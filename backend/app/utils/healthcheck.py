@@ -1,9 +1,28 @@
+import logging
+
 from fastapi import APIRouter
 from sqlalchemy import text
 
 from app.database import DbSession, engine
+from app.utils.structured_logging import log_structured
 
 healthcheck_router = APIRouter()
+logger = logging.getLogger(__name__)
+
+
+def database_is_ready() -> bool:
+    """Return whether the API can obtain and use a database connection.
+
+    Keep the failure deliberately opaque: connection exceptions can contain hostnames,
+    usernames, or driver-specific details and this check is safe to expose publicly.
+    """
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+    except Exception:
+        log_structured(logger, "warning", "Database readiness check failed", action="database_readiness_failed")
+        return False
+    return True
 
 
 def get_pool_status() -> dict[str, str]:
@@ -29,8 +48,8 @@ async def database_health(db: DbSession) -> dict[str, str | dict[str, str]]:
             "status": "healthy",
             "pool": pool_status,
         }
-    except Exception as e:
+    except Exception:
+        log_structured(logger, "warning", "Database health check failed", action="database_health_check_failed")
         return {
             "status": "unhealthy",
-            "error": str(e),
         }

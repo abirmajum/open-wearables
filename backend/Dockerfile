@@ -40,6 +40,11 @@ FROM python:3.13-slim
     ENV UV_PROJECT_ENVIRONMENT=/opt/venv
     ENV UV_NO_SYNC=true
 
+    # stdlib-only probe keeps the slim image small. It checks process liveness;
+    # /readyz is reserved for dependency-aware traffic/readiness checks.
+    HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
+        CMD python -c "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/healthz' % os.environ.get('PORT', os.environ.get('API_PORT', '8000')), timeout=2).read()"
+
     # Commit SHA for Sentry release tracking. Optional: defaults to empty when
     # not passed (e.g. local builds), in which case the app falls back to the
     # plain package version.

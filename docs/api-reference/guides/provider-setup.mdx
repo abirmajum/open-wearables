@@ -119,13 +119,13 @@ Whoop uses OAuth 2.0 and supports both workouts and 24/7 data (sleep, recovery, 
 ### Setup
 
 1. Create an application at [developer.whoop.com](https://developer.whoop.com)
-2. Set your redirect URI to `http://localhost:8000/api/v1/oauth/whoop/callback`
+2. Set `API_BASE_URL` to your public API URL, then register the derived callback URI: `{API_BASE_URL}/api/v1/oauth/whoop/callback` (for local development, `http://localhost:8000/api/v1/oauth/whoop/callback`).
 3. Configure environment variables:
 
 ```bash
 WHOOP_CLIENT_ID=your-client-id
 WHOOP_CLIENT_SECRET=your-client-secret
-WHOOP_REDIRECT_URI=http://localhost:8000/api/v1/oauth/whoop/callback
+API_BASE_URL=http://localhost:8000
 WHOOP_DEFAULT_SCOPE=offline read:cycles read:sleep read:recovery read:workout
 ```
 

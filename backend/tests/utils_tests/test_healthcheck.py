@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from app.utils.healthcheck import database_health, get_pool_status
+from app.utils.healthcheck import database_health, database_is_ready, get_pool_status
 
 
 class TestGetPoolStatus:
@@ -150,16 +150,13 @@ class TestDatabaseHealth:
         """Test database health check when database connection fails."""
         # Arrange
         mock_db = MagicMock()
-        error_message = "Connection refused"
-        mock_db.execute.side_effect = Exception(error_message)
+        mock_db.execute.side_effect = Exception("Connection refused")
 
         # Act
         result = await database_health(mock_db)
 
         # Assert
         assert result["status"] == "unhealthy"
-        assert "error" in result
-        assert result["error"] == error_message
         assert "pool" not in result
 
     @pytest.mark.asyncio
@@ -174,7 +171,7 @@ class TestDatabaseHealth:
 
         # Assert
         assert result["status"] == "unhealthy"
-        assert "Connection timeout" in result["error"]
+        assert "error" not in result
 
     @pytest.mark.asyncio
     async def test_database_health_with_database_error(self) -> None:
@@ -188,7 +185,7 @@ class TestDatabaseHealth:
 
         # Assert
         assert result["status"] == "unhealthy"
-        assert result["error"] == "Database is shutting down"
+        assert "error" not in result
 
     @pytest.mark.asyncio
     async def test_database_health_includes_pool_status_on_success(self) -> None:
@@ -212,3 +209,21 @@ class TestDatabaseHealth:
             assert result["status"] == "healthy"
             assert result["pool"] == expected_pool
             mock_pool_status.assert_called_once()
+
+
+class TestDatabaseReadiness:
+    """Test the public readiness helper without exposing connection details."""
+
+    @patch("app.utils.healthcheck.engine")
+    def test_database_is_ready_after_a_successful_query(self, mock_engine: MagicMock) -> None:
+        connection = mock_engine.connect.return_value.__enter__.return_value
+
+        assert database_is_ready() is True
+
+        connection.execute.assert_called_once()
+
+    @patch("app.utils.healthcheck.engine")
+    def test_database_is_not_ready_when_connection_fails(self, mock_engine: MagicMock) -> None:
+        mock_engine.connect.side_effect = RuntimeError("postgres://user:password@db:5432/open-wearables")
+
+        assert database_is_ready() is False

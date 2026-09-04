@@ -20,6 +20,7 @@ from app.middlewares import add_access_log_middleware, add_cors_middleware
 from app.services import raw_payload_storage
 from app.services.outgoing_webhooks import svix as svix_service
 from app.utils.exceptions import DatetimeParseError, handle_exception
+from app.utils.healthcheck import database_is_ready
 
 # Configure logging to use stdout instead of stderr
 # Some platforms convert stderr logs to level.error automatically, so we must use stdout
@@ -78,6 +79,25 @@ if static_dir.exists():
 @api.get("/")
 async def root() -> dict[str, str]:
     return {"message": "Server is running!"}
+
+
+@api.get("/healthz", include_in_schema=False)
+async def liveness() -> dict[str, str]:
+    """Confirm that this API process can answer HTTP requests.
+
+    This intentionally does not check external services. Use it for container and
+    platform health checks so a temporary dependency outage does not cause a
+    restart loop.
+    """
+    return {"status": "ok"}
+
+
+@api.get("/readyz", include_in_schema=False, response_model=None)
+def readiness() -> JSONResponse | dict[str, str]:
+    """Confirm that the API can serve database-backed requests without blocking the event loop."""
+    if database_is_ready():
+        return {"status": "ready"}
+    return JSONResponse(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, content={"status": "not_ready"})
 
 
 def _capture_error_body(request: Request, status_code: int, detail: object) -> None:

@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 from typing import Annotated
+from urllib.parse import unquote, urlsplit
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, status
@@ -24,6 +25,26 @@ factory = ProviderFactory()
 settings_service = ProviderSettingsService()
 
 
+def _normalise_callback_target(url: str) -> tuple[str, str, int | None, str] | None:
+    """Return the callback-relevant parts of a URL, or None for an invalid port."""
+    parsed = urlsplit(url)
+    scheme = parsed.scheme.lower()
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    if port == {"http": 80, "https": 443}.get(scheme):
+        port = None
+    return scheme, (parsed.hostname or "").lower(), port, unquote(parsed.path).rstrip("/")
+
+
+def _is_provider_callback_url(provider: ProviderName, redirect_uri: str) -> bool:
+    """Prevent the post-callback redirect from pointing back to the OAuth callback."""
+    candidate = _normalise_callback_target(redirect_uri)
+    callback = _normalise_callback_target(settings.oauth_redirect_uri(provider))
+    return candidate is not None and candidate == callback
+
+
 def get_oauth_strategy(provider: ProviderName) -> BaseProviderStrategy:
     """Helper to get provider strategy and ensure it supports OAuth."""
     strategy = factory.get_provider(provider.value)
@@ -46,13 +67,21 @@ def get_oauth_strategy(provider: ProviderName) -> BaseProviderStrategy:
 def authorize_provider(
     provider: ProviderName,
     user_id: Annotated[UUID, Query(description="User ID to connect")],
-    redirect_uri: Annotated[str | None, Query(description="Optional redirect URI after authorization")] = None,
+    redirect_uri: Annotated[
+        str | None,
+        Query(description="Optional application URL to redirect the user to after the provider callback completes"),
+    ] = None,
 ):
     """
     Initiate OAuth flow for a provider.
 
     Returns authorization URL where user should be redirected to log in.
     """
+    if redirect_uri and _is_provider_callback_url(provider, redirect_uri):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="redirect_uri must be an application return URL, not the Open Wearables provider callback",
+        )
     strategy = get_oauth_strategy(provider)
 
     assert strategy.oauth

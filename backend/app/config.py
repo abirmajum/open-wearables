@@ -363,7 +363,7 @@ class Settings(BaseSettings):
                 stacklevel=2,
             )
             return legacy_value
-        return f"{self.api_base_url}/api/v1/oauth/{provider.value}/callback"
+        return f"{self.api_base_url.rstrip('/')}/api/v1/oauth/{provider.value}/callback"
 
     @property
     def raw_payload_bucket(self) -> str | None:

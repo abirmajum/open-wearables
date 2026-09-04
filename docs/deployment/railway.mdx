@@ -75,6 +75,58 @@ All inter-service networking and environment variables are configured automatica
   </Step>
 </Steps>
 
+## Production rollout and rollback
+
+Use the Backend service's **healthcheck path** `/healthz`. It reports only that
+the FastAPI process can answer HTTP requests, which prevents a transient database
+or provider outage from turning into a platform restart loop. `/readyz` is a
+separate dependency check: it returns `200 {"status":"ready"}` only when the
+Backend can run a database query, otherwise `503 {"status":"not_ready"}`. Neither
+endpoint returns connection details or credentials.
+
+Before releasing a Whoop-enabled deployment, set these **Backend** environment
+variable names in Railway (use Railway secrets for secret values):
+
+| Variable | Purpose |
+|----------|---------|
+| `ENVIRONMENT` | Set to `production`. |
+| `SECRET_KEY` | Token-signing secret; keep the existing value during a rollout. |
+| `ADMIN_EMAIL`, `ADMIN_PASSWORD` | Initial administrator credentials. |
+| `CORS_ORIGINS`, `FRONTEND_URL`, `API_BASE_URL` | Public frontend/API URLs. With `API_BASE_URL=https://ow.rumihq.com`, the registered Whoop callback is `https://ow.rumihq.com/api/v1/oauth/whoop/callback`. |
+| `WHOOP_CLIENT_ID`, `WHOOP_CLIENT_SECRET` | Whoop OAuth application credentials. |
+| `WHOOP_DEFAULT_SCOPE` | Optional override for the documented Whoop OAuth scopes. |
+| `ACCESS_LOG_LEVEL` | Set to `errors` for normal production logging. |
+| `LOG_ERROR_RESPONSE_BODY` | Keep `false` unless there is a time-bounded, approved debugging need. |
+
+<Steps>
+  <Step title="Deploy and check the API">
+    Deploy the pinned release. Wait for the Backend startup logs to finish its
+    existing migration/initialization work, then check the public
+    `https://&lt;backend-domain&gt;/healthz` and
+    `https://&lt;backend-domain&gt;/readyz` endpoints. Both must return `200` before
+    routing traffic or starting a Whoop connection test.
+  </Step>
+  <Step title="Exercise the Whoop path">
+    Complete one controlled Whoop OAuth connection using the production callback
+    URL. The optional `redirect_uri` on Open Wearables' `/authorize` request is
+    instead the post-callback application return URL; it must not point back to
+    the Open Wearables callback. Then confirm the callback and its background
+    sync complete without logging tokens, authorization codes, or API keys.
+    Check the worker/queue service separately: API readiness does not assert
+    Celery worker health.
+  </Step>
+  <Step title="Roll back safely if needed">
+    Revert the Backend service to the last known-good image/release and repeat
+    the two endpoint checks. Startup migrations are forward-only by default;
+    do not run a database downgrade during incident response unless there is a
+    tested migration rollback plan and a verified backup/restore path.
+  </Step>
+</Steps>
+
+This repository does not establish the live backup, restore-test, region, or
+capacity status. Confirm those directly in the production platform before a
+user-facing rollout.
+
 ## Environment variables reference
 
 Key variables you may want to customize on the **Backend** service:
