@@ -4,6 +4,7 @@ from uuid import UUID
 from fastapi import APIRouter, Query
 
 from app.database import DbSession
+from app.schemas.enums import ProviderName
 from app.schemas.responses.activity import (
     ActivitySummary,
     BodySummary,
@@ -29,15 +30,18 @@ def get_activity_summary(
     cursor: str | None = None,
     limit: Annotated[int, Query(ge=1, le=400)] = 50,
     sort_order: Annotated[str, Query(pattern="^(asc|desc)$")] = "asc",
+    provider: Annotated[ProviderName | None, Query(description="Restrict summaries to a single provider")] = None,
 ) -> PaginatedResponse[ActivitySummary]:
     """Returns daily aggregated activity metrics.
 
-    Aggregates time-series data (steps, energy, heart rate, etc.) by day.
+    Aggregates time-series data (steps, energy, heart rate, etc.) by day. When
+    ``provider`` is supplied, all metrics and source provenance come only from
+    that provider.
     """
     start_datetime = parse_query_datetime(start_date)
     end_datetime = parse_query_datetime(end_date)
     return summaries_service.get_activity_summaries(
-        db, user_id, start_datetime, end_datetime, cursor, limit, sort_order
+        db, user_id, start_datetime, end_datetime, cursor, limit, sort_order, provider
     )
 
 

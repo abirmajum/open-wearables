@@ -7,8 +7,9 @@ from uuid import uuid4
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from app.models import DataPointSeriesArchive
+from app.models import DataPointSeriesArchive, ProviderPriority
 from app.models.archival_setting import ArchivalSetting
+from app.repositories.provider_priority_repository import ProviderPriorityRepository
 from app.schemas.enums import AggregationMethod, HealthScoreCategory, ProviderName
 from tests.factories import (
     ApiKeyFactory,
@@ -384,6 +385,192 @@ class TestSleepSummaryEndpoint:
 
 class TestActivitySummaryEndpoint:
     """Test suite for activity summaries endpoint."""
+
+    def test_provider_filter_excludes_other_provider_data(self, client: TestClient, db: Session) -> None:
+        """A provider-filtered summary never selects or enriches from another provider."""
+        user = UserFactory()
+        apple_source = DataSourceFactory(user=user, provider=ProviderName.APPLE, source="apple_health_sdk")
+        whoop_source = DataSourceFactory(user=user, provider=ProviderName.WHOOP, source="whoop_api")
+        steps_type = SeriesTypeDefinitionFactory.get_or_create_steps()
+        energy_type = SeriesTypeDefinitionFactory.get_or_create_energy()
+        heart_rate_type = SeriesTypeDefinitionFactory.get_or_create_heart_rate()
+        timestamp = datetime(2025, 12, 26, 9, 0, 0, tzinfo=timezone.utc)
+
+        DataPointSeriesFactory(mapping=apple_source, series_type=steps_type, value=Decimal("50"), recorded_at=timestamp)
+        DataPointSeriesFactory(
+            mapping=apple_source, series_type=energy_type, value=Decimal("250"), recorded_at=timestamp
+        )
+        DataPointSeriesFactory(
+            mapping=apple_source, series_type=heart_rate_type, value=Decimal("130"), recorded_at=timestamp
+        )
+        DataPointSeriesFactory(
+            mapping=whoop_source, series_type=steps_type, value=Decimal("9000"), recorded_at=timestamp
+        )
+        DataPointSeriesFactory(
+            mapping=whoop_source, series_type=energy_type, value=Decimal("500"), recorded_at=timestamp
+        )
+        DataPointSeriesFactory(
+            mapping=whoop_source, series_type=heart_rate_type, value=Decimal("160"), recorded_at=timestamp
+        )
+        whoop_workout = EventRecordFactory(
+            mapping=whoop_source,
+            category="workout",
+            type_="running",
+            start_datetime=timestamp,
+            end_datetime=timestamp + timedelta(hours=1),
+            duration_seconds=3600,
+        )
+        WorkoutDetailsFactory(
+            event_record=whoop_workout,
+            total_elevation_gain=Decimal("200"),
+            energy_burned=Decimal("1000"),
+        )
+
+        response = client.get(
+            f"/api/v1/users/{user.id}/summaries/activity",
+            headers=api_key_headers(ApiKeyFactory()),
+            params={
+                "start_date": "2025-12-25T00:00:00Z",
+                "end_date": "2025-12-27T00:00:00Z",
+                "provider": "apple",
+            },
+        )
+
+        assert response.status_code == 200
+        activity = response.json()["data"][0]
+        assert set(activity) == {
+            "date",
+            "source",
+            "steps",
+            "distance_meters",
+            "floors_climbed",
+            "elevation_meters",
+            "active_calories_kcal",
+            "total_calories_kcal",
+            "active_minutes",
+            "sedentary_minutes",
+            "intensity_minutes",
+            "heart_rate",
+        }
+        assert activity["source"]["provider"] == "apple"
+        assert activity["steps"] == 50
+        assert activity["active_calories_kcal"] == 250.0
+        assert activity["elevation_meters"] is None
+        assert activity["active_minutes"] == 1
+        assert activity["intensity_minutes"] == {"light": 0, "moderate": 1, "vigorous": 0}
+
+    def test_activity_summary_without_provider_keeps_existing_priority_selection(
+        self, client: TestClient, db: Session
+    ) -> None:
+        """Omitting provider retains the existing highest-priority-source behavior."""
+        user = UserFactory()
+        apple_source = DataSourceFactory(user=user, provider=ProviderName.APPLE, source="apple_health_sdk")
+        whoop_source = DataSourceFactory(user=user, provider=ProviderName.WHOOP, source="whoop_api")
+        priority_repo = ProviderPriorityRepository(ProviderPriority)
+        priority_repo.upsert(db, ProviderName.APPLE, 1)
+        priority_repo.upsert(db, ProviderName.WHOOP, 2)
+        steps_type = SeriesTypeDefinitionFactory.get_or_create_steps()
+        timestamp = datetime(2025, 12, 26, 9, 0, 0, tzinfo=timezone.utc)
+
+        DataPointSeriesFactory(
+            mapping=apple_source, series_type=steps_type, value=Decimal("1200"), recorded_at=timestamp
+        )
+        DataPointSeriesFactory(
+            mapping=whoop_source, series_type=steps_type, value=Decimal("9000"), recorded_at=timestamp
+        )
+
+        response = client.get(
+            f"/api/v1/users/{user.id}/summaries/activity",
+            headers=api_key_headers(ApiKeyFactory()),
+            params={"start_date": "2025-12-25T00:00:00Z", "end_date": "2025-12-27T00:00:00Z"},
+        )
+
+        assert response.status_code == 200
+        activity = response.json()["data"][0]
+        assert activity["source"]["provider"] == "apple"
+        assert activity["steps"] == 1200
+
+    def test_activity_summary_rejects_invalid_provider(self, client: TestClient, db: Session) -> None:
+        """Provider is an enum query parameter, so unsupported values fail closed."""
+        response = client.get(
+            f"/api/v1/users/{UserFactory().id}/summaries/activity",
+            headers=api_key_headers(ApiKeyFactory()),
+            params={
+                "start_date": "2025-12-25T00:00:00Z",
+                "end_date": "2025-12-27T00:00:00Z",
+                "provider": "not-a-provider",
+            },
+        )
+
+        assert response.status_code == 400
+
+    def test_provider_filter_preserves_live_archive_and_daily_total_deduplication(
+        self, client: TestClient, db: Session
+    ) -> None:
+        """Provider filtering retains live-over-archive and daily-total deduplication."""
+        user = UserFactory()
+        source = DataSourceFactory(user=user, provider=ProviderName.APPLE, source="apple_health_sdk")
+        whoop_source = DataSourceFactory(user=user, provider=ProviderName.WHOOP, source="whoop_api")
+        steps_type = SeriesTypeDefinitionFactory.get_or_create_steps()
+        timestamp = datetime(2025, 12, 26, 9, 0, 0, tzinfo=timezone.utc)
+
+        # A daily total wins over overlapping intraday samples.
+        DataPointSeriesFactory(
+            mapping=source,
+            series_type=steps_type,
+            value=Decimal("1000"),
+            recorded_at=timestamp,
+            is_daily_total=True,
+        )
+        DataPointSeriesFactory(
+            mapping=source,
+            series_type=steps_type,
+            value=Decimal("400"),
+            recorded_at=timestamp + timedelta(minutes=1),
+        )
+
+        # When live and archived rows overlap for one source/day, live remains authoritative.
+        if not db.query(ArchivalSetting).filter(ArchivalSetting.id == 1).first():
+            db.add(ArchivalSetting(id=1, archive_after_days=30, delete_after_days=None))
+        db.add(
+            DataPointSeriesArchive(
+                id=uuid4(),
+                data_source_id=source.id,
+                series_type_definition_id=steps_type.id,
+                bucket_start_at=datetime(2025, 12, 26, 0, 0, 0, tzinfo=timezone.utc),
+                aggregation_type=AggregationMethod.SUM,
+                value=Decimal("5000"),
+                sample_count=1,
+            )
+        )
+        db.add(
+            DataPointSeriesArchive(
+                id=uuid4(),
+                data_source_id=whoop_source.id,
+                series_type_definition_id=steps_type.id,
+                bucket_start_at=datetime(2025, 12, 25, 0, 0, 0, tzinfo=timezone.utc),
+                aggregation_type=AggregationMethod.SUM,
+                value=Decimal("5000"),
+                sample_count=1,
+            )
+        )
+        db.commit()
+
+        response = client.get(
+            f"/api/v1/users/{user.id}/summaries/activity",
+            headers=api_key_headers(ApiKeyFactory()),
+            params={
+                "start_date": "2025-12-25T00:00:00Z",
+                "end_date": "2025-12-27T00:00:00Z",
+                "provider": "apple",
+            },
+        )
+
+        assert response.status_code == 200
+        activities = response.json()["data"]
+        assert len(activities) == 1
+        assert activities[0]["date"] == "2025-12-26"
+        assert activities[0]["steps"] == 1000
 
     def test_get_activity_summary_empty(self, client: TestClient, db: Session) -> None:
         """Test activity summary returns empty data when no data points exist."""

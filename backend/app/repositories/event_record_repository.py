@@ -865,6 +865,7 @@ class EventRecordRepository(
         user_id: UUID,
         start_date: datetime,
         end_date: datetime,
+        provider: ProviderName | None = None,
     ) -> list[dict]:
         """Get daily workout aggregates including elevation, distance, and energy.
 
@@ -896,6 +897,7 @@ class EventRecordRepository(
             .outerjoin(WorkoutDetails, self.model.id == WorkoutDetails.record_id)
             .filter(
                 DataSource.user_id == user_id,
+                *([DataSource.provider == provider] if provider is not None else []),
                 self.model.category == "workout",
                 self.model.end_datetime >= start_date - timedelta(days=1),
                 local_workout_date >= cast(start_date, Date),

@@ -14,6 +14,7 @@ from app.models.archival_setting import ArchivalSetting
 from app.schemas.enums import (
     AGGREGATION_METHOD_BY_TYPE,
     AggregationMethod,
+    ProviderName,
     SeriesType,
     get_series_type_from_id,
     get_series_type_id,
@@ -339,6 +340,7 @@ class DataPointSeriesArchiveRepository:
         start_date: datetime,
         end_date: datetime,
         series_type_ids: list[int],
+        provider: ProviderName | None = None,
     ) -> list[dict]:
         """Query the archive table for daily activity aggregates.
 
@@ -427,6 +429,7 @@ class DataPointSeriesArchiveRepository:
             .join(DataSource, DataPointSeriesArchive.data_source_id == DataSource.id)
             .filter(
                 DataSource.user_id == user_id,
+                *([DataSource.provider == provider] if provider is not None else []),
                 DataPointSeriesArchive.bucket_start_at >= start_ts,
                 DataPointSeriesArchive.bucket_start_at < end_ts,
                 DataPointSeriesArchive.series_type_definition_id.in_(series_type_ids),

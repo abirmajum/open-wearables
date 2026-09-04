@@ -550,6 +550,7 @@ class DataPointSeriesRepository(
         user_id: UUID,
         start_date: datetime,
         end_date: datetime,
+        provider: ProviderName | None = None,
     ) -> list[ActivityAggregateResult]:
         """Get daily activity aggregates from time-series data.
 
@@ -637,6 +638,7 @@ class DataPointSeriesRepository(
             .join(DataSource, self.model.data_source_id == DataSource.id)
             .filter(
                 DataSource.user_id == user_id,
+                *([DataSource.provider == provider] if provider is not None else []),
                 self.model.recorded_at >= start_date - timedelta(days=1),
                 local_date >= cast(start_date, Date),
                 local_date < cast(end_date, Date),
@@ -687,6 +689,7 @@ class DataPointSeriesRepository(
         start_date: datetime,
         end_date: datetime,
         active_threshold: int = 30,
+        provider: ProviderName | None = None,
     ) -> list[ActiveMinutesResult]:
         """Get daily active/sedentary minutes from step data.
 
@@ -724,6 +727,7 @@ class DataPointSeriesRepository(
             .join(DataSource, self.model.data_source_id == DataSource.id)
             .filter(
                 DataSource.user_id == user_id,
+                *([DataSource.provider == provider] if provider is not None else []),
                 self.model.recorded_at >= start_date - timedelta(days=1),
                 local_date >= cast(start_date, Date),
                 local_date < cast(end_date, Date),
@@ -789,6 +793,7 @@ class DataPointSeriesRepository(
         light_max: int,
         moderate_max: int,
         vigorous_max: int,
+        provider: ProviderName | None = None,
     ) -> list[IntensityMinutesResult]:
         """Get daily intensity minutes from heart rate data.
 
@@ -827,6 +832,7 @@ class DataPointSeriesRepository(
             .join(DataSource, self.model.data_source_id == DataSource.id)
             .filter(
                 DataSource.user_id == user_id,
+                *([DataSource.provider == provider] if provider is not None else []),
                 self.model.recorded_at >= start_date - timedelta(days=1),
                 local_date >= cast(start_date, Date),
                 local_date < cast(end_date, Date),
