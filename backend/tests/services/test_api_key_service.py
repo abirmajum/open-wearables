@@ -1,15 +1,5 @@
-"""
-Tests for ApiKeyService.
-
-Tests cover:
-- Creating API keys with sk- prefix
-- Listing API keys ordered by creation date
-- Rotating API keys (delete old, create new)
-- Validating API keys
-- Key generation format
-"""
-
 from datetime import datetime, timedelta, timezone
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi import HTTPException
@@ -17,13 +7,13 @@ from sqlalchemy.orm import Session
 
 from app.services.api_key_service import api_key_service
 from tests.factories import ApiKeyFactory, DeveloperFactory
+from tests.utils import api_key_secret
 
 
 class TestApiKeyServiceCreateApiKey:
     """Test API key creation with proper format."""
 
-    def test_create_api_key_generates_sk_prefix(self, db: Session) -> None:
-        """Should generate API key with sk- prefix."""
+    def test_create_api_key_separates_id_and_secret(self, db: Session) -> None:
         # Arrange
         developer = DeveloperFactory()
 
@@ -31,24 +21,24 @@ class TestApiKeyServiceCreateApiKey:
         api_key = api_key_service.create_api_key(db, developer.id, "Test Key")
 
         # Assert
-        assert api_key.id.startswith("sk-")
+        assert isinstance(api_key.id, UUID)
+        assert len(api_key.secret) == 67
+        assert "secret=" not in repr(api_key)
         assert api_key.name == "Test Key"
         assert api_key.created_by == developer.id
 
-    def test_create_api_key_has_correct_length(self, db: Session) -> None:
-        """Should generate key with correct format: sk- + 32 hex chars."""
+    def test_create_api_key_persists_only_hash(self, db: Session) -> None:
         # Arrange
         developer = DeveloperFactory()
 
         # Act
         api_key = api_key_service.create_api_key(db, developer.id)
 
-        # Assert
-        # Format: "sk-" (3 chars) + 32 hex chars = 35 total
-        assert len(api_key.id) == 35
-        # Verify hex portion is valid hexadecimal
-        hex_portion = api_key.id[3:]
-        assert all(c in "0123456789abcdef" for c in hex_portion)
+        persisted = api_key_service.get(db, api_key.id)
+        assert persisted is not None
+        assert persisted.key_hash == api_key_service.hash_secret(api_key.secret)
+        assert not hasattr(persisted, "secret")
+        assert "key_hash" not in repr(persisted)
 
     def test_create_api_key_default_name(self, db: Session) -> None:
         """Should use default name when not provided."""
@@ -67,7 +57,7 @@ class TestApiKeyServiceCreateApiKey:
         api_key = api_key_service.create_api_key(db, None, "Anonymous Key")
 
         # Assert
-        assert api_key.id.startswith("sk-")
+        assert isinstance(api_key.id, UUID)
         assert api_key.created_by is None
         assert api_key.name == "Anonymous Key"
 
@@ -97,24 +87,23 @@ class TestApiKeyServiceCreateApiKey:
         assert key1.id != key2.id
 
 
-class TestApiKeyServiceGenerateKeyValue:
+class TestApiKeyServiceGenerateSecret:
     """Test internal key generation method."""
 
-    def test_generate_key_value_format(self) -> None:
-        """Should generate key with sk- prefix and 32 hex chars."""
+    def test_generate_secret_format(self) -> None:
         # Act
-        key = api_key_service._generate_key_value()
+        key = api_key_service._generate_secret()
 
         # Assert
         assert key.startswith("sk-")
-        assert len(key) == 35
+        assert len(key) == 67
         hex_portion = key[3:]
         assert all(c in "0123456789abcdef" for c in hex_portion)
 
-    def test_generate_key_value_uniqueness(self) -> None:
+    def test_generate_secret_uniqueness(self) -> None:
         """Should generate unique keys on each call."""
         # Act
-        keys = [api_key_service._generate_key_value() for _ in range(100)]
+        keys = [api_key_service._generate_secret() for _ in range(100)]
 
         # Assert
         assert len(keys) == len(set(keys))  # All unique
@@ -176,23 +165,24 @@ class TestApiKeyServiceListApiKeys:
 class TestApiKeyServiceRotateApiKey:
     """Test API key rotation."""
 
-    def test_rotate_api_key_deletes_old_creates_new(self, db: Session) -> None:
-        """Should delete old key and create new one."""
+    def test_rotate_api_key_replaces_secret_in_place(self, db: Session) -> None:
         # Arrange
         developer = DeveloperFactory()
         old_key = ApiKeyFactory(developer=developer, name="Old Key")
         old_key_id = old_key.id
 
         # Act
-        new_key = api_key_service.rotate_api_key(db, old_key_id, developer.id)
+        old_secret = api_key_secret(old_key)
+        new_key = api_key_service.rotate_api_key(db, old_key_id)
 
         # Assert
-        assert new_key.id != old_key_id
-        assert new_key.id.startswith("sk-")
+        assert new_key.id == old_key_id
+        assert len(new_key.secret) == 67
         assert new_key.created_by == developer.id
 
-        # Verify old key is deleted
-        assert api_key_service.get(db, old_key_id) is None
+        with pytest.raises(HTTPException):
+            api_key_service.validate_api_key(db, old_secret)
+        assert api_key_service.validate_api_key(db, new_key.secret).id == old_key_id
 
     def test_rotate_api_key_with_none_creator(self, db: Session) -> None:
         """Should rotate key with None as creator."""
@@ -201,23 +191,21 @@ class TestApiKeyServiceRotateApiKey:
         old_key_id = old_key.id
 
         # Act
-        new_key = api_key_service.rotate_api_key(db, old_key_id, None)
+        new_key = api_key_service.rotate_api_key(db, old_key_id)
 
         # Assert
-        assert new_key.id != old_key_id
-        assert new_key.created_by is None
+        assert new_key.id == old_key_id
 
     def test_rotate_nonexistent_key_raises_404(self, db: Session) -> None:
         """Should raise HTTPException(404) when rotating non-existent key."""
         # Arrange
         from fastapi import HTTPException
 
-        fake_key = "sk-nonexistent"
-        developer = DeveloperFactory()
+        fake_key = uuid4()
 
         # Act & Assert
         with pytest.raises(HTTPException) as exc_info:
-            api_key_service.rotate_api_key(db, fake_key, developer.id)
+            api_key_service.rotate_api_key(db, fake_key)
 
         assert exc_info.value.status_code == 404
 
@@ -232,7 +220,7 @@ class TestApiKeyServiceValidateApiKey:
         api_key = ApiKeyFactory(developer=developer)
 
         # Act
-        validated = api_key_service.validate_api_key(db, api_key.id)
+        validated = api_key_service.validate_api_key(db, api_key_secret(api_key))
 
         # Assert
         assert validated.id == api_key.id
@@ -241,7 +229,7 @@ class TestApiKeyServiceValidateApiKey:
     def test_validate_api_key_nonexistent_raises_401(self, db: Session) -> None:
         """Should raise 401 for non-existent key."""
         # Arrange
-        fake_key = "sk-nonexistent12345678901234567890"
+        fake_key = "definitely-invalid"
 
         # Act & Assert
         with pytest.raises(HTTPException) as exc_info:
@@ -279,7 +267,7 @@ class TestApiKeyServiceGet:
     def test_get_nonexistent_api_key_returns_none(self, db: Session) -> None:
         """Should return None for non-existent key."""
         # Arrange
-        fake_key = "sk-doesnotexist123456789012345678"
+        fake_key = uuid4()
 
         # Act
         result = api_key_service.get(db, fake_key)
@@ -308,7 +296,7 @@ class TestApiKeyServiceDelete:
     def test_delete_nonexistent_api_key(self, db: Session) -> None:
         """Should handle deleting non-existent key gracefully."""
         # Arrange
-        fake_key = "sk-doesnotexist123456789012345678"
+        fake_key = uuid4()
 
         # Act & Assert - should not raise error
         api_key_service.delete(db, fake_key, raise_404=False)

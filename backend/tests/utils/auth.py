@@ -3,9 +3,13 @@ Authentication helpers for tests.
 """
 
 from datetime import timedelta
+from hashlib import sha256
 from uuid import UUID
 
+from app.models import ApiKey
 from app.utils.security import create_access_token
+
+_TEST_SECRET_NAMESPACE = b"open-wearables-test-api-key:"
 
 
 def developer_auth_headers(developer_id: UUID | str) -> dict[str, str]:
@@ -14,9 +18,18 @@ def developer_auth_headers(developer_id: UUID | str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
-def api_key_headers(api_key: str) -> dict[str, str]:
-    """Generate X-Open-Wearables-API-Key headers for API key authentication."""
-    return {"X-Open-Wearables-API-Key": api_key}
+def api_key_secret_for_id(api_key_id: UUID) -> str:
+    digest = sha256(_TEST_SECRET_NAMESPACE + api_key_id.bytes).hexdigest()
+    return f"test-{digest}"
+
+
+def api_key_secret(api_key: ApiKey) -> str:
+    return api_key_secret_for_id(api_key.id)
+
+
+def api_key_headers(api_key: ApiKey | str) -> dict[str, str]:
+    secret = api_key_secret(api_key) if isinstance(api_key, ApiKey) else api_key
+    return {"X-Open-Wearables-API-Key": secret}
 
 
 def create_test_token(

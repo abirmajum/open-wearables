@@ -8,6 +8,7 @@ from starlette.testclient import TestClient
 
 from app.config import settings
 from tests.factories import ApiKeyFactory
+from tests.utils import api_key_secret
 
 _USER_ID = "123e4567-e89b-12d3-a456-426614174000"
 _REF = "s3://bucket/raw-payloads/apple/sdk/2026-08-26/user/x.json"
@@ -30,7 +31,7 @@ def _sync(client: TestClient, api_v1_prefix: str) -> object:
     api_key = ApiKeyFactory()
     return client.post(
         f"{api_v1_prefix}/sdk/users/{_USER_ID}/sync/",
-        headers={"X-Open-Wearables-API-Key": api_key.id},
+        headers={"X-Open-Wearables-API-Key": api_key_secret(api_key)},
         json=_BODY,
     )
 

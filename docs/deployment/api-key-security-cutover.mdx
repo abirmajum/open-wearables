@@ -1,0 +1,59 @@
+---
+title: "API Key Security Cutover"
+description: "Maintenance procedure for migrating API keys to hash-only storage"
+---
+
+This migration replaces plaintext API-key identifiers with UUID resource IDs and
+SHA-256 hashes. Use a maintenance window because old backend images cannot read
+the new schema.
+
+<Warning>
+  Stop every old API container before running the migration. Alembic downgrade
+  cannot reconstruct plaintext secrets. Rollback requires the pre-migration
+  database backup and the old backend image together.
+</Warning>
+
+## Cutover
+
+<Steps>
+  <Step title="Stop old backend containers">
+    Stop the API containers first, followed by workers and schedulers that use the
+    same backend image. Confirm no old backend process can write to PostgreSQL.
+  </Step>
+  <Step title="Take and verify a backup">
+    Create a PostgreSQL custom-format backup before changing the schema, then
+    verify that PostgreSQL can read its catalog.
+
+    ```bash
+    pg_dump --format=custom --file=open-wearables-before-api-key-migration.dump "$DATABASE_URL"
+    pg_restore --list open-wearables-before-api-key-migration.dump >/dev/null
+    ```
+  </Step>
+  <Step title="Confirm pgcrypto">
+    Confirm that `pgcrypto` is installed, or that the migration role is authorized
+    to install it.
+
+    ```sql
+    SELECT extname FROM pg_extension WHERE extname = 'pgcrypto';
+    ```
+  </Step>
+  <Step title="Start the new API image">
+    Start one API container from the new image. Its normal startup command runs
+    Alembic before serving traffic. Wait for the migration to complete before
+    scaling the API or starting workers.
+  </Step>
+  <Step title="Verify authentication">
+    Use an existing API key through the `X-Open-Wearables-API-Key` header and
+    confirm a normal authenticated endpoint succeeds. Create a key in the admin
+    UI, save the one-time secret, and confirm that it also authenticates. Then
+    start the remaining new API containers, workers, and schedulers.
+  </Step>
+</Steps>
+
+## Rollback
+
+Stop all new backend containers. Restore
+`open-wearables-before-api-key-migration.dump` into the database, deploy the old
+backend image that matches that backup, and only then resume traffic. Do not run
+`alembic downgrade` for this revision: the hash-only database cannot recover the
+discarded plaintext credentials.

@@ -99,10 +99,12 @@ X-Open-Wearables-API-Key: YOUR_API_KEY
 2. Log in
 3. Navigate to the API Keys section in the Settings tab
 4. Generate a new API key
-5. Copy and securely store the key
+5. Copy and securely store the secret when it is shown
 
 <Warning>
-  Keep your API keys secure. Never commit them to version control or expose them in client-side code.
+  API key secrets are returned only when a key is created or rotated. They cannot
+  be recovered later. Keep them secure, never put them in a URL, and never commit
+  them to version control or expose them in client-side code.
 </Warning>
 
 ## Response Formats

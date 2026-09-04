@@ -9,7 +9,7 @@ from starlette.testclient import TestClient
 
 from app.services.sdk_token_service import create_sdk_user_token
 from tests.factories import ApiKeyFactory, DeveloperFactory
-from tests.utils import developer_auth_headers
+from tests.utils import api_key_secret, developer_auth_headers
 
 
 @pytest.fixture(autouse=True)
@@ -55,7 +55,7 @@ class TestSDKSyncWithSDKToken:
 
         response = client.post(
             f"{api_v1_prefix}/sdk/users/{user_id}/sync/",
-            headers={"X-Open-Wearables-API-Key": api_key.id},
+            headers={"X-Open-Wearables-API-Key": api_key_secret(api_key)},
             json={
                 "data": {
                     "provider": "apple",

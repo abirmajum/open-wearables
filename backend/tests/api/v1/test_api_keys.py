@@ -9,11 +9,15 @@ Tests cover:
 - POST /api/v1/developer/api-keys/{key_id}/rotate - rotate API key
 """
 
+from uuid import UUID, uuid4
+
+import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
 from tests.factories import ApiKeyFactory, DeveloperFactory
-from tests.utils import developer_auth_headers
+from tests.utils import api_key_secret, developer_auth_headers
 
 
 class TestListApiKeys:
@@ -37,16 +41,19 @@ class TestListApiKeys:
         assert len(data) >= 2
 
         # Find our test keys
-        key_ids = [api_key1.id, api_key2.id]
+        key_ids = [str(api_key1.id), str(api_key2.id)]
         found_keys = [k for k in data if k["id"] in key_ids]
         assert len(found_keys) == 2
 
         # Verify structure
         for key in found_keys:
             assert "id" in key
+            UUID(key["id"])
+            assert "display_prefix" in key
             assert "name" in key
             assert "created_by" in key
             assert "created_at" in key
+            assert "secret" not in key
 
     def test_list_api_keys_empty(self, client: TestClient, db: Session, api_v1_prefix: str) -> None:
         """Test listing API keys when developer has none."""
@@ -97,8 +104,8 @@ class TestListApiKeys:
         assert response.status_code == 200
         data = response.json()
         key_ids = [k["id"] for k in data]
-        assert key1.id in key_ids
-        assert key2.id in key_ids
+        assert str(key1.id) in key_ids
+        assert str(key2.id) in key_ids
 
 
 class TestCreateApiKey:
@@ -118,8 +125,8 @@ class TestCreateApiKey:
         assert response.status_code == 201
         data = response.json()
         assert data["name"] == "Production API Key"
-        assert "id" in data
-        assert data["id"].startswith("sk-")
+        UUID(data["id"])
+        assert len(data["secret"]) == 67
         assert data["created_by"] == str(developer.id)
         assert "created_at" in data
 
@@ -129,6 +136,8 @@ class TestCreateApiKey:
         api_key = api_key_service.get(db, data["id"])
         assert api_key is not None
         assert api_key.name == "Production API Key"
+        assert api_key.key_hash == api_key_service.hash_secret(data["secret"])
+        assert not hasattr(api_key, "secret")
 
     def test_create_api_key_default_name(self, client: TestClient, db: Session, api_v1_prefix: str) -> None:
         """Test creating API key with default name."""
@@ -231,7 +240,7 @@ class TestDeleteApiKey:
         # Assert
         assert response.status_code == 200
         data = response.json()
-        assert data["id"] == key_id
+        assert data["id"] == str(key_id)
         assert data["name"] == "To Delete"
 
         # Verify key is deleted from database
@@ -240,13 +249,33 @@ class TestDeleteApiKey:
         deleted_key = api_key_service.get(db, key_id, raise_404=False)
         assert deleted_key is None
 
+    def test_mutation_url_uses_opaque_id(self, client: TestClient, db: Session, api_v1_prefix: str) -> None:
+        developer = DeveloperFactory(email="url-test@example.com", password="test123")
+        headers = developer_auth_headers(developer.id)
+        created = client.post(f"{api_v1_prefix}/developer/api-keys", headers=headers)
+        resource_id = created.json()["id"]
+
+        mutation_path = f"{api_v1_prefix}/developer/api-keys/{resource_id}"
+        assert "sk-" not in mutation_path
+        response = client.patch(mutation_path, json={"name": "Renamed"}, headers=headers)
+
+        assert response.status_code == 200
+        assert response.request.url.path == mutation_path
+
+        credential_shaped_value = "sk-" + "not-a-resource-id"
+        rejected = client.delete(
+            f"{api_v1_prefix}/developer/api-keys/{credential_shaped_value}",
+            headers=headers,
+        )
+        assert rejected.status_code == 400
+
     def test_delete_api_key_not_found(self, client: TestClient, db: Session, api_v1_prefix: str) -> None:
         """Test deleting non-existent API key raises ResourceNotFoundError."""
 
         # Arrange
         developer = DeveloperFactory(email="test@example.com", password="test123")
         headers = developer_auth_headers(developer.id)
-        fake_key_id = "sk-nonexistent1234567890"
+        fake_key_id = uuid4()
 
         # Act
         response = client.delete(f"{api_v1_prefix}/developer/api-keys/{fake_key_id}", headers=headers)
@@ -304,7 +333,7 @@ class TestUpdateApiKey:
         assert response.status_code == 200
         data = response.json()
         assert data["name"] == "New Name"
-        assert data["id"] == api_key.id
+        assert data["id"] == str(api_key.id)
 
         # Verify in database
         db.refresh(api_key)
@@ -336,7 +365,7 @@ class TestUpdateApiKey:
         # Arrange
         developer = DeveloperFactory(email="test@example.com", password="test123")
         headers = developer_auth_headers(developer.id)
-        fake_key_id = "sk-nonexistent1234567890"
+        fake_key_id = uuid4()
         payload = {"name": "New Name"}
 
         # Act
@@ -386,21 +415,19 @@ class TestRotateApiKey:
         # Assert
         assert response.status_code == 201
         data = response.json()
-        assert data["name"] == "Default"  # New key gets default name
-        assert data["id"] != old_key_id  # New key ID should be different
-        assert data["id"].startswith("sk-")
+        assert data["name"] == "To Rotate"
+        assert data["id"] == str(old_key_id)
+        assert len(data["secret"]) == 67
         assert data["created_by"] == str(developer.id)
 
-        # Verify old key is deleted from database
         from app.services import api_key_service
 
-        old_key = api_key_service.get(db, old_key_id, raise_404=False)
-        assert old_key is None
-
-        # Verify new key exists
-        new_key = api_key_service.get(db, data["id"])
-        assert new_key is not None
-        assert new_key.name == "Default"
+        persisted = api_key_service.get(db, old_key_id)
+        assert persisted is not None
+        assert persisted.key_hash == api_key_service.hash_secret(data["secret"])
+        with pytest.raises(HTTPException):
+            api_key_service.validate_api_key(db, api_key_secret(old_api_key))
+        assert api_key_service.validate_api_key(db, data["secret"]).id == old_key_id
 
     def test_rotate_api_key_not_found(self, client: TestClient, db: Session, api_v1_prefix: str) -> None:
         """Test rotating non-existent API key raises ResourceNotFoundError."""
@@ -408,7 +435,7 @@ class TestRotateApiKey:
         # Arrange
         developer = DeveloperFactory(email="test@example.com", password="test123")
         headers = developer_auth_headers(developer.id)
-        fake_key_id = "sk-nonexistent1234567890"
+        fake_key_id = uuid4()
 
         # Act
         response = client.post(
@@ -447,7 +474,6 @@ class TestRotateApiKey:
         assert response.status_code == 401
 
     def test_rotate_preserves_key_name(self, client: TestClient, db: Session, api_v1_prefix: str) -> None:
-        """Test that rotation creates new key with default name (not preserving original)."""
         # Arrange
         developer = DeveloperFactory(email="test@example.com", password="test123")
         old_api_key = ApiKeyFactory(developer=developer, name="Production Key")
@@ -462,8 +488,7 @@ class TestRotateApiKey:
         # Assert
         assert response.status_code == 201
         data = response.json()
-        # The new key gets default name (implementation doesn't preserve original name)
-        assert data["name"] == "Default"
+        assert data["name"] == "Production Key"
 
     def test_rotate_multiple_times(self, client: TestClient, db: Session, api_v1_prefix: str) -> None:
         """Test rotating the same API key multiple times."""
@@ -478,23 +503,18 @@ class TestRotateApiKey:
             headers=headers,
         )
         assert response1.status_code == 201
-        new_key_id_1 = response1.json()["id"]
+        key_id = response1.json()["id"]
 
         # Act - Second rotation
         response2 = client.post(
-            f"{api_v1_prefix}/developer/api-keys/{new_key_id_1}/rotate",
+            f"{api_v1_prefix}/developer/api-keys/{key_id}/rotate",
             headers=headers,
         )
 
         # Assert
         assert response2.status_code == 201
-        new_key_id_2 = response2.json()["id"]
-        assert new_key_id_2 != new_key_id_1
-        assert new_key_id_2 != api_key.id
+        assert response2.json()["id"] == key_id
 
-        # Verify only the final key exists
         from app.services import api_key_service
 
-        assert api_key_service.get(db, api_key.id, raise_404=False) is None
-        assert api_key_service.get(db, new_key_id_1, raise_404=False) is None
-        assert api_key_service.get(db, new_key_id_2, raise_404=False) is not None
+        assert api_key_service.get(db, key_id, raise_404=False) is not None
