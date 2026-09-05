@@ -253,6 +253,7 @@ class SummariesService:
         end_date: datetime,
         cursor: str | None,
         limit: int,
+        filter_by_priority: bool = True,
     ) -> PaginatedResponse[SleepSummary]:
         """Get daily sleep summaries aggregated by date, provider, and device."""
         self.logger.debug(f"Fetching sleep summaries for user {user_id} from {start_date} to {end_date}")
@@ -260,8 +261,9 @@ class SummariesService:
         # Get aggregated data from repository (now returns list of dicts)
         results = self.event_record_repo.get_sleep_summaries(db_session, user_id, start_date, end_date, cursor, limit)
 
-        # Filter by priority to get best source per date
-        results = self._filter_by_priority(db_session, user_id, results, date_key="sleep_date")
+        # Keep all aggregated provider/device candidates for clients with their own source policy.
+        if filter_by_priority:
+            results = self._filter_by_priority(db_session, user_id, results, date_key="sleep_date")
 
         # Check if there's more data
         has_more = len(results) > limit

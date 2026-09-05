@@ -54,11 +54,16 @@ def get_sleep_summary(
     _api_key: ApiKeyDep,
     cursor: str | None = None,
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    filter_by_priority: Annotated[
+        bool, Query(description="Keep only the preferred source per date; false returns all source summaries")
+    ] = True,
 ) -> PaginatedResponse[SleepSummary]:
     """Returns daily sleep metrics."""
     start_datetime = parse_query_datetime(start_date)
     end_datetime = parse_query_datetime(end_date)
-    return summaries_service.get_sleep_summaries(db, user_id, start_datetime, end_datetime, cursor, limit)
+    return summaries_service.get_sleep_summaries(
+        db, user_id, start_datetime, end_datetime, cursor, limit, filter_by_priority=filter_by_priority
+    )
 
 
 @router.get("/users/{user_id}/summaries/recovery")

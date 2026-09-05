@@ -29,6 +29,86 @@ from tests.utils import api_key_headers
 class TestSleepSummaryEndpoint:
     """Test suite for sleep summaries endpoint."""
 
+    def test_sleep_priority_opt_out_preserves_both_sources_and_cursor(self, client: TestClient, db: Session) -> None:
+        user = UserFactory()
+        priority_repo = ProviderPriorityRepository(ProviderPriority)
+        priority_repo.upsert(db, ProviderName.APPLE, 1)
+        priority_repo.upsert(db, ProviderName.WHOOP, 5)
+        for provider in (ProviderName.APPLE, ProviderName.WHOOP):
+            mapping = DataSourceFactory(user=user, provider=provider, source=provider.value)
+            event = EventRecordFactory(
+                mapping=mapping,
+                category="sleep",
+                start_datetime=datetime(2025, 12, 25, 22, tzinfo=timezone.utc),
+                end_datetime=datetime(2025, 12, 26, 6, tzinfo=timezone.utc),
+                duration_seconds=28800,
+                zone_offset="+00:00",
+            )
+            SleepDetailsFactory(event_record=event, sleep_total_duration_minutes=420)
+        headers = api_key_headers(ApiKeyFactory())
+        path = f"/api/v1/users/{user.id}/summaries/sleep"
+        params = {"start_date": "2025-12-25T00:00:00Z", "end_date": "2025-12-27T00:00:00Z"}
+        default = client.get(path, headers=headers, params=params)
+        assert default.status_code == 200
+        assert [row["source"]["provider"] for row in default.json()["data"]] == ["apple"]
+
+        all_sources = client.get(path, headers=headers, params={**params, "filter_by_priority": "false"})
+        assert all_sources.status_code == 200
+        assert {row["source"]["provider"] for row in all_sources.json()["data"]} == {"apple", "whoop"}
+        assert all(row["duration_minutes"] == 420 for row in all_sources.json()["data"])
+
+        first = client.get(path, headers=headers, params={**params, "filter_by_priority": "false", "limit": 1})
+        assert first.status_code == 200
+        page = first.json()
+        assert page["pagination"]["has_more"] is True
+        second = client.get(
+            path,
+            headers=headers,
+            params={**params, "filter_by_priority": "false", "limit": 1, "cursor": page["pagination"]["next_cursor"]},
+        )
+        assert second.status_code == 200
+        assert second.json()["pagination"]["has_more"] is False
+        assert {row["source"]["provider"] for row in page["data"] + second.json()["data"]} == {"apple", "whoop"}
+
+    def test_sleep_priority_opt_out_preserves_devices_and_existing_vitals(
+        self, client: TestClient, db: Session
+    ) -> None:
+        user = UserFactory()
+        hr_type = SeriesTypeDefinitionFactory.get_or_create_heart_rate()
+        start = datetime(2025, 12, 25, 22, tzinfo=timezone.utc)
+        for device, bpm in (("Watch A", 50), ("Watch B", 70)):
+            mapping = DataSourceFactory(user=user, provider=ProviderName.APPLE, source="apple", device_model=device)
+            event = EventRecordFactory(
+                mapping=mapping,
+                category="sleep",
+                start_datetime=start,
+                end_datetime=start + timedelta(hours=8),
+                duration_seconds=28800,
+                zone_offset="+00:00",
+            )
+            SleepDetailsFactory(event_record=event, sleep_total_duration_minutes=420)
+            DataPointSeriesFactory(mapping=mapping, series_type=hr_type, recorded_at=start, value=Decimal(bpm))
+        path = f"/api/v1/users/{user.id}/summaries/sleep"
+        headers = api_key_headers(ApiKeyFactory())
+        params = {
+            "start_date": "2025-12-25T00:00:00Z",
+            "end_date": "2025-12-27T00:00:00Z",
+            "filter_by_priority": "false",
+            "limit": 1,
+        }
+        first = client.get(path, headers=headers, params=params)
+        assert first.status_code == 200
+        page = first.json()
+        assert page["pagination"]["has_more"] is True
+        second = client.get(path, headers=headers, params={**params, "cursor": page["pagination"]["next_cursor"]})
+        assert second.status_code == 200
+        assert second.json()["pagination"]["has_more"] is False
+        rows = page["data"] + second.json()["data"]
+        assert {row["source"]["device"] for row in rows} == {"Watch A", "Watch B"}
+        # The existing physiological query averages all user sources in each sleep window.
+        assert all(row["avg_heart_rate_bpm"] == 60 for row in rows)
+        assert all(len(row["sessions"]) == 1 for row in rows)
+
     def test_get_sleep_summary_basic(self, client: TestClient, db: Session) -> None:
         """Test basic sleep summary returns start_time, end_time, and duration."""
         user = UserFactory()
