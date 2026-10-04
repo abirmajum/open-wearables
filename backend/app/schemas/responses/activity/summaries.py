@@ -1,4 +1,5 @@
 from datetime import date, datetime
+from uuid import UUID
 
 from pydantic import BaseModel, Field
 
@@ -53,6 +54,7 @@ class SleepSessionSummary(BaseModel):
     For full per-session detail (stages, intervals, source) use the sleep-sessions endpoint.
     """
 
+    id: UUID | None = Field(None, description="Stable event-record identity for exact score/session joins")
     start_time: datetime
     end_time: datetime
     zone_offset: str | None = Field(None, description="UTC offset of the session, e.g. '+02:00'")

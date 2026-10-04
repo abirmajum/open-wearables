@@ -317,6 +317,7 @@ class SummariesService:
             raw_sessions = result.get("sessions") or []
             sessions = [
                 SleepSessionSummary(
+                    id=s.get("id"),
                     start_time=s["start_time"],
                     end_time=s["end_time"],
                     zone_offset=s.get("zone_offset"),
