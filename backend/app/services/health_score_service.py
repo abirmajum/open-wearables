@@ -19,6 +19,12 @@ class HealthScoreService(
         super().__init__(crud_model=HealthScoreRepository, model=HealthScore, log=log)
 
     @handle_exceptions
+    def upsert_event_score(self, db_session: DbSession, score: HealthScoreCreate) -> HealthScore:
+        saved = self.crud.upsert_event_score(db_session, score)
+        db_session.commit()
+        return saved
+
+    @handle_exceptions
     def get_by_all_components(self, db_session: DbSession, components: list[str]) -> list[HealthScore]:
         return self.crud.get_by_all_components(db_session, components)
 

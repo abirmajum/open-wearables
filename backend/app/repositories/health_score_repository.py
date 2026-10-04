@@ -2,7 +2,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import and_, asc, desc, tuple_
+from sqlalchemy import and_, asc, desc, text, tuple_
 from sqlalchemy.dialects.postgresql import insert
 
 from app.database import DbSession
@@ -14,6 +14,40 @@ from app.utils.pagination import decode_cursor
 
 
 class HealthScoreRepository(CrudRepository[HealthScore, HealthScoreCreate, HealthScoreUpdate]):
+    def upsert_event_score(self, db_session: DbSession, creator: HealthScoreCreate) -> HealthScore:
+        """Refresh a provider event score while preserving its public identity.
+
+        The event link is authoritative; timestamp lookup attaches legacy scores
+        that predate event links. Serialize this account/category's writes so a
+        webhook and history replay cannot race the two unique constraints.
+        """
+        if creator.event_record_id is None:
+            raise ValueError("event_score_requires_record")
+        db_session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+            {"key": f"event-score:{creator.user_id}:{creator.provider}:{creator.category}"},
+        )
+        scope = db_session.query(HealthScore).filter(
+            HealthScore.user_id == creator.user_id,
+            HealthScore.provider == creator.provider,
+            HealthScore.category == creator.category,
+        )
+        existing = scope.filter(HealthScore.event_record_id == creator.event_record_id).first()
+        if existing is None:
+            existing = scope.filter(HealthScore.recorded_at == creator.recorded_at).first()
+            if existing is not None and existing.event_record_id not in (None, creator.event_record_id):
+                raise ValueError("event_score_identity_conflict")
+        values = creator.model_dump()
+        if existing is None:
+            existing = HealthScore(**values)
+            db_session.add(existing)
+        else:
+            for key, value in values.items():
+                if key != "id":
+                    setattr(existing, key, value)
+        db_session.flush()
+        return existing
+
     def get_by_all_components(self, db_session: DbSession, components: list[str]) -> list[HealthScore]:
         """Return health scores whose components JSONB contains all specified keys (?& operator)."""
         return db_session.query(HealthScore).filter(HealthScore.components.has_all(components)).all()

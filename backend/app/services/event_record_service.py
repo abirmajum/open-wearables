@@ -35,6 +35,7 @@ from app.schemas.model_crud.activities import (
     MenstrualCycleDetailCreate,
 )
 from app.schemas.model_crud.activities.sleep import SleepStage
+from app.schemas.model_crud.activities.zones import HRZones
 from app.schemas.responses.activity import (
     MenstrualCycleRecord,
     SleepSession,
@@ -230,6 +231,8 @@ class EventRecordService(
         record: EventRecordCreate,
         detail: EventRecordDetailCreate,
         threshold_minutes: int,
+        *,
+        merge_adjacent: bool = True,
     ) -> EventRecord:
         """Create a sleep record, merging with any adjacent session within threshold_minutes.
 
@@ -242,7 +245,7 @@ class EventRecordService(
         never loses the original data.
         """
         result, inserted, final_detail = self._create_or_merge_sleep_inner(
-            db_session, user_id, record, detail, threshold_minutes
+            db_session, user_id, record, detail, threshold_minutes, merge_adjacent=merge_adjacent
         )
         if inserted:
             eff = final_detail.sleep_efficiency_score
@@ -283,16 +286,32 @@ class EventRecordService(
         record: EventRecordCreate,
         detail: EventRecordDetailCreate,
         threshold_minutes: int,
+        *,
+        merge_adjacent: bool = True,
     ) -> tuple[EventRecord, bool, EventRecordDetailCreate]:
-        adjacent = self.find_adjacent_sleep_record(
-            db_session,
-            user_id,
-            record.start_datetime,
-            record.end_datetime,
-            threshold_minutes,
-            source=record.source,
-            provider=record.provider,
+        # External identity is stronger than temporal adjacency. A provider may
+        # correct a session's start/end by more than the merge threshold.
+        adjacent = (
+            self.crud.get_by_external_id(
+                db_session,
+                user_id,
+                record.external_id,
+                source=record.source,
+                provider=record.provider,
+            )
+            if record.external_id is not None
+            else None
         )
+        if adjacent is None and merge_adjacent:
+            adjacent = self.find_adjacent_sleep_record(
+                db_session,
+                user_id,
+                record.start_datetime,
+                record.end_datetime,
+                threshold_minutes,
+                source=record.source,
+                provider=record.provider,
+            )
 
         if adjacent is not None:
             # Same external_id → re-ingestion of the same session (e.g. webhook
@@ -758,6 +777,7 @@ class EventRecordService(
                 distance_meters=float(details.distance) if details and details.distance else None,
                 avg_heart_rate_bpm=computed_hr.get(record.id),
                 max_heart_rate_bpm=details.heart_rate_max if details else None,
+                hr_zones=HRZones.model_validate(details.hr_zones) if details and details.hr_zones else None,
                 avg_pace_sec_per_km=None,  # Derived or in details?
                 elevation_gain_meters=float(details.total_elevation_gain)
                 if details and details.total_elevation_gain
@@ -822,6 +842,7 @@ class EventRecordService(
             distance_meters=float(details.distance) if details and details.distance else None,
             avg_heart_rate_bpm=self._resolve_avg_hr(db_session, [record]).get(record.id),
             max_heart_rate_bpm=details.heart_rate_max if details else None,
+            hr_zones=HRZones.model_validate(details.hr_zones) if details and details.hr_zones else None,
             avg_pace_sec_per_km=avg_pace_sec_per_km,
             elevation_gain_meters=float(details.total_elevation_gain)
             if details and details.total_elevation_gain

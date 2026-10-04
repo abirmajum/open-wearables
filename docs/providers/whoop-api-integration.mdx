@@ -303,6 +303,32 @@ With webhooks enabled, most data arrives in real time and the polling cycle only
 
 The default scope `offline read:cycles read:sleep read:recovery read:workout read:body_measurement read:profile` covers all data types currently processed by Open Wearables.
 
+## Sleep history integrity
+
+New WHOOP sleep sessions use a stable internal UUID scoped to the Open Wearables
+user. The same WHOOP account connected to two OW users therefore does not collide
+on the event primary key. Re-importing an existing external sleep ID preserves its
+current internal ID, including rows written before this change. Timestamp
+corrections update that row even outside the adjacency window. WHOOP already
+supplies complete sessions, so nearby naps remain separate from main sleep.
+
+Sleep persistence errors propagate to the caller and mark a bulk result partial;
+failed records are not counted as saved. Replaying a window refreshes the existing
+provider score and attaches it to the actual saved event. Pending/unscorable states
+keep a null score value. Score components preserve `score_state`, sleep-cycle and
+disturbance counts, and supplied `sleep_needed` fields with their original `_milli`
+units. Original `timezone_offset` is retained.
+
+Sleep summaries expose `sessions[].id` for exact event/score joins. Workout list
+and detail responses expose stored `hr_zones` (zone durations in seconds). Existing
+rows need a normal provider replay to acquire fields that were never persisted;
+this change does not trigger a backfill or migrate identities automatically.
+
+Run `pytest tests/integrations/test_whoop_sleep_history.py --basetemp=OUTPUT_DIR --junitxml=RESULTS.xml`
+against a disposable PostgreSQL/Redis pair to verify the fixture import through
+public HTTP responses. The test writes synthetic JSON evidence under the pytest
+output directory and does not call WHOOP.
+
 ## Next Steps
 
 <CardGroup cols={2}>

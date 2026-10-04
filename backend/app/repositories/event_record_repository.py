@@ -822,6 +822,7 @@ class EventRecordRepository(
 
         rows = (
             db_session.query(
+                EventRecord.id.label("id"),
                 local_sleep_date.label("sleep_date"),
                 EventRecord.start_datetime.label("start_time"),
                 EventRecord.end_datetime.label("end_time"),
@@ -850,6 +851,7 @@ class EventRecordRepository(
             key = (row.sleep_date, row.provider, row.source, row.device_model)
             sessions_by_key.setdefault(key, []).append(
                 {
+                    "id": row.id,
                     "start_time": row.start_time,
                     "end_time": row.end_time,
                     "zone_offset": row.zone_offset,
