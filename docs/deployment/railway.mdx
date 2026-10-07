@@ -127,6 +127,24 @@ This repository does not establish the live backup, restore-test, region, or
 capacity status. Confirm those directly in the production platform before a
 user-facing rollout.
 
+## Worker supervision
+
+The Celery worker service starts an I/O worker for `default`, `sdk_sync`,
+`garmin_sync`, and `webhook_sync`, and a separate two-process worker for
+`xml_sync`. Keep the service start command set to
+`bash scripts/start/worker.sh`.
+
+The start script supervises both workers. If either exits unexpectedly, it
+terminates the other and exits with a failure status so Railway's configured
+restart policy can recover the service. A container shutdown signal is forwarded
+to both worker process groups; they have up to 30 seconds to exit before being
+killed. Configure the platform shutdown grace period accordingly.
+
+After a worker deployment, confirm that both `io@...` and `cpu@...` workers are
+present and that their queues drain. API `/readyz` alone does not establish
+worker health. Supervision does not change task acknowledgement or retry
+semantics; interrupted in-flight jobs still require separate durability checks.
+
 ## Environment variables reference
 
 Key variables you may want to customize on the **Backend** service:
