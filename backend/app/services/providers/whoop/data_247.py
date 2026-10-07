@@ -98,8 +98,8 @@ class Whoop247Data(Base247DataTemplate):
         """Fetch every page of a paginated Whoop collection endpoint.
 
         Returns (records, truncated). truncated means a page failed and the range is
-        incomplete — nothing re-fetches it, so callers keep the records they got and
-        report the gap rather than discarding real data.
+        incomplete. Callers keep the records they got and report the gap so the live
+        pull can preserve its cursor and retry the range.
 
         label names the data for logging; task follows the get_{label}_data convention.
         """
