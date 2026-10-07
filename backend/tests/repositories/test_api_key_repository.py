@@ -1,14 +1,5 @@
-"""
-Tests for ApiKeyRepository.
-
-Tests cover:
-- CRUD operations (create, get, get_all, delete)
-- get_all_ordered method (ordered by created_at descending)
-- API key specific behaviors (string ID)
-"""
-
 from datetime import datetime, timedelta, timezone
-from typing import cast
+from hashlib import sha256
 from uuid import UUID, uuid4
 
 import pytest
@@ -18,11 +9,6 @@ from app.models import ApiKey
 from app.repositories.api_key_repository import ApiKeyRepository
 from app.schemas.model_crud.credentials import ApiKeyCreate, ApiKeyUpdate
 from tests.factories import ApiKeyFactory, DeveloperFactory
-
-
-def _str_id_as_uuid(str_id: str) -> UUID:
-    """Cast string ID to UUID for type checker (ApiKey uses string IDs)."""
-    return cast(UUID, str_id)
 
 
 class TestApiKeyRepository:
@@ -37,9 +23,12 @@ class TestApiKeyRepository:
         """Test creating a new API key."""
         # Arrange
         developer = DeveloperFactory()
-        key_id = f"sk-{uuid4().hex[:32]}"
+        key_id = uuid4()
+        synthetic_secret = "repository-create-test"
         api_key_data = ApiKeyCreate(
             id=key_id,
+            key_hash=sha256(synthetic_secret.encode("utf-8")).hexdigest(),
+            display_prefix="repository",
             name="Test API Key",
             created_by=developer.id,
             created_at=datetime.now(timezone.utc),
@@ -56,16 +45,18 @@ class TestApiKeyRepository:
 
         # Verify in database
         db.expire_all()
-        db_api_key = api_key_repo.get(db, _str_id_as_uuid(key_id))
+        db_api_key = api_key_repo.get(db, key_id)
         assert db_api_key is not None
         assert db_api_key.name == "Test API Key"
 
     def test_create_without_developer(self, db: Session, api_key_repo: ApiKeyRepository) -> None:
         """Test creating an API key without a developer (orphaned key)."""
         # Arrange
-        key_id = f"sk-{uuid4().hex[:32]}"
+        key_id = uuid4()
         api_key_data = ApiKeyCreate(
             id=key_id,
+            key_hash=sha256(b"repository-orphan-test").hexdigest(),
+            display_prefix="repository",
             name="Orphaned Key",
             created_by=None,
         )
@@ -84,7 +75,7 @@ class TestApiKeyRepository:
         api_key = ApiKeyFactory(name="My Test Key")
 
         # Act
-        result = api_key_repo.get(db, _str_id_as_uuid(api_key.id))
+        result = api_key_repo.get(db, api_key.id)
 
         # Assert
         assert result is not None
@@ -94,7 +85,7 @@ class TestApiKeyRepository:
     def test_get_nonexistent(self, db: Session, api_key_repo: ApiKeyRepository) -> None:
         """Test retrieving a nonexistent API key returns None."""
         # Act
-        result = api_key_repo.get(db, _str_id_as_uuid("sk-nonexistent-key-12345"))
+        result = api_key_repo.get(db, uuid4())
 
         # Assert
         assert result is None
@@ -218,7 +209,7 @@ class TestApiKeyRepository:
 
         # Assert
         db.expire_all()
-        deleted_key = api_key_repo.get(db, _str_id_as_uuid(key_id))
+        deleted_key = api_key_repo.get(db, key_id)
         assert deleted_key is None
 
     def test_update_not_implemented(self, db: Session, api_key_repo: ApiKeyRepository) -> None:
@@ -235,7 +226,7 @@ class TestApiKeyRepository:
 
         # Verify in database
         db.expire_all()
-        db_key = api_key_repo.get(db, _str_id_as_uuid(api_key.id))
+        db_key = api_key_repo.get(db, api_key.id)
         assert db_key is not None
         assert db_key.name == "Updated Name"
 
@@ -243,9 +234,11 @@ class TestApiKeyRepository:
         """Test creating an API key with a specific timestamp."""
         # Arrange
         custom_time = datetime(2023, 1, 15, 10, 30, 0, tzinfo=timezone.utc)
-        key_id = f"sk-{uuid4().hex[:32]}"
+        key_id = uuid4()
         api_key_data = ApiKeyCreate(
             id=key_id,
+            key_hash=sha256(b"repository-timestamp-test").hexdigest(),
+            display_prefix="repository",
             name="Historical Key",
             created_at=custom_time,
         )
@@ -278,9 +271,11 @@ class TestApiKeyRepository:
     def test_api_key_id_format(self, db: Session, api_key_repo: ApiKeyRepository) -> None:
         """Test that API key IDs are stored correctly (string format)."""
         # Arrange
-        key_id = "sk-test-custom-key-id-12345"
+        key_id = uuid4()
         api_key_data = ApiKeyCreate(
             id=key_id,
+            key_hash=sha256(b"repository-format-test").hexdigest(),
+            display_prefix="repository",
             name="Custom ID Key",
         )
 
@@ -288,9 +283,8 @@ class TestApiKeyRepository:
         result = api_key_repo.create(db, api_key_data)
 
         # Assert
-        assert isinstance(result.id, str)
+        assert isinstance(result.id, UUID)
         assert result.id == key_id
-        assert result.id.startswith("sk-")
 
     def test_get_all_ordered_empty_database(self, db: Session, api_key_repo: ApiKeyRepository) -> None:
         """Test get_all_ordered with no API keys."""

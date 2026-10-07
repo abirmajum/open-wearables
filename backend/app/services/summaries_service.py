@@ -195,6 +195,7 @@ class SummariesService:
         start_date: datetime,
         end_date: datetime,
         live_results: list,  # noqa: ANN401  — accepts ActivityAggregateResult | dict
+        provider: ProviderName | None = None,
     ) -> list:
         """Merge archived daily aggregates into live results.
 
@@ -221,7 +222,7 @@ class SummariesService:
         ]
 
         archive_results = self.archive_repo.get_daily_activity_aggregates_from_archive(
-            db_session, user_id, start_date, end_date, series_type_ids
+            db_session, user_id, start_date, end_date, series_type_ids, provider
         )
 
         if not archive_results:
@@ -252,6 +253,7 @@ class SummariesService:
         end_date: datetime,
         cursor: str | None,
         limit: int,
+        filter_by_priority: bool = True,
     ) -> PaginatedResponse[SleepSummary]:
         """Get daily sleep summaries aggregated by date, provider, and device."""
         self.logger.debug(f"Fetching sleep summaries for user {user_id} from {start_date} to {end_date}")
@@ -259,8 +261,9 @@ class SummariesService:
         # Get aggregated data from repository (now returns list of dicts)
         results = self.event_record_repo.get_sleep_summaries(db_session, user_id, start_date, end_date, cursor, limit)
 
-        # Filter by priority to get best source per date
-        results = self._filter_by_priority(db_session, user_id, results, date_key="sleep_date")
+        # Keep all aggregated provider/device candidates for clients with their own source policy.
+        if filter_by_priority:
+            results = self._filter_by_priority(db_session, user_id, results, date_key="sleep_date")
 
         # Check if there's more data
         has_more = len(results) > limit
@@ -314,6 +317,7 @@ class SummariesService:
             raw_sessions = result.get("sessions") or []
             sessions = [
                 SleepSessionSummary(
+                    id=s.get("id"),
                     start_time=s["start_time"],
                     end_time=s["end_time"],
                     zone_offset=s.get("zone_offset"),
@@ -458,6 +462,7 @@ class SummariesService:
         cursor: str | None,
         limit: int,
         sort_order: str = "asc",
+        provider: ProviderName | None = None,
     ) -> PaginatedResponse[ActivitySummary]:
         """Get daily activity summaries aggregated by date, provider, and device.
 
@@ -475,17 +480,19 @@ class SummariesService:
         self.logger.debug(f"Fetching activity summaries for user {user_id} from {start_date} to {end_date}")
 
         # Get aggregated data from time-series repository (live data)
-        results = self.data_point_repo.get_daily_activity_aggregates(db_session, user_id, start_date, end_date)
+        results = self.data_point_repo.get_daily_activity_aggregates(
+            db_session, user_id, start_date, end_date, provider
+        )
 
         # Merge archived data when archival is enabled
-        results = self._merge_archive_activity(db_session, user_id, start_date, end_date, results)
+        results = self._merge_archive_activity(db_session, user_id, start_date, end_date, results, provider)
 
         # Filter by priority to get best source per date
         results = self._filter_by_priority(db_session, user_id, results, date_key="activity_date")
 
         # Get workout aggregates (elevation, distance, energy from workouts)
         workout_aggregates = self.event_record_repo.get_daily_workout_aggregates(
-            db_session, user_id, start_date, end_date
+            db_session, user_id, start_date, end_date, provider
         )
 
         # Build lookup dict for workout data by (date, provider, device)
@@ -496,7 +503,7 @@ class SummariesService:
 
         # Get active/sedentary minutes from step data
         activity_minutes = self.data_point_repo.get_daily_active_minutes(
-            db_session, user_id, start_date, end_date, active_threshold=ACTIVE_STEPS_THRESHOLD
+            db_session, user_id, start_date, end_date, active_threshold=ACTIVE_STEPS_THRESHOLD, provider=provider
         )
 
         # Build lookup for activity minutes
@@ -518,6 +525,7 @@ class SummariesService:
             light_max=hr_zones["light_max"],
             moderate_max=hr_zones["moderate_max"],
             vigorous_max=hr_zones["vigorous_max"],
+            provider=provider,
         )
 
         # Build lookup for intensity minutes

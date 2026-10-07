@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from decimal import Decimal
+from hashlib import sha256
 from typing import Any
 from uuid import uuid4
 
@@ -36,6 +37,7 @@ from app.models import (
 from app.schemas.auth import ConnectionStatus
 from app.schemas.enums import HealthScoreCategory, ProviderName
 from app.utils.security import get_password_hash
+from tests.utils.auth import api_key_secret_for_id
 
 
 class BaseFactory(factory.alchemy.SQLAlchemyModelFactory):
@@ -284,7 +286,9 @@ class ApiKeyFactory(BaseFactory):
     class Meta:
         model = ApiKey
 
-    id = LazyFunction(lambda: f"sk-{uuid4().hex[:32]}")
+    id = LazyFunction(uuid4)
+    key_hash = LazyAttribute(lambda o: sha256(api_key_secret_for_id(o.id).encode("utf-8")).hexdigest())
+    display_prefix = "test-key"
     name = Sequence(lambda n: f"Test API Key {n}")
     created_at = LazyFunction(lambda: datetime.now(timezone.utc))
 

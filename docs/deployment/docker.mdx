@@ -183,11 +183,21 @@ The defaults in `.env.example` are development values. Override at least these f
   </Step>
   <Step title="Verify the API and frontend">
     ```bash
-    curl -fsS http://localhost:8000/openapi.json > /dev/null && echo OK
+    curl -fsS http://localhost:8000/healthz && echo
+    curl -fsS http://localhost:8000/readyz && echo
     ```
-    Prints `OK` once the API is up (migrations can take a moment on first start). Then open `http://localhost:3000` in a browser—the login page should load.
+    `/healthz` confirms the API process can answer requests. `/readyz` additionally
+    checks the database and returns `503` while it is unavailable. The backend image
+    uses `/healthz` for its Docker health check, so a temporary dependency outage does
+    not cause a container restart loop. Migrations can take a moment on first start.
+    Then open `http://localhost:3000` in a browser—the login page should load.
   </Step>
 </Steps>
+
+The startup command honors a platform-provided `PORT` (such as Railway) and otherwise
+uses `API_PORT` (default `8000`). Configure a platform health check for `/healthz`;
+use `/readyz` for load-balancer/readiness decisions that should stop traffic when the
+database is unavailable.
 
 In practice you will put the API and frontend behind a reverse proxy with TLS instead of exposing the container ports directly.
 

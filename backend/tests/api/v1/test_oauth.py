@@ -13,6 +13,8 @@ from uuid import uuid4
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
+from app.config import settings
+from app.schemas.enums import ProviderName
 from tests.factories import DeveloperFactory
 from tests.utils import developer_auth_headers
 
@@ -60,6 +62,22 @@ class TestOAuthAuthorizeEndpoint:
         data = response.json()
         assert "authorization_url" in data
         assert "state" in data
+
+    def test_authorize_rejects_provider_callback_as_post_callback_redirect(
+        self, client: TestClient, db: Session
+    ) -> None:
+        response = client.get(
+            "/api/v1/oauth/whoop/authorize",
+            params={
+                "user_id": str(uuid4()),
+                "redirect_uri": settings.oauth_redirect_uri(ProviderName.WHOOP),
+            },
+        )
+
+        assert response.status_code == 400
+        assert response.json() == {
+            "detail": "redirect_uri must be an application return URL, not the Open Wearables provider callback"
+        }
 
     def test_authorize_different_providers(self, client: TestClient, db: Session) -> None:
         """Test initiating OAuth for different providers."""

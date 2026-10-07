@@ -820,10 +820,26 @@ class OpenWearablesClient:
                     return items
                 params = {**params, "cursor": cursor}
 
-    async def get_activity_summary(self, user_id: str, start_date: str, end_date: str) -> list[dict]:
+    async def get_activity_summary(
+        self,
+        user_id: str,
+        start_date: str,
+        end_date: str,
+        provider: str | None = None,
+    ) -> list[dict]:
+        """Get normalized daily activity summaries, optionally from one provider only.
+
+        Pass ``provider="apple"`` (or another supported provider enum value)
+        to constrain aggregation and source provenance before source-priority
+        selection.
+        Omit it to retain the default cross-provider priority behavior.
+        """
+        params = {"start_date": start_date, "end_date": end_date}
+        if provider:
+            params["provider"] = provider
         return await self._paginated(
             f"/api/v1/users/{user_id}/summaries/activity",
-            {"start_date": start_date, "end_date": end_date},
+            params,
         )
 
     async def get_sleep_summary(self, user_id: str, start_date: str, end_date: str) -> list[dict]:
@@ -1012,4 +1028,3 @@ async def main():
     View source code and contribute.
   </Card>
 </CardGroup>
-

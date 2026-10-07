@@ -7,14 +7,17 @@ from pydantic import BaseModel, ConfigDict, Field
 class ApiKeyRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
-    id: str
+    id: UUID
+    display_prefix: str
     name: str
     created_by: UUID | None
     created_at: datetime
 
 
 class ApiKeyCreate(BaseModel):
-    id: str
+    id: UUID
+    key_hash: str
+    display_prefix: str
     name: str
     created_by: UUID | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -22,3 +25,9 @@ class ApiKeyCreate(BaseModel):
 
 class ApiKeyUpdate(BaseModel):
     name: str | None = None
+
+
+class ApiKeyWithSecret(ApiKeyRead):
+    """One-time credential response returned only by create and rotate."""
+
+    secret: str = Field(repr=False)

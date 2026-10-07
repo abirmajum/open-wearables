@@ -69,8 +69,11 @@ done || echo "Warning: Could not register webhook event types with Svix. Will re
 
 # Init app
 echo "Starting the FastAPI application..."
+# Railway and other managed platforms set PORT. Local Docker Compose continues to
+# use API_PORT (defaulting to 8000), so published images work in both environments.
+api_port="${PORT:-${API_PORT:-8000}}"
 if [ "$ENVIRONMENT" = "local" ]; then
-    uv run fastapi dev app/main.py --host 0.0.0.0 --port "${API_PORT:-8000}"
+    uv run fastapi dev app/main.py --host 0.0.0.0 --port "$api_port"
 else
-    uv run fastapi run app/main.py --host 0.0.0.0 --port "${API_PORT:-8000}"
+    uv run fastapi run app/main.py --host 0.0.0.0 --port "$api_port"
 fi

@@ -517,10 +517,15 @@ export interface ActivitySummary {
 }
 
 export interface ApiKey {
-  id: string; // This is the actual API key value (sk-...)
+  id: string;
+  display_prefix: string;
   name: string;
-  created_by: string;
+  created_by: string | null;
   created_at: string;
+}
+
+export interface ApiKeyWithSecret extends ApiKey {
+  secret: string;
 }
 
 export interface ApiKeyCreate {

@@ -132,7 +132,7 @@ Whoop reports sleep stages as **aggregate durations for the whole sleep**, not a
 #--- Whoop ---#
 WHOOP_CLIENT_ID=your-whoop-client-id
 WHOOP_CLIENT_SECRET=your-whoop-client-secret
-WHOOP_REDIRECT_URI=http://localhost:8000/api/v1/oauth/whoop/callback
+API_BASE_URL=http://localhost:8000
 WHOOP_DEFAULT_SCOPE=offline read:cycles read:sleep read:recovery read:workout read:body_measurement read:profile
 ```
 
@@ -142,7 +142,7 @@ WHOOP_DEFAULT_SCOPE=offline read:cycles read:sleep read:recovery read:workout re
     |----------|-------------|
     | `WHOOP_CLIENT_ID` | Client ID from the Whoop Developer Dashboard |
     | `WHOOP_CLIENT_SECRET` | Client Secret from the Whoop Developer Dashboard |
-    | `WHOOP_REDIRECT_URI` | Must match a redirect URI registered in the Developer Dashboard. For local dev: `http://localhost:8000/api/v1/oauth/whoop/callback` |
+    | `API_BASE_URL` | Open Wearables derives the server-side callback as `{API_BASE_URL}/api/v1/oauth/whoop/callback`. Register that exact URL in the Developer Dashboard. For `https://ow.rumihq.com`, register `https://ow.rumihq.com/api/v1/oauth/whoop/callback`. |
     | `WHOOP_DEFAULT_SCOPE` | OAuth scopes requested during authorization. The `offline` scope is required for refresh tokens |
 
   </Step>
@@ -167,7 +167,7 @@ WHOOP_DEFAULT_SCOPE=offline read:cycles read:sleep read:recovery read:workout re
 
     **2. Redirect the user** to the `authorization_url`. They will log in to Whoop and authorize your app.
 
-    **3. Whoop redirects back** to the callback URI configured in your `.env` (`WHOOP_REDIRECT_URI`). Open Wearables automatically exchanges the authorization code for access and refresh tokens.
+    **3. Whoop redirects back** to the server-side callback derived from `API_BASE_URL`. Open Wearables automatically exchanges the authorization code for access and refresh tokens.
 
     **4. Verify the connection** was created:
 
@@ -179,7 +179,7 @@ WHOOP_DEFAULT_SCOPE=offline read:cycles read:sleep read:recovery read:workout re
     You should see a connection with `"provider": "whoop"` and `"status": "active"`.
 
     <Note>
-      The `redirect_uri` parameter in the authorize call is where the **user** is sent after the flow completes (e.g., back to your app). This is separate from `WHOOP_REDIRECT_URI` in your `.env`, which is the **server-side** OAuth callback that Whoop sends the authorization code to.
+      The `redirect_uri` parameter in the authorize call is where the **user** is sent after the flow completes (e.g., back to your app). It is separate from the server-side callback derived from `API_BASE_URL`, which Whoop sends the authorization code to. Do not point `redirect_uri` back to the Open Wearables callback; the API rejects that loop.
     </Note>
   </Step>
 
@@ -303,6 +303,32 @@ With webhooks enabled, most data arrives in real time and the polling cycle only
 
 The default scope `offline read:cycles read:sleep read:recovery read:workout read:body_measurement read:profile` covers all data types currently processed by Open Wearables.
 
+## Sleep history integrity
+
+New WHOOP sleep sessions use a stable internal UUID scoped to the Open Wearables
+user. The same WHOOP account connected to two OW users therefore does not collide
+on the event primary key. Re-importing an existing external sleep ID preserves its
+current internal ID, including rows written before this change. Timestamp
+corrections update that row even outside the adjacency window. WHOOP already
+supplies complete sessions, so nearby naps remain separate from main sleep.
+
+Sleep persistence errors propagate to the caller and mark a bulk result partial;
+failed records are not counted as saved. Replaying a window refreshes the existing
+provider score and attaches it to the actual saved event. Pending/unscorable states
+keep a null score value. Score components preserve `score_state`, sleep-cycle and
+disturbance counts, and supplied `sleep_needed` fields with their original `_milli`
+units. Original `timezone_offset` is retained.
+
+Sleep summaries expose `sessions[].id` for exact event/score joins. Workout list
+and detail responses expose stored `hr_zones` (zone durations in seconds). Existing
+rows need a normal provider replay to acquire fields that were never persisted;
+this change does not trigger a backfill or migrate identities automatically.
+
+Run `pytest tests/integrations/test_whoop_sleep_history.py --basetemp=OUTPUT_DIR --junitxml=RESULTS.xml`
+against a disposable PostgreSQL/Redis pair to verify the fixture import through
+public HTTP responses. The test writes synthetic JSON evidence under the pytest
+output directory and does not call WHOOP.
+
 ## Next Steps
 
 <CardGroup cols={2}>
@@ -322,3 +348,17 @@ The default scope `offline read:cycles read:sleep read:recovery read:workout rea
 - Check [GitHub Discussions](https://github.com/the-momentum/open-wearables/discussions).
 - Check the [Whoop Developer Documentation](https://developer.whoop.com/docs/developing/getting-started).
 </Note>
+
+## Failed and partial pull retries
+
+A live REST pull advances its `last_synced_at` cursor only after the workouts and
+24/7 data operations complete successfully. Fetch errors, failed records and
+partial pagination preserve the previous cursor, including WHOOP sleep, recovery,
+cycles and body measurements. Successfully saved records remain available, and the
+next scheduled pull retries the same range using the existing upsert behavior.
+Zero records is a successful result when the entire request completed.
+
+A linked profile waiting for another profile's pull preserves its cursor until
+its own fan-out task completes. Historical pulls never advance the live cursor.
+This change does not initiate a backfill or repair gaps from earlier cursor moves;
+those require a separately requested historical sync.

@@ -134,7 +134,8 @@
             "group": "Deployment",
             "pages": [
               "deployment/docker",
-              "deployment/railway"
+              "deployment/railway",
+              "deployment/api-key-security-cutover"
             ]
           },
           {

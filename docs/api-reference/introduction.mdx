@@ -99,10 +99,12 @@ X-Open-Wearables-API-Key: YOUR_API_KEY
 2. Log in
 3. Navigate to the API Keys section in the Settings tab
 4. Generate a new API key
-5. Copy and securely store the key
+5. Copy and securely store the secret when it is shown
 
 <Warning>
-  Keep your API keys secure. Never commit them to version control or expose them in client-side code.
+  API key secrets are returned only when a key is created or rotated. They cannot
+  be recovered later. Keep them secure, never put them in a URL, and never commit
+  them to version control or expose them in client-side code.
 </Warning>
 
 ## Response Formats
@@ -216,3 +218,15 @@ The complete OpenAPI specification is available at:
 <Tip>
   The OpenAPI specification is auto-generated from the API code and is always the most accurate reference.
 </Tip>
+
+### Sleep summary source selection
+
+`GET /api/v1/users/{user_id}/summaries/sleep` accepts optional boolean
+`filter_by_priority` (default `true`). Set `filter_by_priority=false` to return
+all daily provider/source/device groups for clients that select their own source.
+Keep this parameter on subsequent cursor requests. The existing date range and
+`limit` (1–100, default 50) parameters still apply.
+
+This option changes selection of sleep summaries only. Physiological averages
+remain calculated across the user's data sources within each summary's sleep
+window; they are not measurements restricted to the summary's source.
