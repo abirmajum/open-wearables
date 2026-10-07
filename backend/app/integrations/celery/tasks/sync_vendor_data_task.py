@@ -223,8 +223,7 @@ def sync_vendor_data(
                         # task for this profile that emits a LINKED_ACCOUNT completed event
                         # once the actual data delivery is done.  A pre-emptive event here
                         # would show up as a duplicate in the sync log.
-                        if not is_historical:
-                            user_connection_repo.update_last_synced_at(db, connection)
+                        # Preserve the cursor until the fan-out actually delivers data.
                         result.providers_synced[provider_name] = ProviderSyncResult(
                             success=True, params={"linked_account": True}
                         )
@@ -396,7 +395,27 @@ def sync_vendor_data(
                             )
                             provider_result.params["data_247"] = {"success": False, "error": str(e)}
 
-                    if not is_historical:
+                    sub_results = list(provider_result.params.values())
+                    all_failed = bool(sub_results) and all(
+                        isinstance(r, dict) and r.get("success") is False for r in sub_results
+                    )
+                    any_failed = any(isinstance(r, dict) and r.get("success") is False for r in sub_results)
+                    any_partial = any(
+                        isinstance(r, dict) and any(key.endswith("_partial") and value for key, value in r.items())
+                        for r in sub_results
+                    )
+                    any_failed = any_failed or any_partial
+                    if all_failed:
+                        final_status = SyncStatus.FAILED
+                    elif any_failed:
+                        final_status = SyncStatus.PARTIAL
+                    else:
+                        final_status = SyncStatus.SUCCESS
+
+                    provider_result.success = final_status == SyncStatus.SUCCESS
+
+                    # A failed or partial pull must retry the same window on the next run.
+                    if not is_historical and provider_result.success:
                         user_connection_repo.update_last_synced_at(db, connection)
 
                     if shared_token and connection.provider_user_id:
@@ -436,25 +455,14 @@ def sync_vendor_data(
                     log_structured(
                         logger,
                         "info",
-                        f"Successfully synced {provider_name} for user {user_id}",
+                        "Provider sync finished",
                         provider=provider_name,
                         task="sync_vendor_data",
                         user_id=user_id,
+                        sync_status=final_status.value,
                         effective_start=effective_start,
                         lookback=format_duration(settings.pull_sync_lookback) if settings.pull_sync_lookback else None,
                     )
-
-                    sub_results = list(provider_result.params.values())
-                    all_failed = bool(sub_results) and all(
-                        isinstance(r, dict) and r.get("success") is False for r in sub_results
-                    )
-                    any_failed = any(isinstance(r, dict) and r.get("success") is False for r in sub_results)
-                    if all_failed:
-                        final_status = SyncStatus.FAILED
-                    elif any_failed:
-                        final_status = SyncStatus.PARTIAL
-                    else:
-                        final_status = SyncStatus.SUCCESS
 
                     if final_status == SyncStatus.FAILED:
                         _emit_sync_status(

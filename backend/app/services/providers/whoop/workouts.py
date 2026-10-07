@@ -340,6 +340,7 @@ class WhoopWorkouts(BaseWorkoutsTemplate):
     ) -> int:
         """Load data from Whoop API with pagination."""
         all_workouts = []
+        fetch_error: Exception | None = None
         next_token = None
         max_limit = 25  # Whoop API limit
 
@@ -432,6 +433,7 @@ class WhoopWorkouts(BaseWorkoutsTemplate):
                         task="load_data",
                         user_id=str(user_id),
                     )
+                    fetch_error = e
                     break
                 raise
 
@@ -456,4 +458,7 @@ class WhoopWorkouts(BaseWorkoutsTemplate):
                 db.rollback()
                 raise
 
+        if fetch_error is not None:
+            # Keep saved pages, but report failure so the sync cursor can retry the range.
+            raise fetch_error
         return count

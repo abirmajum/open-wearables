@@ -520,6 +520,7 @@ class Whoop247Data(Base247DataTemplate):
                 results["sleep_partial"] = 1
         except Exception as e:
             db.rollback()
+            results["sleep_partial"] = 1
             log_structured(
                 self.logger,
                 "error",
@@ -536,6 +537,7 @@ class Whoop247Data(Base247DataTemplate):
                 results["recovery_partial"] = 1
         except Exception as e:
             db.rollback()
+            results["recovery_partial"] = 1
             log_structured(
                 self.logger,
                 "error",
@@ -552,6 +554,7 @@ class Whoop247Data(Base247DataTemplate):
                 results["cycles_partial"] = 1
         except Exception as e:
             db.rollback()
+            results["cycles_partial"] = 1
             log_structured(
                 self.logger,
                 "error",
@@ -565,6 +568,7 @@ class Whoop247Data(Base247DataTemplate):
             results["body_measurement_samples_synced"] = self.load_and_save_body_measurement(db, user_id)
         except Exception as e:
             db.rollback()
+            results["body_measurement_partial"] = 1
             log_structured(
                 self.logger,
                 "error",
@@ -609,7 +613,7 @@ class Whoop247Data(Base247DataTemplate):
                 task="get_body_measurement",
                 user_id=str(user_id),
             )
-            return {}
+            raise
 
     def _get_latest_value(
         self,
@@ -928,6 +932,7 @@ class Whoop247Data(Base247DataTemplate):
                     if health_score:
                         health_scores.append(health_score)
             except Exception as e:
+                truncated = True
                 db.rollback()
                 log_structured(
                     self.logger,
@@ -1102,6 +1107,7 @@ class Whoop247Data(Base247DataTemplate):
                 if strain_score:
                     health_scores.append(strain_score)
             except Exception as e:
+                truncated = True
                 log_structured(
                     self.logger,
                     "warning",

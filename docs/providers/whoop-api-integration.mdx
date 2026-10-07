@@ -348,3 +348,17 @@ output directory and does not call WHOOP.
 - Check [GitHub Discussions](https://github.com/the-momentum/open-wearables/discussions).
 - Check the [Whoop Developer Documentation](https://developer.whoop.com/docs/developing/getting-started).
 </Note>
+
+## Failed and partial pull retries
+
+A live REST pull advances its `last_synced_at` cursor only after the workouts and
+24/7 data operations complete successfully. Fetch errors, failed records and
+partial pagination preserve the previous cursor, including WHOOP sleep, recovery,
+cycles and body measurements. Successfully saved records remain available, and the
+next scheduled pull retries the same range using the existing upsert behavior.
+Zero records is a successful result when the entire request completed.
+
+A linked profile waiting for another profile's pull preserves its cursor until
+its own fan-out task completes. Historical pulls never advance the live cursor.
+This change does not initiate a backfill or repair gaps from earlier cursor moves;
+those require a separately requested historical sync.
