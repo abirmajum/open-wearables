@@ -8,12 +8,35 @@ from sqlalchemy.dialects.postgresql import insert
 from app.database import DbSession
 from app.models import DataSource, HealthScore
 from app.repositories.repositories import CrudRepository
-from app.schemas.enums import HealthScoreCategory
+from app.schemas.enums import HealthScoreCategory, ProviderName
 from app.schemas.model_crud.activities import HealthScoreCreate, HealthScoreQueryParams, HealthScoreUpdate
 from app.utils.pagination import decode_cursor
 
 
 class HealthScoreRepository(CrudRepository[HealthScore, HealthScoreCreate, HealthScoreUpdate]):
+    def upsert_whoop_recovery(self, db_session: DbSession, creator: HealthScoreCreate) -> HealthScore:
+        """Replace a fetched WHOOP recovery without changing its public ID or date.
+
+        WHOOP's created_at is the existing recovery identity; updated_at must not
+        move a correction to another day. Keep other providers' insert semantics.
+        """
+        if (
+            creator.provider != ProviderName.WHOOP
+            or creator.category != HealthScoreCategory.RECOVERY
+            or creator.event_record_id is not None
+        ):
+            raise ValueError("whoop_recovery_required")
+        stmt = insert(HealthScore).values(creator.model_dump())
+        stmt = stmt.on_conflict_do_update(
+            constraint="uq_health_score_user_provider_category_time",
+            set_={
+                "value": stmt.excluded.value,
+                "qualifier": stmt.excluded.qualifier,
+                "components": stmt.excluded.components,
+            },
+        ).returning(HealthScore)
+        return db_session.scalars(stmt, execution_options={"populate_existing": True}).one()
+
     def upsert_event_score(self, db_session: DbSession, creator: HealthScoreCreate) -> HealthScore:
         """Refresh a provider event score while preserving its public identity.
 

@@ -897,17 +897,13 @@ class Whoop247Data(Base247DataTemplate):
                 return 0
             count = self.save_recovery_data(db, user_id, normalized)
             if health_score:
-                health_score_service.create(db, health_score)
+                health_score_service.upsert_whoop_recovery(db, health_score)
             return count
-        except Exception as e:
-            log_structured(
-                self.logger,
-                "warning",
-                f"Failed to save recovery record {cycle_id}: {e}",
-                provider="whoop",
-                task="load_single_recovery",
-            )
-            return 0
+        except Exception:
+            db.rollback()
+            # Let the webhook task retry failed persistence instead of reporting
+            # a successfully processed notification with zero saved records.
+            raise
 
     def load_and_save_recovery(
         self,
@@ -922,30 +918,24 @@ class Whoop247Data(Base247DataTemplate):
         """
         raw_data, truncated = self._fetch_paginated(db, user_id, _RECOVERY_ENDPOINT, start_time, end_time, "recovery")
         total_count = 0
-        health_scores: list[HealthScoreCreate] = []
 
         for item in raw_data:
             try:
                 normalized, health_score = self.normalize_recovery(item, user_id)
                 if normalized:  # Skip unscored records
-                    total_count += self.save_recovery_data(db, user_id, normalized)
+                    count = self.save_recovery_data(db, user_id, normalized)
                     if health_score:
-                        health_scores.append(health_score)
+                        health_score_service.upsert_whoop_recovery(db, health_score)
+                    total_count += count
             except Exception as e:
                 truncated = True
                 db.rollback()
-                log_structured(
+                log_and_capture_error(
+                    e,
                     self.logger,
-                    "warning",
-                    f"Failed to save recovery data: {e}",
-                    provider="whoop",
-                    task="load_and_save_recovery",
-                    user_id=str(user_id),
+                    "Failed to save WHOOP recovery data",
+                    extra={"provider": "whoop", "task": "load_and_save_recovery", "user_id": str(user_id)},
                 )
-
-        if health_scores:
-            health_score_service.bulk_create(db, health_scores)
-            db.commit()
 
         return total_count, truncated
 
