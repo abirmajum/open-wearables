@@ -7,8 +7,6 @@ from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import event as sa_event
-
 from app.config import settings
 from app.database import DbSession
 from app.integrations import rollup_queue
@@ -51,6 +49,7 @@ from app.services.outgoing_webhooks import svix as svix_service
 from app.services.outgoing_webhooks.events import on_timeseries_batch_saved
 from app.services.priority_service import priority_service
 from app.services.services import AppService
+from app.utils.after_commit import run_after_commit
 from app.utils.context import current_sync_payload
 from app.utils.exceptions import ReconcileWindowTooLargeError
 from app.utils.pagination import decode_date_cursor, encode_bucket_cursor, encode_cursor, encode_date_cursor
@@ -273,11 +272,12 @@ class TimeSeriesService(
         samples_copy = [
             s for s in samples if getattr(s, "period", None) is None and getattr(s, "session", None) is None
         ]
+        if not samples_copy:
+            return counts
         # Read here, not in the thread: a ContextVar does not cross into one.
         sync = current_sync_payload()
 
-        @sa_event.listens_for(db_session, "after_commit", once=True)
-        def _start_webhook_thread(session: DbSession) -> None:  # noqa: ARG001
+        def _start_webhook_thread() -> None:
             if not svix_service.is_enabled():
                 return
             threading.Thread(
@@ -286,6 +286,7 @@ class TimeSeriesService(
                 daemon=True,
             ).start()
 
+        run_after_commit(db_session, _start_webhook_thread)
         return counts
 
     def has_samples_in_range(

@@ -472,6 +472,13 @@ class Whoop247Data(Base247DataTemplate):
             )
             return 0, closed_at
 
+    def save_single_sleep(self, db: DbSession, user_id: UUID, raw: dict[str, Any]) -> int:
+        normalized, health_score = self.normalize_sleep(raw, user_id)
+        record_id = self.save_sleep_data(db, user_id, normalized)
+        if health_score:
+            health_score_service.upsert_event_score(db, health_score.model_copy(update={"event_record_id": record_id}))
+        return 1
+
     def load_and_save_sleep(
         self,
         db: DbSession,
@@ -880,6 +887,15 @@ class Whoop247Data(Base247DataTemplate):
             # a successfully processed notification with zero saved records.
             raise
 
+    def save_single_recovery(self, db: DbSession, user_id: UUID, raw: dict[str, Any]) -> WriteCounts:
+        normalized, health_score = self.normalize_recovery(raw, user_id)
+        if not normalized:
+            return WriteCounts(0, 0)
+        count = self.save_recovery_data(db, user_id, normalized)
+        if health_score:
+            health_score_service.upsert_whoop_recovery(db, health_score)
+        return count
+
     def load_and_save_recovery(
         self,
         db: DbSession,
@@ -947,6 +963,13 @@ class Whoop247Data(Base247DataTemplate):
     ) -> list[dict[str, Any]]:
         """Fetch physiological cycles from Whoop API via v2 endpoint with pagination."""
         return self._fetch_paginated(db, user_id, _CYCLE_ENDPOINT, start_time, end_time, "cycle")[0]
+
+    def get_cycle_record(self, db: DbSession, user_id: UUID, cycle_id: str) -> dict[str, Any]:
+        response = self._make_api_request(db, user_id, f"/v2/cycle/{cycle_id}")
+        return response if isinstance(response, dict) else {}
+
+    def get_recent_cycles(self, db: DbSession, user_id: UUID, end_time: datetime) -> list[dict[str, Any]]:
+        return self._fetch_paginated(db, user_id, _CYCLE_ENDPOINT, end_time - timedelta(days=2), end_time, "cycle")[0]
 
     def load_closed_cycle(
         self,
