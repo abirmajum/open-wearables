@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 from app.models import DataPointSeries, DataSource, HealthScore
 from app.repositories.health_score_repository import HealthScoreRepository
 from app.schemas.enums import HealthScoreCategory, ProviderName, SeriesType, get_series_type_id
-from app.schemas.model_crud.activities import HealthScoreCreate
+from app.schemas.model_crud.activities import HealthScoreCreate, ScoreComponent
 from app.services.providers.whoop.data_247 import Whoop247Data
 from tests.factories import DataSourceFactory, EventRecordFactory, UserFactory
 
@@ -190,3 +190,42 @@ def test_period_upsert_rejects_event_linked_scores(db: Session) -> None:
     )
     with pytest.raises(ValueError, match="period_score_must_not_link_event"):
         HealthScoreRepository(HealthScore).bulk_upsert_period_scores(db, [score])
+
+
+def test_open_payload_never_replaces_closed_cycle(db: Session, provider: Whoop247Data) -> None:
+    """A late or out-of-order fetch of the running cycle cannot undo the final strain or energy."""
+    user = UserFactory()
+    closed = cycle_fixture(strain=14.2, kilojoule=9100.0, end="2026-10-13T22:05:00Z")
+    _pull(provider, db, user.id, closed)
+
+    _pull(provider, db, user.id, cycle_fixture(strain=8.7, kilojoule=5200.0))
+
+    [final] = _strain_rows(db, user.id)
+    assert float(final.value) == 14.2
+    assert final.components["cycle_state"]["qualifier"] == "CLOSED"
+    [energy] = _energy_values(db, user.id)
+    assert energy == pytest.approx(9100.0 / 4.184, abs=0.01)
+
+
+def test_period_upsert_guard_keeps_closed_value(db: Session) -> None:
+    """The repository guard holds even if a caller skips the closed-cycle check."""
+    user = UserFactory()
+    recorded_at = datetime(2026, 10, 12, 21, 30, tzinfo=timezone.utc)
+    repo = HealthScoreRepository(HealthScore)
+
+    def score(value: float, state: str) -> HealthScoreCreate:
+        return HealthScoreCreate(
+            id=uuid4(),
+            user_id=user.id,
+            provider=ProviderName.WHOOP,
+            category=HealthScoreCategory.STRAIN,
+            value=value,
+            recorded_at=recorded_at,
+            components={"cycle_state": ScoreComponent(qualifier=state)},
+        )
+
+    assert repo.bulk_upsert_period_scores(db, [score(14.2, "CLOSED")]) == 1
+    assert repo.bulk_upsert_period_scores(db, [score(8.7, "OPEN")]) == 0
+    assert repo.bulk_upsert_period_scores(db, [score(14.5, "CLOSED")]) == 1  # a closed revision still applies
+    [row] = _strain_rows(db, user.id)
+    assert float(row.value) == 14.5

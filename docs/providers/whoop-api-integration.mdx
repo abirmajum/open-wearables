@@ -212,15 +212,18 @@ WHOOP_DEFAULT_SCOPE=offline read:cycles read:sleep read:recovery read:workout re
     |-------|--------|
     | `workout.updated` | Fetches the workout by ID and saves it |
     | `workout.deleted` | Deletes the workout record by external ID |
-    | `sleep.updated` | Fetches the sleep session by ID and saves it, then refreshes the sleep's cycle |
+    | `sleep.updated` | Fetches the sleep session by ID and saves it, then refreshes the cycles of the two days before the sleep ended (the cycle that just closed and the new one) |
     | `sleep.deleted` | Deletes the sleep record by external ID |
     | `recovery.updated` | Fetches the recovery record by cycle ID and saves it |
     | `recovery.deleted` | Logged but not actioned (recovery stored as time-series, no external ID index) |
 
     When one WHOOP account is connected to several Open Wearables users, each webhook
     is fetched once and saved for every active linked user, with outgoing events per
-    user. A failure for one user does not stop the others; the delivery is retried
-    only if every linked user failed.
+    user. The fetch uses the most recently synced connection first and falls back to
+    the next one if its token fails. A failure for one user does not stop the others.
+    The delivery is retried only if every linked user failed with a transient error
+    (database, network, or WHOOP 5xx, 401 or 429); other errors are recorded as failed
+    and not retried, so outgoing events are not re-sent.
 
     <Note>
     Webhook registration is manual — there is no API to register subscriptions programmatically. All configuration is done through the Developer Dashboard.
@@ -360,11 +363,15 @@ WHOOP scores the cycle in progress, and its strain and energy climb until the cy
 closes. Open Wearables stores that partial value and replaces it in place on every
 later fetch, so the closed cycle's final value overwrites it without changing the
 score's ID. The strain score's `cycle_state` component is `OPEN` while the value is
-partial and `CLOSED` once final. The live pull always re-reads the last two days of
-cycles, so the current and just-closed cycles refresh on every pull; `sleep.updated`
-also refreshes the sleep's cycle. Strain changes emit no outgoing event because there
+partial and `CLOSED` once final. A stored `CLOSED` cycle is never replaced by an
+`OPEN` payload, so a late or out-of-order fetch cannot undo the final strain or energy.
+
+Cycles refresh on every live pull, which always re-reads the last two days, and on
+`sleep.updated`, which re-reads the two days before the sleep ended. Both cover the
+cycle that closed when the sleep began and the new one, so the final value also
+arrives in webhook live-sync mode. Strain changes emit no outgoing event because there
 is no health-score event type; the cycle's energy total emits the usual
-`calories.created` and `series.energy.created` events.
+`calories.created` and `series.energy.created` events, and only for committed writes.
 
 Both values are recorded at the cycle start. WHOOP starts a cycle when you fall
 asleep, so a cycle that began before local midnight is dated to the previous local

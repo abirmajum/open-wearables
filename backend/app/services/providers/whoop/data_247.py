@@ -10,6 +10,7 @@ from app.database import DbSession
 from app.models import DataPointSeries, DataSource, EventRecord
 from app.repositories import EventRecordRepository, UserConnectionRepository
 from app.repositories.data_source_repository import DataSourceRepository
+from app.repositories.health_score_repository import CYCLE_CLOSED, CYCLE_OPEN
 from app.schemas.enums import HealthScoreCategory, ProviderName, SeriesType, get_series_type_id
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
@@ -1028,15 +1029,67 @@ class Whoop247Data(Base247DataTemplate):
 
         Returns the number of cycles saved (0 or 1). Persistence errors propagate.
         """
-        energy_sample, strain_score = self.normalize_cycle(raw, user_id)
-        if not energy_sample and not strain_score:
-            return 0
-        if energy_sample:
-            timeseries_service.bulk_create_samples(db, [energy_sample])
-        if strain_score:
-            health_score_service.bulk_upsert_period_scores(db, [strain_score])
-        db.commit()
-        return 1
+        return self.save_cycles(db, user_id, [raw])[1]
+
+    def get_recent_cycles(self, db: DbSession, user_id: UUID, end_time: datetime) -> list[dict[str, Any]]:
+        """Fetch the cycles of the _CYCLE_REFRESH_WINDOW ending at end_time (normally one request).
+
+        Covers the cycle in progress and the one it followed, which closed at this sleep's onset.
+        """
+        return self._fetch_paginated(db, user_id, _CYCLE_ENDPOINT, end_time - _CYCLE_REFRESH_WINDOW, end_time, "cycle")[
+            0
+        ]
+
+    def save_cycles(self, db: DbSession, user_id: UUID, raw_cycles: list[dict[str, Any]]) -> tuple[Any, int]:
+        """Normalize and save already-fetched cycles for one OW user, then commit.
+
+        A payload of a still-open cycle is skipped when that cycle is already stored as
+        closed: a late or out-of-order fetch must not undo the final strain or energy.
+
+        Returns (energy sample write counts, cycles saved). Persistence errors propagate.
+        """
+        samples: list[TimeSeriesSampleCreate] = []
+        scores: list[HealthScoreCreate] = []
+        open_cycles: list[tuple[datetime, TimeSeriesSampleCreate | None, HealthScoreCreate | None]] = []
+        for item in raw_cycles:
+            try:
+                energy_sample, strain_score = self.normalize_cycle(item, user_id)
+            except Exception as e:
+                log_structured(
+                    self.logger,
+                    "warning",
+                    f"Failed to normalize cycle: {e}",
+                    provider="whoop",
+                    task="save_cycles",
+                    user_id=str(user_id),
+                )
+                continue
+            if item.get("end"):
+                samples += [energy_sample] if energy_sample else []
+                scores += [strain_score] if strain_score else []
+            elif energy_sample:
+                open_cycles.append((energy_sample.recorded_at, energy_sample, strain_score))
+            elif strain_score:
+                open_cycles.append((strain_score.recorded_at, None, strain_score))
+
+        if open_cycles:
+            closed = health_score_service.get_closed_period_starts(
+                db, user_id, ProviderName.WHOOP, HealthScoreCategory.STRAIN, [start for start, _, _ in open_cycles]
+            )
+            for start, energy_sample, strain_score in open_cycles:
+                if start in closed:
+                    continue
+                samples += [energy_sample] if energy_sample else []
+                scores += [strain_score] if strain_score else []
+
+        counts: Any = 0
+        if samples:
+            counts = timeseries_service.bulk_create_samples(db, samples)
+        if scores:
+            health_score_service.bulk_upsert_period_scores(db, scores)
+        if samples or scores:
+            db.commit()
+        return counts, len({item.recorded_at for item in [*samples, *scores]})
 
     def normalize_cycle(
         self,
@@ -1092,7 +1145,7 @@ class Whoop247Data(Base247DataTemplate):
                 for k in ("average_heart_rate", "max_heart_rate", "kilojoule")
                 if score.get(k) is not None
             }
-            components["cycle_state"] = ScoreComponent(qualifier="CLOSED" if raw_cycle.get("end") else "OPEN")
+            components["cycle_state"] = ScoreComponent(qualifier=CYCLE_CLOSED if raw_cycle.get("end") else CYCLE_OPEN)
             strain_score = HealthScoreCreate(
                 id=uuid4(),
                 user_id=user_id,
@@ -1123,34 +1176,7 @@ class Whoop247Data(Base247DataTemplate):
         """
         fetch_start = min(start_time, end_time - _CYCLE_REFRESH_WINDOW)
         raw_data, truncated = self._fetch_paginated(db, user_id, _CYCLE_ENDPOINT, fetch_start, end_time, "cycle")
-        samples: list[TimeSeriesSampleCreate] = []
-        health_scores: list[HealthScoreCreate] = []
-
-        for item in raw_data:
-            try:
-                energy_sample, strain_score = self.normalize_cycle(item, user_id)
-                if energy_sample:
-                    samples.append(energy_sample)
-                if strain_score:
-                    health_scores.append(strain_score)
-            except Exception as e:
-                log_structured(
-                    self.logger,
-                    "warning",
-                    f"Failed to normalize cycle: {e}",
-                    provider="whoop",
-                    task="load_and_save_cycles",
-                    user_id=str(user_id),
-                )
-
-        counts: int = 0
-        if samples:
-            counts = timeseries_service.bulk_create_samples(db, samples)
-        if health_scores:
-            health_score_service.bulk_upsert_period_scores(db, health_scores)
-        if samples or health_scores:
-            db.commit()
-
+        counts, _ = self.save_cycles(db, user_id, raw_data)
         return counts, truncated
 
     # -------------------------------------------------------------------------

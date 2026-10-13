@@ -14,6 +14,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from fastapi import HTTPException
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from app.models import DataSource, EventRecord, HealthScore, User, UserConnection
@@ -76,6 +77,18 @@ def open_cycle_fixture(cycle_id: int) -> dict[str, Any]:
         "timezone_offset": "+03:00",
         "score_state": "SCORED",
         "score": {"strain": 4.2, "kilojoule": 3100.0, "average_heart_rate": 64, "max_heart_rate": 120},
+    }
+
+
+def closed_cycle_fixture(cycle_id: int) -> dict[str, Any]:
+    return {
+        "id": cycle_id,
+        "user_id": WHOOP_USER_ID,
+        "start": "2026-10-10T21:00:00Z",
+        "end": "2026-10-11T22:00:00Z",
+        "timezone_offset": "+03:00",
+        "score_state": "SCORED",
+        "score": {"strain": 15.3, "kilojoule": 10400.0, "average_heart_rate": 72, "max_heart_rate": 181},
     }
 
 
@@ -186,20 +199,75 @@ def test_one_profile_failing_does_not_block_the_others(
     assert len(_records_for(db, live.user_id, workout_id)) == 1
 
 
-def test_every_profile_failing_raises_for_retry(
+@pytest.mark.parametrize(
+    "error",
+    [
+        OperationalError("SELECT 1", {}, Exception("server closed the connection")),
+        HTTPException(status_code=503, detail="Whoop API error"),
+        TimeoutError("read timed out"),
+    ],
+)
+def test_every_profile_failing_transiently_raises_for_retry(
     db: Session,
     handler: WhoopWebhookHandler,
     connections: list[UserConnection],
+    error: Exception,
 ) -> None:
     workout_id = str(uuid4())
     payload = {"user_id": WHOOP_USER_ID, "id": workout_id, "type": "workout.updated"}
 
     with (
         patch.object(handler.workouts, "get_workout_detail_from_api", return_value=workout_fixture(workout_id)),
-        patch.object(handler.workouts, "save_single_workout", side_effect=RuntimeError("synthetic write failure")),
-        pytest.raises(RuntimeError, match="synthetic write failure"),
+        patch.object(handler.workouts, "save_single_workout", side_effect=error),
+        pytest.raises(type(error)),
     ):
         handler.process_payload(db, payload, TRACE_ID)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [ValueError("event_score_identity_conflict"), RuntimeError("synthetic write failure")],
+)
+def test_every_profile_failing_deterministically_is_not_retried(
+    db: Session,
+    handler: WhoopWebhookHandler,
+    connections: list[UserConnection],
+    error: Exception,
+) -> None:
+    """A retry would fail the same way and re-emit outgoing events, so the error is returned."""
+    workout_id = str(uuid4())
+    payload = {"user_id": WHOOP_USER_ID, "id": workout_id, "type": "workout.updated"}
+
+    with (
+        patch.object(handler.workouts, "get_workout_detail_from_api", return_value=workout_fixture(workout_id)),
+        patch.object(handler.workouts, "save_single_workout", side_effect=error),
+    ):
+        result = handler.process_payload(db, payload, TRACE_ID)
+
+    assert result["status"] == "error"
+    assert [p["status"] for p in result["profiles"]] == ["error", "error"]
+    assert all(str(error) in p["error"] for p in result["profiles"])
+
+
+def test_fetch_uses_most_recently_synced_connection_first(
+    db: Session,
+    handler: WhoopWebhookHandler,
+    connections: list[UserConnection],
+) -> None:
+    stale, live = connections
+    now = datetime.now(timezone.utc)
+    stale.last_synced_at, live.last_synced_at = now - timedelta(days=2), now
+    db.commit()
+    workout_id = str(uuid4())
+    payload = {"user_id": WHOOP_USER_ID, "id": workout_id, "type": "workout.updated"}
+
+    with patch.object(
+        handler.workouts, "get_workout_detail_from_api", return_value=workout_fixture(workout_id)
+    ) as fetch:
+        handler.process_payload(db, payload, TRACE_ID)
+
+    assert fetch.call_count == 1
+    assert fetch.call_args.args[1] == live.user_id
 
 
 def test_fetch_falls_back_to_next_profile_token(
@@ -207,8 +275,11 @@ def test_fetch_falls_back_to_next_profile_token(
     handler: WhoopWebhookHandler,
     connections: list[UserConnection],
 ) -> None:
-    """A stale profile's broken token must not stop the live profile from getting data."""
+    """A broken token on the first-tried profile must not stop the others from getting data."""
     stale, live = connections
+    now = datetime.now(timezone.utc)
+    stale.last_synced_at, live.last_synced_at = now, now - timedelta(hours=1)
+    db.commit()
     workout_id = str(uuid4())
     payload = {"user_id": WHOOP_USER_ID, "id": workout_id, "type": "workout.updated"}
 
@@ -217,13 +288,40 @@ def test_fetch_falls_back_to_next_profile_token(
             raise HTTPException(status_code=401, detail="Whoop authorization expired. Please re-authorize.")
         return workout_fixture(resource_id)
 
-    with patch.object(handler.workouts, "get_workout_detail_from_api", side_effect=fetch) as fetch_mock:
+    with (
+        patch.object(handler.workouts, "get_workout_detail_from_api", side_effect=fetch) as fetch_mock,
+        patch.object(db, "rollback", wraps=db.rollback) as rollback,
+    ):
         result = handler.process_payload(db, payload, TRACE_ID)
 
-    assert fetch_mock.call_count == 2
+    assert [call.args[1] for call in fetch_mock.call_args_list] == [stale.user_id, live.user_id]
+    assert rollback.call_count == 1  # between the two attempts
     assert [p["status"] for p in result["profiles"]] == ["processed", "processed"]
     for connection in connections:
         assert len(_records_for(db, connection.user_id, workout_id)) == 1
+
+
+def test_fetch_failing_everywhere_prefers_a_retriable_error(
+    db: Session,
+    handler: WhoopWebhookHandler,
+    connections: list[UserConnection],
+) -> None:
+    stale, live = connections
+    now = datetime.now(timezone.utc)
+    stale.last_synced_at, live.last_synced_at = now - timedelta(hours=1), now
+    db.commit()
+    payload = {"user_id": WHOOP_USER_ID, "id": str(uuid4()), "type": "workout.updated"}
+    errors = {live.user_id: HTTPException(status_code=502), stale.user_id: HTTPException(status_code=400)}
+
+    def fetch(db_: Session, user_id: UUID, resource_id: str) -> dict[str, Any]:
+        raise errors[user_id]
+
+    with (
+        patch.object(handler.workouts, "get_workout_detail_from_api", side_effect=fetch),
+        pytest.raises(HTTPException) as raised,
+    ):
+        handler.process_payload(db, payload, TRACE_ID)
+    assert raised.value.status_code == 502
 
 
 def test_missing_resource_is_not_refetched_per_profile(
@@ -285,35 +383,75 @@ def test_deleted_event_reports_each_profile_separately(
     assert _records_for(db, live.user_id, workout_id) == []
 
 
+def _strain_by_start(db: Session, user_id: UUID) -> dict[datetime, HealthScore]:
+    db.expire_all()
+    rows = (
+        db.query(HealthScore)
+        .filter_by(user_id=user_id, provider=ProviderName.WHOOP, category=HealthScoreCategory.STRAIN)
+        .all()
+    )
+    return {row.recorded_at: row for row in rows}
+
+
 @pytest.mark.usefixtures("svix_enabled")
-def test_sleep_and_open_cycle_saved_for_every_linked_profile(
+def test_sleep_refreshes_closed_and_open_cycles_for_every_linked_profile(
     db: Session,
     handler: WhoopWebhookHandler,
     connections: list[UserConnection],
     mock_webhook_dispatch: MagicMock,
 ) -> None:
+    """One list request finalizes the cycle that just closed and stores the new open one."""
     sleep_id = str(uuid4())
     payload = {"user_id": WHOOP_USER_ID, "id": sleep_id, "type": "sleep.updated"}
+    previous = closed_cycle_fixture(500)
+    # The previous cycle was stored while still open, with a partial value.
+    for connection in connections:
+        handler.data_247.save_cycles(db, connection.user_id, [{**previous, "end": None, "score": {"strain": 9.0}}])
 
     with (
         patch.object(handler.data_247, "get_sleep_record", return_value=sleep_fixture(sleep_id, 501)) as get_sleep,
-        patch.object(handler.data_247, "get_cycle_record", return_value=open_cycle_fixture(501)) as get_cycle,
+        patch.object(
+            handler.data_247, "_fetch_paginated", return_value=([open_cycle_fixture(501), previous], False)
+        ) as list_cycles,
+        patch.object(handler.data_247, "get_cycle_record") as get_cycle,
     ):
         result = handler.process_payload(db, payload, TRACE_ID)
 
     assert get_sleep.call_count == 1
-    assert get_cycle.call_count == 1
+    assert list_cycles.call_count == 1
+    start, end = list_cycles.call_args.args[3:5]
+    assert end == datetime(2026, 10, 12, 5, 30, tzinfo=timezone.utc)  # the sleep's end
+    assert start == end - timedelta(days=2)
+    get_cycle.assert_not_called()  # the sleep's own cycle was in the list
     assert [p["status"] for p in result["profiles"]] == ["processed", "processed"]
     for connection in connections:
         assert len(_records_for(db, connection.user_id, sleep_id)) == 1
-        strain = (
-            db.query(HealthScore)
-            .filter_by(user_id=connection.user_id, provider=ProviderName.WHOOP, category=HealthScoreCategory.STRAIN)
-            .one()
-        )
-        assert float(strain.value) == 4.2
-        assert strain.components["cycle_state"]["qualifier"] == "OPEN"
+        strain = _strain_by_start(db, connection.user_id)
+        closed = strain[datetime(2026, 10, 10, 21, 0, tzinfo=timezone.utc)]
+        current = strain[datetime(2026, 10, 11, 22, 0, tzinfo=timezone.utc)]
+        assert (float(closed.value), closed.components["cycle_state"]["qualifier"]) == (15.3, "CLOSED")
+        assert (float(current.value), current.components["cycle_state"]["qualifier"]) == (4.2, "OPEN")
     assert _emitted(mock_webhook_dispatch, WebhookEventType.SLEEP_CREATED) == {str(c.user_id) for c in connections}
+
+
+def test_sleep_fetches_its_own_cycle_when_missing_from_the_list(
+    db: Session,
+    handler: WhoopWebhookHandler,
+    connections: list[UserConnection],
+) -> None:
+    sleep_id = str(uuid4())
+    payload = {"user_id": WHOOP_USER_ID, "id": sleep_id, "type": "sleep.updated"}
+
+    with (
+        patch.object(handler.data_247, "get_sleep_record", return_value=sleep_fixture(sleep_id, 501)),
+        patch.object(handler.data_247, "_fetch_paginated", return_value=([closed_cycle_fixture(500)], False)),
+        patch.object(handler.data_247, "get_cycle_record", return_value=open_cycle_fixture(501)) as get_cycle,
+    ):
+        handler.process_payload(db, payload, TRACE_ID)
+
+    assert get_cycle.call_count == 1
+    for connection in connections:
+        assert len(_strain_by_start(db, connection.user_id)) == 2
 
 
 def test_unlinked_whoop_user_is_reported(db: Session, handler: WhoopWebhookHandler) -> None:

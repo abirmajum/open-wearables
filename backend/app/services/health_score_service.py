@@ -1,10 +1,11 @@
+from datetime import datetime
 from logging import Logger, getLogger
 from uuid import UUID
 
 from app.database import DbSession
 from app.models import HealthScore
 from app.repositories import HealthScoreRepository
-from app.schemas.enums import HealthScoreCategory
+from app.schemas.enums import HealthScoreCategory, ProviderName
 from app.schemas.model_crud.activities import HealthScoreCreate, HealthScoreQueryParams, HealthScoreUpdate
 from app.services.services import AppService
 from app.utils.exceptions import handle_exceptions
@@ -35,6 +36,17 @@ class HealthScoreService(
     @handle_exceptions
     def bulk_create(self, db_session: DbSession, scores: list[HealthScoreCreate]) -> None:
         self.crud.bulk_create(db_session, scores)
+
+    @handle_exceptions
+    def get_closed_period_starts(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        provider: ProviderName,
+        category: HealthScoreCategory,
+        recorded_ats: list[datetime],
+    ) -> set[datetime]:
+        return self.crud.get_closed_period_starts(db_session, user_id, provider, category, recorded_ats)
 
     @handle_exceptions
     def bulk_upsert_period_scores(self, db_session: DbSession, scores: list[HealthScoreCreate]) -> int:

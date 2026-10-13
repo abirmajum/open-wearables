@@ -37,13 +37,18 @@ import json
 import logging
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from contextlib import suppress
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
+import httpx
 from celery import current_app as celery_app
 from fastapi import HTTPException, Request
 from pydantic import ValidationError
+from redis.exceptions import RedisError
+from sqlalchemy.exc import DBAPIError, OperationalError
 
 from app.config import settings
 from app.database import DbSession
@@ -65,13 +70,25 @@ _PROCESS_PUSH_TASK = "app.integrations.celery.tasks.webhook_push_task.process_we
 # gone, or the app-wide rate limit is exhausted.
 _SHARED_FETCH_ERROR_STATUSES = frozenset({404, 410, 429})
 
+# WHOOP responses worth retrying: token refresh, timeouts and the rate limit.
+_TRANSIENT_HTTP_STATUSES = frozenset({401, 408, 429})
+
+
+def _is_transient(exc: Exception) -> bool:
+    """True for failures a later retry can fix: infrastructure, network or WHOOP-side errors."""
+    if isinstance(exc, HTTPException):
+        return exc.status_code >= 500 or exc.status_code in _TRANSIENT_HTTP_STATUSES
+    if isinstance(exc, DBAPIError):
+        return isinstance(exc, OperationalError) or exc.connection_invalidated
+    return isinstance(exc, TimeoutError | ConnectionError | httpx.TransportError | RedisError)
+
 
 @dataclass(frozen=True)
 class _FetchedResource:
     """A notification's WHOOP payloads, fetched once and saved for each linked profile."""
 
     record: dict[str, Any]
-    cycle: dict[str, Any] | None = None
+    cycles: list[dict[str, Any]] = field(default_factory=list)
 
 
 class WhoopWebhookHandler(BaseWebhookHandler):
@@ -241,7 +258,7 @@ class WhoopWebhookHandler(BaseWebhookHandler):
                 return self._handle_deleted(db, event_type, user_id, resource_id)
 
         elif event_type.is_update_type:
-            fetched = self._fetch_updated(db, event_type, user_ids, resource_id)
+            fetched = self._fetch_updated(db, event_type, connections, resource_id)
             if not isinstance(fetched, _FetchedResource):
                 return {**fetched, "user_id": str(user_ids[0])}
 
@@ -277,7 +294,9 @@ class WhoopWebhookHandler(BaseWebhookHandler):
         """Run ``handle`` for each linked profile, isolating failures per profile.
 
         Returns the first profile's result with every profile's result under ``profiles``.
-        Raises the first error only when every profile failed, so the Celery task retries.
+        When every profile failed, a transient error (database, network, WHOOP 5xx/401/429)
+        is raised so the Celery task retries. Deterministic errors would fail the same way
+        on every retry and re-emit outgoing events, so they are returned, not raised.
         """
         profiles: list[dict[str, Any]] = []
         errors: list[Exception] = []
@@ -320,7 +339,20 @@ class WhoopWebhookHandler(BaseWebhookHandler):
             profiles.append(result)
 
         if len(errors) == len(connections):
-            raise errors[0]
+            transient = next((exc for exc in errors if _is_transient(exc)), None)
+            if transient is not None:
+                raise transient
+            log_structured(
+                logger,
+                "error",
+                "Whoop webhook failed for every linked profile with a non-retriable error",
+                provider="whoop",
+                action="whoop_webhook_failed_non_retriable",
+                trace_id=trace_id,
+                whoop_user_id=notification.user_id,
+                event_type=notification.type,
+                errors=[str(exc) for exc in errors],
+            )
         return {**profiles[0], "profiles": profiles}
 
     # ------------------------------------------------------------------
@@ -329,26 +361,38 @@ class WhoopWebhookHandler(BaseWebhookHandler):
 
     def _fetch_with_fallback(
         self,
-        user_ids: list[UUID],
+        db: DbSession,
+        connections: list[UserConnection],
         fetch: Callable[[UUID], dict[str, Any]],
     ) -> tuple[UUID, dict[str, Any]]:
         """Fetch with the first linked profile whose token works.
 
         Every linked profile reads the same WHOOP account, so one fetch serves all of
-        them. A stale profile's broken token falls through to the next profile; errors
-        about the resource or the app's rate limit would repeat for every token, so they
-        are raised immediately.
+        them. The most recently synced connection is tried first, since a stale profile's
+        token is the one most likely to be broken; a failure falls through to the next
+        profile. Errors about the resource or the app's rate limit would repeat for every
+        token, so they are raised immediately. When every token fails, a transient error
+        is preferred so the task retries.
         """
-        error: Exception | None = None
+        never = datetime.min.replace(tzinfo=timezone.utc)
+        ordered = sorted(
+            connections,
+            key=lambda c: (c.last_synced_at or never, c.created_at or never),
+            reverse=True,
+        )
+        user_ids = [connection.user_id for connection in ordered]
+        errors: list[Exception] = []
         for user_id in user_ids:
             try:
                 return user_id, fetch(user_id)
             except HTTPException as exc:
                 if exc.status_code in _SHARED_FETCH_ERROR_STATUSES:
                     raise
-                error = exc
+                errors.append(exc)
             except Exception as exc:
-                error = exc
+                errors.append(exc)
+            # A failed token refresh can leave the session mid-transaction.
+            db.rollback()
             log_structured(
                 logger,
                 "warning",
@@ -356,23 +400,22 @@ class WhoopWebhookHandler(BaseWebhookHandler):
                 provider="whoop",
                 action="whoop_webhook_fetch_fallback",
                 user_id=str(user_id),
-                error=str(error),
+                error=str(errors[-1]),
             )
-        assert error is not None, "connections are never empty here"
-        raise error
+        raise next((exc for exc in errors if _is_transient(exc)), errors[-1])
 
     def _fetch_updated(
         self,
         db: DbSession,
         event_type: WhoopWebhookNotificationType,
-        user_ids: list[UUID],
+        connections: list[UserConnection],
         resource_id: str,
     ) -> _FetchedResource | dict[str, Any]:
         """Fetch the updated resource once. Returns a result dict when there is nothing to save."""
         match event_type:
             case WhoopWebhookNotificationType.WORKOUT_UPDATED:
                 fetcher_id, raw = self._fetch_with_fallback(
-                    user_ids, lambda user_id: self.workouts.get_workout_detail_from_api(db, user_id, resource_id)
+                    db, connections, lambda user_id: self.workouts.get_workout_detail_from_api(db, user_id, resource_id)
                 )
                 store_raw_payload(
                     source="api_response",
@@ -384,32 +427,31 @@ class WhoopWebhookHandler(BaseWebhookHandler):
                 return _FetchedResource(record=raw if isinstance(raw, dict) else {})
             case WhoopWebhookNotificationType.SLEEP_UPDATED:
                 fetcher_id, sleep = self._fetch_with_fallback(
-                    user_ids, lambda user_id: self.data_247.get_sleep_record(db, user_id, resource_id)
+                    db, connections, lambda user_id: self.data_247.get_sleep_record(db, user_id, resource_id)
                 )
-                # WHOOP starts a cycle at sleep onset and emits no cycle event, so the
-                # sleep's cycle (normally the one now in progress) is refreshed here.
-                cycle_id = sleep.get("cycle_id")
-                cycle: dict[str, Any] | None = None
-                if cycle_id:
-                    try:
-                        cycle = self.data_247.get_cycle_record(db, fetcher_id, str(cycle_id))
-                    except Exception as exc:
-                        # Best effort: the sleep still saves, and the periodic pull refreshes cycles.
-                        log_structured(
-                            logger,
-                            "warning",
-                            "Failed to fetch Whoop cycle for sleep.updated",
-                            provider="whoop",
-                            action="whoop_webhook_cycle_fetch_failed",
-                            user_id=str(fetcher_id),
-                            resource_id=resource_id,
-                            cycle_id=str(cycle_id),
-                            error=str(exc),
-                        )
-                return _FetchedResource(record=sleep, cycle=cycle)
+                # WHOOP starts a cycle at sleep onset and emits no cycle event. Refresh
+                # the sleep's cycle (normally the one now in progress) and the cycle it
+                # followed, which closed at this sleep's onset, with one list request.
+                cycles: list[dict[str, Any]] = []
+                try:
+                    cycles = self._fetch_cycles_for_sleep(db, fetcher_id, sleep)
+                except Exception as exc:
+                    # Best effort: the sleep still saves, and the periodic pull refreshes cycles.
+                    db.rollback()
+                    log_structured(
+                        logger,
+                        "warning",
+                        "Failed to fetch Whoop cycles for sleep.updated",
+                        provider="whoop",
+                        action="whoop_webhook_cycle_fetch_failed",
+                        user_id=str(fetcher_id),
+                        resource_id=resource_id,
+                        error=str(exc),
+                    )
+                return _FetchedResource(record=sleep, cycles=cycles)
             case WhoopWebhookNotificationType.RECOVERY_UPDATED:
                 fetcher_id, sleep = self._fetch_with_fallback(
-                    user_ids, lambda user_id: self.data_247.get_sleep_record(db, user_id, resource_id)
+                    db, connections, lambda user_id: self.data_247.get_sleep_record(db, user_id, resource_id)
                 )
                 cycle_id = sleep.get("cycle_id")
                 if not cycle_id:
@@ -432,6 +474,17 @@ class WhoopWebhookHandler(BaseWebhookHandler):
             case _:
                 return {"status": "ignored", "reason": f"unhandled_event_type: {event_type}"}
 
+    def _fetch_cycles_for_sleep(self, db: DbSession, user_id: UUID, sleep: dict[str, Any]) -> list[dict[str, Any]]:
+        """Fetch the cycles of the two days ending at the sleep's end, plus its own cycle if missing."""
+        end_time = datetime.now(timezone.utc)
+        with suppress(AttributeError, TypeError, ValueError):
+            end_time = datetime.fromisoformat(sleep["end"].replace("Z", "+00:00"))
+        cycles = self.data_247.get_recent_cycles(db, user_id, end_time)
+        cycle_id = sleep.get("cycle_id")
+        if cycle_id and all(str(cycle.get("id")) != str(cycle_id) for cycle in cycles):
+            cycles.append(self.data_247.get_cycle_record(db, user_id, str(cycle_id)))
+        return cycles
+
     def _save_updated(
         self,
         db: DbSession,
@@ -448,27 +501,27 @@ class WhoopWebhookHandler(BaseWebhookHandler):
             case WhoopWebhookNotificationType.SLEEP_UPDATED:
                 if fetched.record:
                     count = self.data_247.save_single_sleep(db, user_id, fetched.record)
-                if fetched.cycle:
-                    self._save_cycle(db, user_id, fetched.cycle)
+                if fetched.cycles:
+                    self._save_cycles(db, user_id, fetched.cycles)
             case WhoopWebhookNotificationType.RECOVERY_UPDATED:
                 if fetched.record:
                     count = self.data_247.save_single_recovery(db, user_id, fetched.record)
         return {"status": "processed", "event_type": event_type, "records_saved": count}
 
-    def _save_cycle(self, db: DbSession, user_id: UUID, cycle: dict[str, Any]) -> None:
-        """Save the sleep's cycle; a failure here must not fail the saved sleep."""
+    def _save_cycles(self, db: DbSession, user_id: UUID, cycles: list[dict[str, Any]]) -> None:
+        """Save the sleep's cycles; a failure here must not fail the saved sleep."""
         try:
-            self.data_247.save_single_cycle(db, user_id, cycle)
+            self.data_247.save_cycles(db, user_id, cycles)
         except Exception as exc:
             db.rollback()
             log_structured(
                 logger,
                 "warning",
-                "Failed to save Whoop cycle for sleep.updated",
+                "Failed to save Whoop cycles for sleep.updated",
                 provider="whoop",
                 action="whoop_webhook_cycle_save_failed",
                 user_id=str(user_id),
-                cycle_id=str(cycle.get("id")),
+                cycle_ids=[str(cycle.get("id")) for cycle in cycles],
                 error=str(exc),
             )
 
