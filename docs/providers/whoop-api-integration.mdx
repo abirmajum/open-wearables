@@ -27,7 +27,7 @@ Whoop provides access to workout, sleep, recovery, and body measurement data thr
 | Sleep (with stage durations) | Yes — aggregate totals only, no per-stage timestamps |
 | Recovery (score, resting HR, HRV, SpO2, skin temp) | Yes |
 | Body measurements (height, weight) | Yes |
-| Cycle aggregates (daily strain, energy) | Yes — scored cycles only; energy stored as a daily total in kcal |
+| Cycle aggregates (daily strain, energy) | Yes — scored cycles, including the one in progress; energy stored as a daily total in kcal |
 | Continuous heart rate / activity samples | No (not available via API) |
 
 ### Workout field availability
@@ -212,10 +212,15 @@ WHOOP_DEFAULT_SCOPE=offline read:cycles read:sleep read:recovery read:workout re
     |-------|--------|
     | `workout.updated` | Fetches the workout by ID and saves it |
     | `workout.deleted` | Deletes the workout record by external ID |
-    | `sleep.updated` | Fetches the sleep session by ID and saves it |
+    | `sleep.updated` | Fetches the sleep session by ID and saves it, then refreshes the sleep's cycle |
     | `sleep.deleted` | Deletes the sleep record by external ID |
     | `recovery.updated` | Fetches the recovery record by cycle ID and saves it |
     | `recovery.deleted` | Logged but not actioned (recovery stored as time-series, no external ID index) |
+
+    When one WHOOP account is connected to several Open Wearables users, each webhook
+    is fetched once and saved for every active linked user, with outgoing events per
+    user. A failure for one user does not stop the others; the delivery is retried
+    only if every linked user failed.
 
     <Note>
     Webhook registration is manual — there is no API to register subscriptions programmatically. All configuration is done through the Developer Dashboard.
@@ -348,3 +353,20 @@ output directory and does not call WHOOP.
 - Check [GitHub Discussions](https://github.com/the-momentum/open-wearables/discussions).
 - Check the [Whoop Developer Documentation](https://developer.whoop.com/docs/developing/getting-started).
 </Note>
+
+## Cycle strain and energy
+
+WHOOP scores the cycle in progress, and its strain and energy climb until the cycle
+closes. Open Wearables stores that partial value and replaces it in place on every
+later fetch, so the closed cycle's final value overwrites it without changing the
+score's ID. The strain score's `cycle_state` component is `OPEN` while the value is
+partial and `CLOSED` once final. The live pull always re-reads the last two days of
+cycles, so the current and just-closed cycles refresh on every pull; `sleep.updated`
+also refreshes the sleep's cycle. Strain changes emit no outgoing event because there
+is no health-score event type; the cycle's energy total emits the usual
+`calories.created` and `series.energy.created` events.
+
+Both values are recorded at the cycle start. WHOOP starts a cycle when you fall
+asleep, so a cycle that began before local midnight is dated to the previous local
+day in `/health-scores` and activity summaries. If a sleep edit moves a cycle's start
+time, the row stored under the old start is not removed.

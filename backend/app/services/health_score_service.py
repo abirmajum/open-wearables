@@ -37,6 +37,10 @@ class HealthScoreService(
         self.crud.bulk_create(db_session, scores)
 
     @handle_exceptions
+    def bulk_upsert_period_scores(self, db_session: DbSession, scores: list[HealthScoreCreate]) -> int:
+        return self.crud.bulk_upsert_period_scores(db_session, scores)
+
+    @handle_exceptions
     def get_latest_by_category(
         self,
         db_session: DbSession,

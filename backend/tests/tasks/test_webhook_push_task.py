@@ -9,7 +9,7 @@ deliveries with no resolvable user (or from self-reporting Garmin) are dropped.
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 import pytest
@@ -102,3 +102,23 @@ def test_emission_never_raises() -> None:
         task._emit_webhook_sync_status("oura", None)
         task._emit_webhook_sync_status("oura", {"status": "processed", "records_saved": 1, "user_id": "not-a-uuid"})
     assert calls == []
+
+
+def test_fanned_out_delivery_logs_every_linked_profile() -> None:
+    """A WHOOP account linked to two profiles records a sync-log entry for each profile."""
+    stale, live = str(uuid4()), str(uuid4())
+    profiles = [
+        {"status": "error", "error": "boom", "user_id": stale},
+        {"status": "processed", "records_saved": 1, "user_id": live},
+    ]
+    handler = MagicMock()
+    handler.process_payload.return_value = {**profiles[0], "profiles": profiles}
+    calls, fake = _capture()
+    with (
+        patch.object(task, "ProviderFactory") as factory,
+        patch.object(task, "SessionLocal"),
+        patch.object(task.sync_status_service, "webhook_delivered", side_effect=fake),
+    ):
+        factory.return_value.get_provider.return_value.webhooks = handler
+        task.process_webhook_push.run("whoop", {"user_id": 1, "id": "x", "type": "workout.updated"}, "trace")
+    assert [(c["user_id"], c["status"]) for c in calls] == [(stale, SyncStatus.FAILED), (live, SyncStatus.SUCCESS)]
