@@ -36,6 +36,9 @@ from app.services.services import AppService
 from app.utils.exceptions import handle_exceptions
 from app.utils.pagination import encode_cursor
 
+# Session.info key: sample batches written in the open transaction, announced on commit.
+_PENDING_WEBHOOK_BATCHES = "timeseries_webhook_batches"
+
 
 class TimeSeriesService(
     AppService[
@@ -56,19 +59,33 @@ class TimeSeriesService(
         samples: (list[TimeSeriesSampleCreate] | list[HeartRateSampleCreate] | list[StepSampleCreate]),
     ) -> WriteCounts:
         counts = self.crud.bulk_create(db_session, samples)  # ty:ignore[invalid-argument-type]
-        samples_copy = list(samples)
-
-        @sa_event.listens_for(db_session, "after_commit", once=True)
-        def _start_webhook_thread(session: DbSession) -> None:  # noqa: ARG001
-            if not svix_service.is_enabled():
-                return
-            threading.Thread(
-                target=self._emit_timeseries_webhooks,
-                args=(samples_copy,),
-                daemon=True,
-            ).start()
-
+        if _PENDING_WEBHOOK_BATCHES not in db_session.info:
+            db_session.info[_PENDING_WEBHOOK_BATCHES] = []
+            sa_event.listen(db_session, "after_commit", self._emit_committed_batches)
+            sa_event.listen(db_session, "after_soft_rollback", self._drop_rolled_back_batches)
+        db_session.info[_PENDING_WEBHOOK_BATCHES].append(list(samples))
         return counts
+
+    def _emit_committed_batches(self, session: DbSession) -> None:
+        """Emit webhooks for the batches this commit persisted, one event group per batch."""
+        batches = session.info[_PENDING_WEBHOOK_BATCHES]
+        session.info[_PENDING_WEBHOOK_BATCHES] = []
+        if not batches or not svix_service.is_enabled():
+            return
+        threading.Thread(
+            target=lambda: [self._emit_timeseries_webhooks(batch) for batch in batches],
+            daemon=True,
+        ).start()
+
+    @staticmethod
+    def _drop_rolled_back_batches(session: DbSession, previous_transaction: Any) -> None:
+        """Forget batches undone by a rollback so the next commit does not announce them.
+
+        A savepoint rollback leaves the outer transaction's rows in place, so only the
+        outermost rollback clears the queue.
+        """
+        if not previous_transaction.nested:
+            session.info[_PENDING_WEBHOOK_BATCHES] = []
 
     @staticmethod
     def _emit_timeseries_webhooks(

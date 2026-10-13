@@ -155,7 +155,10 @@ def process_webhook_push(
         provider_user_id = handler.extract_user_id(payload)
         with SessionLocal() as db:
             result = handler.process_payload(db, payload, request_trace_id)
-        _emit_webhook_sync_status(provider_name, result)
+        # Handlers that fan out to linked profiles report each profile under "profiles".
+        profiles = result.get("profiles") if isinstance(result, dict) else None
+        for profile_result in profiles if isinstance(profiles, list) else [result]:
+            _emit_webhook_sync_status(provider_name, profile_result)
         return result
     except ValueError as exc:
         # Configuration error (unknown provider, missing handler) — retrying won't help.

@@ -145,16 +145,7 @@ class WhoopWorkouts(BaseWorkoutsTemplate):
             )
             if not isinstance(raw, dict) or not raw:
                 return 0
-            workout = WhoopWorkoutJSON(**raw)
-            if workout.score_state != "SCORED" and workout.score is None:
-                return 0
-            record, detail, health_score = self._normalize_workout(workout, user_id)
-            created = event_record_service.create(db, record)
-            detail_for_record = detail.model_copy(update={"record_id": created.id})
-            event_record_service.create_detail(db, detail_for_record)
-            if health_score:
-                health_score_service.create(db, health_score.model_copy(update={"event_record_id": created.id}))
-            return 1
+            return self.save_single_workout(db, user_id, raw)
         except Exception as e:
             log_structured(
                 self.logger,
@@ -164,6 +155,23 @@ class WhoopWorkouts(BaseWorkoutsTemplate):
                 task="load_single_workout",
             )
             return 0
+
+    def save_single_workout(self, db: DbSession, user_id: UUID, raw: dict[str, Any]) -> int:
+        """Normalize and save one already-fetched workout for one OW user. Returns 1 when saved.
+
+        Split from the fetch so one webhook payload can be saved for every profile linked
+        to the same WHOOP account. Persistence errors propagate to the caller.
+        """
+        workout = WhoopWorkoutJSON(**raw)
+        if workout.score_state != "SCORED" and workout.score is None:
+            return 0
+        record, detail, health_score = self._normalize_workout(workout, user_id)
+        created = event_record_service.create(db, record)
+        detail_for_record = detail.model_copy(update={"record_id": created.id})
+        event_record_service.create_detail(db, detail_for_record)
+        if health_score:
+            health_score_service.create(db, health_score.model_copy(update={"event_record_id": created.id}))
+        return 1
 
     def _extract_dates(self, start_timestamp: str, end_timestamp: str) -> tuple[datetime, datetime]:
         """Extract start and end dates from ISO 8601 strings."""

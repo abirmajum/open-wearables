@@ -2,15 +2,19 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import and_, asc, desc, text, tuple_
+from sqlalchemy import and_, asc, desc, or_, text, tuple_
 from sqlalchemy.dialects.postgresql import insert
 
 from app.database import DbSession
 from app.models import DataSource, HealthScore
 from app.repositories.repositories import CrudRepository
-from app.schemas.enums import HealthScoreCategory
+from app.schemas.enums import HealthScoreCategory, ProviderName
 from app.schemas.model_crud.activities import HealthScoreCreate, HealthScoreQueryParams, HealthScoreUpdate
 from app.utils.pagination import decode_cursor
+
+# Qualifiers of the ``cycle_state`` score component: partial vs final period scores.
+CYCLE_OPEN = "OPEN"
+CYCLE_CLOSED = "CLOSED"
 
 
 class HealthScoreRepository(CrudRepository[HealthScore, HealthScoreCreate, HealthScoreUpdate]):
@@ -47,6 +51,24 @@ class HealthScoreRepository(CrudRepository[HealthScore, HealthScoreCreate, Healt
                     setattr(existing, key, value)
         db_session.flush()
         return existing
+
+    def get_closed_period_starts(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        provider: ProviderName,
+        category: HealthScoreCategory,
+        recorded_ats: list[datetime],
+    ) -> set[datetime]:
+        """Return which of these period starts are already stored with a CLOSED ``cycle_state``."""
+        rows = db_session.query(HealthScore.recorded_at).filter(
+            HealthScore.user_id == user_id,
+            HealthScore.provider == provider,
+            HealthScore.category == category,
+            HealthScore.recorded_at.in_(recorded_ats),
+            HealthScore.components["cycle_state"]["qualifier"].astext == CYCLE_CLOSED,
+        )
+        return {recorded_at for (recorded_at,) in rows}
 
     def get_by_all_components(self, db_session: DbSession, components: list[str]) -> list[HealthScore]:
         """Return health scores whose components JSONB contains all specified keys (?& operator)."""
@@ -91,6 +113,50 @@ class HealthScoreRepository(CrudRepository[HealthScore, HealthScoreCreate, Healt
         stmt = insert(HealthScore).values(values).on_conflict_do_nothing()
         db_session.execute(stmt)
         # Caller is responsible for commit — allows batching with other operations
+
+    def bulk_upsert_period_scores(self, db_session: DbSession, creators: list[HealthScoreCreate]) -> int:
+        """Insert period scores, refreshing rows already stored at the same time.
+
+        For scores a provider revises while their period is still running (a WHOOP cycle's
+        strain climbs all day), so the last fetched value replaces the earlier partial one.
+        The existing row keeps its public ID. Event-linked scores are never overwritten: a
+        workout score that happens to share the timestamp keeps its own value. A row whose
+        ``cycle_state`` component is CLOSED is never replaced by an OPEN one, so a late or
+        out-of-order fetch of the running period cannot undo its final value.
+
+        Returns the number of rows inserted or changed. Caller is responsible for commit.
+        """
+        if any(c.event_record_id is not None for c in creators):
+            raise ValueError("period_score_must_not_link_event")
+        # PostgreSQL cannot upsert the same key twice in one statement; keep the last value.
+        deduped = {(c.user_id, c.provider, c.category, c.recorded_at): c for c in creators}
+        if not deduped:
+            return 0
+
+        stmt = insert(HealthScore).values([c.model_dump() for c in deduped.values()])
+        excluded = stmt.excluded
+        stored_state = HealthScore.components["cycle_state"]["qualifier"].astext
+        incoming_state = excluded.components["cycle_state"]["qualifier"].astext
+        stmt = stmt.on_conflict_do_update(
+            constraint="uq_health_score_user_provider_category_time",
+            set_={
+                "value": excluded.value,
+                "qualifier": excluded.qualifier,
+                "zone_offset": excluded.zone_offset,
+                "components": excluded.components,
+            },
+            where=and_(
+                HealthScore.event_record_id.is_(None),
+                or_(stored_state.is_distinct_from(CYCLE_CLOSED), incoming_state.is_distinct_from(CYCLE_OPEN)),
+                or_(
+                    HealthScore.value.is_distinct_from(excluded.value),
+                    HealthScore.qualifier.is_distinct_from(excluded.qualifier),
+                    HealthScore.zone_offset.is_distinct_from(excluded.zone_offset),
+                    HealthScore.components.is_distinct_from(excluded.components),
+                ),
+            ),
+        ).returning(HealthScore.id)
+        return len(db_session.execute(stmt).all())
 
     def get_latest_by_category(
         self,
