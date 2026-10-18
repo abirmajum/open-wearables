@@ -329,6 +329,30 @@ against a disposable PostgreSQL/Redis pair to verify the fixture import through
 public HTTP responses. The test writes synthetic JSON evidence under the pytest
 output directory and does not call WHOOP.
 
+## Recovery score revisions
+
+Both recovery webhooks and scheduled/history pulls replace an existing WHOOP
+recovery score with the newly fetched value and components (HRV, resting heart
+rate, SpO2 and skin temperature). Revisions may increase or decrease the score.
+The existing score ID and original `created_at`-based recording date are preserved;
+an update received tomorrow does not become a new recovery for tomorrow. Repeated
+deliveries do not create additional scores, and separate OW users stay isolated.
+This applies to existing rows as well as new imports, without a schema migration.
+
+The `/users/{id}/summaries/recovery` and `/users/{id}/health-scores` endpoints expose
+the refreshed score. Consumers caching daily summaries must fetch again to see it.
+The last scored value remains available while WHOOP reports a pending/unscored
+recovery. Webhook persistence failures propagate to the task's retry handler;
+pull failures mark the result partial so its sync window is retried.
+
+Writes use the last fetched payload; this change does not add WHOOP `updated_at`
+version fencing for concurrent fetches. It also does not initiate a historical
+backfill. Previously stale scores are corrected when their date is replayed.
+
+Run `pytest tests/integrations/test_whoop_recovery_revisions.py` with disposable
+PostgreSQL and Redis to verify repeated corrections through the public API using
+synthetic WHOOP responses.
+
 ## Next Steps
 
 <CardGroup cols={2}>

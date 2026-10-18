@@ -19,6 +19,12 @@ class HealthScoreService(
         super().__init__(crud_model=HealthScoreRepository, model=HealthScore, log=log)
 
     @handle_exceptions
+    def upsert_whoop_recovery(self, db_session: DbSession, score: HealthScoreCreate) -> HealthScore:
+        saved = self.crud.upsert_whoop_recovery(db_session, score)
+        db_session.commit()
+        return saved
+
+    @handle_exceptions
     def upsert_event_score(self, db_session: DbSession, score: HealthScoreCreate) -> HealthScore:
         saved = self.crud.upsert_event_score(db_session, score)
         db_session.commit()
