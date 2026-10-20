@@ -12,7 +12,6 @@ from alembic.operations import Operations
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
-from testcontainers.postgres import PostgresContainer
 
 from app.services.api_key_service import api_key_service
 
@@ -33,19 +32,15 @@ def _configure_redis() -> None:
 
 
 @pytest.fixture(scope="module")
-def isolated_engine() -> Generator[Engine, None, None]:
-    with PostgresContainer(
-        image="postgres:18",
-        username="open-wearables",
-        password="open-wearables",
-        dbname="open_wearables_api_key_migration_test",
-        driver="psycopg",
-    ) as postgres:
-        test_engine = create_engine(postgres.get_connection_url())
-        try:
-            yield test_engine
-        finally:
-            test_engine.dispose()
+def isolated_engine(_postgres_url: str) -> Generator[Engine, None, None]:
+    # Keep the migration in its rolled-back private schema on the configured
+    # fixture server. CI's network guard permits that server, not a second
+    # independently allocated container port.
+    test_engine = create_engine(_postgres_url)
+    try:
+        yield test_engine
+    finally:
+        test_engine.dispose()
 
 
 def _load_migration(filename: str = "2026_09_04_1200-a3f4e5d6c7b8_secure_api_key_storage.py") -> ModuleType:
