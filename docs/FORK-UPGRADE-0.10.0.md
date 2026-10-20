@@ -63,7 +63,9 @@ matching application code if a database rollback is necessary.
 
 No real users, credentials, vendor calls or deployed database are used here.
 Docker is required; the migration rehearsal creates its own PostgreSQL containers
-and does not accept an existing database URL.
+and does not accept an existing database URL. Its default PostgreSQL 17 matches
+the current Railway database; pass `postgres:18` as the second argument to also
+rehearse against upstream CI's major version.
 
 ```sh
 cd backend
@@ -83,6 +85,7 @@ verify native tool reads from the same contract. The fixture proves mechanics;
 it does not establish real WHOOP freshness, iOS authentication or device latency.
 
 Release order: checked Rumi PR with `RUMI_WHOOP_CYCLES_ENABLED=false`, then reviewed
-OW migration and the same OW revision for backend, worker and scheduler, then
+OW migration and the same OW revision for backend, worker, scheduler and
+dashboard (the API-key UI contract also changes), then
 `CYCLE_SYNC_ENABLED=true` and Rumi's flag. Verify service revisions, auth, provider
 connections, sync receipts and source/interval/freshness before declaring success.

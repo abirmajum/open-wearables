@@ -22,11 +22,12 @@ BACKEND = Path(__file__).resolve().parents[1]
 
 def main() -> None:
     output = Path(sys.argv[1] if len(sys.argv) > 1 else "/tmp/ow-fork-upgrade-report.json")
+    image = sys.argv[2] if len(sys.argv) > 2 else "postgres:17"
+    if image not in {"postgres:17", "postgres:18"}:
+        raise ValueError("Use a supported disposable PostgreSQL fixture image")
     results: list[dict[str, object]] = []
     for mode in ("fresh", "fork"):
-        with PostgresContainer(
-            "postgres:18", username="fixture", password="fixture", dbname="fixture", driver="psycopg"
-        ) as pg:
+        with PostgresContainer(image, username="fixture", password="fixture", dbname="fixture", driver="psycopg") as pg:
             env = {
                 **os.environ,
                 "DB_HOST": pg.get_container_host_ip(),
@@ -108,7 +109,10 @@ def main() -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=BACKEND, text=True).strip()
     output.write_text(
-        json.dumps({"revision": revision, "fictionalData": True, "passed": True, "results": results}, indent=2)
+        json.dumps(
+            {"revision": revision, "postgresImage": image, "fictionalData": True, "passed": True, "results": results},
+            indent=2,
+        )
     )
     print(output)
 
