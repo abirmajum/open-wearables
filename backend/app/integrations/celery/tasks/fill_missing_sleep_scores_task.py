@@ -7,6 +7,7 @@ from celery import shared_task
 from sqlalchemy import text
 
 from app.config import settings
+from app.constants.celery_tasks import CeleryTask
 from app.database import SessionLocal
 from app.services.health_score_service import health_score_service
 from app.services.scores.sleep_service import sleep_score_service
@@ -47,7 +48,7 @@ _MISSING_SCORES_QUERY = text("""
 """)
 
 
-@shared_task
+@shared_task(name=CeleryTask.FILL_MISSING_SLEEP_SCORES)
 def fill_missing_sleep_scores() -> dict:
     """Find sleep sessions without an OW sleep score and calculate them.
 
@@ -55,6 +56,9 @@ def fill_missing_sleep_scores() -> dict:
     path (periodic pull, webhook, SDK upload). Uses a LEFT JOIN on event_record_id
     to guarantee idempotency — already-scored sessions are never re-processed.
     """
+    if not settings.ow_scores_enabled:
+        return {"saved": 0, "skipped": 0}
+
     cutoff = datetime.now(timezone.utc) - timedelta(days=settings.score_backfill_days)
 
     with SessionLocal() as db:

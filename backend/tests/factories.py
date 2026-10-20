@@ -9,9 +9,8 @@ Usage:
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from hashlib import sha256
 from typing import Any
 from uuid import uuid4
 
@@ -26,6 +25,7 @@ from app.models import (
     Developer,
     EventRecord,
     HealthScore,
+    MealDetails,
     PersonalRecord,
     ProviderSetting,
     SeriesTypeDefinition,
@@ -36,8 +36,7 @@ from app.models import (
 )
 from app.schemas.auth import ConnectionStatus
 from app.schemas.enums import HealthScoreCategory, ProviderName
-from app.utils.security import get_password_hash
-from tests.utils.auth import api_key_secret_for_id
+from app.utils.security import get_password_hash, hash_api_key
 
 
 class BaseFactory(factory.alchemy.SQLAlchemyModelFactory):
@@ -103,6 +102,16 @@ class SeriesTypeDefinitionFactory(BaseFactory):
             if existing:
                 return existing
         return cls(id=82, code="basal_energy", unit="kcal")
+
+    @classmethod
+    def get_or_create_total_energy(cls) -> SeriesTypeDefinition:
+        """Get the pre-seeded total_energy series type (ID=89)."""
+        session = cls._meta.sqlalchemy_session
+        if session:
+            existing = session.query(SeriesTypeDefinition).filter(SeriesTypeDefinition.id == 89).first()
+            if existing:
+                return existing
+        return cls(id=89, code="total_energy", unit="kcal")
 
     @classmethod
     def get_or_create_distance_walking_running(cls) -> SeriesTypeDefinition:
@@ -247,6 +256,7 @@ class UserFactory(BaseFactory):
     first_name = factory.Faker("first_name")
     last_name = factory.Faker("last_name")
     external_user_id = None
+    is_seed = False
 
 
 class PersonalRecordFactory(BaseFactory):
@@ -281,20 +291,22 @@ class DeveloperFactory(BaseFactory):
 
 
 class ApiKeyFactory(BaseFactory):
-    """Factory for ApiKey model."""
+    """Factory for ApiKey model.
+
+    Only the hash of the key is persisted, so the raw value is exposed on the created
+    instance as ``plain_key`` for tests that need to authenticate with it.
+    """
 
     class Meta:
         model = ApiKey
 
     id = LazyFunction(uuid4)
-    key_hash = LazyAttribute(lambda o: sha256(api_key_secret_for_id(o.id).encode("utf-8")).hexdigest())
-    display_prefix = "test-key"
     name = Sequence(lambda n: f"Test API Key {n}")
     created_at = LazyFunction(lambda: datetime.now(timezone.utc))
 
     @classmethod
     def _create(cls, model_class: type[ApiKey], *args: Any, **kwargs: Any) -> ApiKey:
-        """Override create to handle developer relationship."""
+        """Override create to handle developer relationship and key hashing."""
         developer = kwargs.pop("developer", None)
         # Remove any stale created_by that might have been set
         kwargs.pop("created_by", None)
@@ -302,7 +314,13 @@ class ApiKeyFactory(BaseFactory):
             # Create a developer if not provided
             developer = DeveloperFactory()
         kwargs["created_by"] = developer.id
-        return super()._create(model_class, *args, **kwargs)
+
+        plain_key = kwargs.pop("plain_key", None) or f"sk-{uuid4().hex[:32]}"
+        kwargs.setdefault("key_hash", hash_api_key(plain_key))
+        kwargs.setdefault("key_prefix", plain_key[:10])
+        api_key = super()._create(model_class, *args, **kwargs)
+        api_key.plain_key = plain_key  # type: ignore[attr-defined]
+        return api_key
 
 
 class ApplicationFactory(BaseFactory):
@@ -391,7 +409,8 @@ class UserConnectionFactory(BaseFactory):
     provider_username = factory.Faker("user_name")
     access_token = LazyFunction(lambda: f"access_{uuid4().hex}")  # Optional for SDK providers
     refresh_token = LazyFunction(lambda: f"refresh_{uuid4().hex}")
-    token_expires_at = LazyFunction(lambda: datetime(2025, 12, 31, tzinfo=timezone.utc))  # Optional for SDK providers
+    # Optional for SDK providers
+    token_expires_at = LazyFunction(lambda: datetime.now(timezone.utc) + timedelta(days=1))
     scope = "read_all"
     status = ConnectionStatus.ACTIVE
     last_synced_at = None
@@ -572,6 +591,28 @@ class SleepDetailsFactory(BaseFactory):
         return super()._create(model_class, *args, **kwargs)
 
 
+class MealDetailsFactory(BaseFactory):
+    """Factory for MealDetails model."""
+
+    class Meta:
+        model = MealDetails
+
+    title = "Grilled Chicken Breast"
+    meal_type = "lunch"
+    nutrients = LazyFunction(dict)
+
+    @classmethod
+    def _create(cls, model_class: type[MealDetails], *args: Any, **kwargs: Any) -> MealDetails:
+        """Override create to handle event_record relationship."""
+        event_record = kwargs.pop("event_record", None)
+        # Remove any stale record_id that might have been set
+        kwargs.pop("record_id", None)
+        if event_record is None:
+            event_record = EventRecordFactory(category="meal")
+        kwargs["record_id"] = event_record.id
+        return super()._create(model_class, *args, **kwargs)
+
+
 __all__ = [
     "BaseFactory",
     "SeriesTypeDefinitionFactory",
@@ -587,4 +628,5 @@ __all__ = [
     "ProviderSettingFactory",
     "WorkoutDetailsFactory",
     "SleepDetailsFactory",
+    "MealDetailsFactory",
 ]

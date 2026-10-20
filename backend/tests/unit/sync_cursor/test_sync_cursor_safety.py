@@ -9,6 +9,7 @@ from uuid import uuid4
 
 import pytest
 
+from app.services.providers.sync_247_result import Sync247Result
 from app.services.providers.whoop.data_247 import Whoop247Data
 from app.services.providers.whoop.workouts import WhoopWorkouts
 
@@ -28,13 +29,20 @@ def sync_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         data_247=MagicMock(),
     )
     provider.workouts.load_data.return_value = 0
-    provider.data_247.load_and_save_all.return_value = {"sleep_sessions_synced": 0}
+    provider.data_247.load_and_save_all.return_value = Sync247Result(provider="whoop")
     monkeypatch.setattr(sync_module, "SessionLocal", MagicMock())
     monkeypatch.setattr(sync_module, "UserConnectionRepository", lambda: repo)
     monkeypatch.setattr(sync_module, "ProviderSettingsRepository", lambda: SimpleNamespace(get_all=lambda db: {}))
     monkeypatch.setattr(sync_module, "ProviderFactory", lambda: SimpleNamespace(get_provider=lambda name: provider))
     monkeypatch.setattr(sync_module.settings, "pull_sync_lookback", None)
-    for name in ("started", "progress", "completed", "failed", "log_and_capture_error"):
+    for name in (
+        "emit_sync_started",
+        "emit_sync_progress",
+        "emit_sync_completed",
+        "emit_sync_failed",
+        "log_and_capture_error",
+        "try_record_data_types",
+    ):
         monkeypatch.setattr(sync_module, name, MagicMock())
     return SimpleNamespace(connection=connection, repo=repo, provider=provider)
 
@@ -56,7 +64,10 @@ def test_incomplete_live_sync_preserves_cursor(sync_context: SimpleNamespace, fa
     elif failure == "data_exception":
         sync_context.provider.data_247.load_and_save_all.side_effect = RuntimeError("provider unavailable")
     else:
-        sync_context.provider.data_247.load_and_save_all.return_value = {"sleep_partial": 1, "sleep_sessions_synced": 2}
+        partial = Sync247Result(provider="whoop")
+        partial.record("sleep", 2, truncated=True)
+        partial.fail("sleep", RuntimeError("partial"))
+        sync_context.provider.data_247.load_and_save_all.return_value = partial
     result = sync_module.sync_vendor_data.run(str(USER_ID))
     sync_context.repo.update_last_synced_at.assert_not_called()
     assert result["providers_synced"]["whoop"]["success"] is False
@@ -108,7 +119,7 @@ def test_whoop_type_error_reaches_cursor_guard(sync_context: SimpleNamespace, wh
     sync_context.repo.update_last_synced_at.assert_not_called()
     provider_result = result["providers_synced"]["whoop"]
     assert provider_result["success"] is False
-    assert provider_result["params"]["data_247"][f"{kind}_partial"] == 1
+    assert provider_result["params"]["data_247"]["tasks"][kind]["status"] == "failed"
 
 
 @pytest.mark.parametrize("kind", ["sleep", "recovery", "cycles"])
@@ -167,8 +178,8 @@ def test_all_failed_sync_emits_failed_status(sync_context: SimpleNamespace) -> N
     result = sync_module.sync_vendor_data.run(str(USER_ID))
     sync_context.repo.update_last_synced_at.assert_not_called()
     assert result["providers_synced"]["whoop"]["success"] is False
-    sync_module.failed.assert_called_once()
-    sync_module.completed.assert_not_called()
+    sync_module.emit_sync_failed.assert_called_once()
+    sync_module.emit_sync_completed.assert_not_called()
 
 
 def test_linked_fanout_advances_after_success(sync_context: SimpleNamespace) -> None:

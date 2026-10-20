@@ -10,7 +10,6 @@ from app.schemas.enums import SeriesType
 from app.schemas.providers.mobile_sdk import SDKLogRequest
 from app.services.sdk_token_service import create_sdk_user_token
 from tests.factories import ApiKeyFactory
-from tests.utils import api_key_secret
 
 USER_ID = "123e4567-e89b-12d3-a456-426614174000"
 ENDPOINT = "/api/v1/sdk/users/{user_id}/logs"
@@ -70,7 +69,7 @@ class TestSDKLogsHappyPath:
         api_key = ApiKeyFactory()
         response = client.post(
             _url(),
-            headers={"X-Open-Wearables-API-Key": api_key_secret(api_key)},
+            headers={"X-Open-Wearables-API-Key": api_key.plain_key},
             json=_payload(SYNC_START_EVENT, SYNC_END_EVENT, DEVICE_STATE_EVENT),
         )
         assert response.status_code == 202
@@ -82,7 +81,7 @@ class TestSDKLogsHappyPath:
         api_key = ApiKeyFactory()
         response = client.post(
             _url(),
-            headers={"X-Open-Wearables-API-Key": api_key_secret(api_key)},
+            headers={"X-Open-Wearables-API-Key": api_key.plain_key},
             json=_payload(SYNC_START_EVENT),
         )
         assert response.status_code == 202
@@ -92,7 +91,7 @@ class TestSDKLogsHappyPath:
         api_key = ApiKeyFactory()
         response = client.post(
             _url(),
-            headers={"X-Open-Wearables-API-Key": api_key_secret(api_key)},
+            headers={"X-Open-Wearables-API-Key": api_key.plain_key},
             json=_payload(SYNC_END_EVENT),
         )
         assert response.status_code == 202
@@ -102,7 +101,7 @@ class TestSDKLogsHappyPath:
         api_key = ApiKeyFactory()
         response = client.post(
             _url(),
-            headers={"X-Open-Wearables-API-Key": api_key_secret(api_key)},
+            headers={"X-Open-Wearables-API-Key": api_key.plain_key},
             json=_payload(DEVICE_STATE_EVENT),
         )
         assert response.status_code == 202
@@ -112,7 +111,7 @@ class TestSDKLogsHappyPath:
         api_key = ApiKeyFactory()
         response = client.post(
             _url(),
-            headers={"X-Open-Wearables-API-Key": api_key_secret(api_key)},
+            headers={"X-Open-Wearables-API-Key": api_key.plain_key},
             json={"sdkVersion": "1.0.0", "events": [DEVICE_STATE_EVENT]},
         )
         assert response.status_code == 202
@@ -131,7 +130,7 @@ class TestSDKLogsHappyPath:
         }
         response = client.post(
             _url(),
-            headers={"X-Open-Wearables-API-Key": api_key_secret(api_key)},
+            headers={"X-Open-Wearables-API-Key": api_key.plain_key},
             json=_payload(event, DEVICE_STATE_EVENT),
         )
         assert response.status_code == 202
@@ -150,10 +149,43 @@ class TestSDKLogsHappyPath:
         }
         response = client.post(
             _url(),
-            headers={"X-Open-Wearables-API-Key": api_key_secret(api_key)},
+            headers={"X-Open-Wearables-API-Key": api_key.plain_key},
             json=_payload(event),
         )
         assert response.status_code == 202
+
+    @patch("app.api.routes.v1.sdk_logs.log_structured")
+    @patch("app.api.routes.v1.sdk_logs.store_raw_payload")
+    def test_attribution_headers_are_logged(
+        self, mock_store: MagicMock, mock_log: MagicMock, client: TestClient, db: Session
+    ) -> None:
+        api_key = ApiKeyFactory()
+        response = client.post(
+            _url(),
+            headers={
+                "X-Open-Wearables-API-Key": api_key.plain_key,
+                "X-Open-Wearables-SDK-Version": "1.3.0",
+                "X-Open-Wearables-SDK-Platform": "ios",
+                "X-Request-Id": "req-1",
+            },
+            json=_payload(DEVICE_STATE_EVENT),
+        )
+        assert response.status_code == 202
+        attributes = mock_log.call_args.kwargs
+        assert attributes["sdk_version"] == "1.3.0"
+        assert attributes["sdk_platform"] == "ios"
+        assert attributes["request_id"] == "req-1"
+
+    @patch("app.api.routes.v1.sdk_logs.log_structured")
+    @patch("app.api.routes.v1.sdk_logs.store_raw_payload")
+    def test_body_version_logged_without_headers(
+        self, mock_store: MagicMock, mock_log: MagicMock, client: TestClient, db: Session
+    ) -> None:
+        api_key = ApiKeyFactory()
+        client.post(_url(), headers={"X-Open-Wearables-API-Key": api_key.plain_key}, json=_payload(DEVICE_STATE_EVENT))
+        attributes = mock_log.call_args.kwargs
+        assert attributes["sdk_version"] == "1.2.0"
+        assert "sdk_platform" not in attributes
 
 
 class TestSDKLogsEventFields:
@@ -229,7 +261,7 @@ class TestSDKLogsAuth:
         api_key = ApiKeyFactory()
         response = client.post(
             _url(),
-            headers={"X-Open-Wearables-API-Key": api_key_secret(api_key)},
+            headers={"X-Open-Wearables-API-Key": api_key.plain_key},
             json=_payload(DEVICE_STATE_EVENT),
         )
         assert response.status_code == 202
@@ -257,7 +289,7 @@ class TestSDKLogsValidation:
         api_key = ApiKeyFactory()
         response = client.post(
             _url(),
-            headers={"X-Open-Wearables-API-Key": api_key_secret(api_key)},
+            headers={"X-Open-Wearables-API-Key": api_key.plain_key},
             json={"sdkVersion": "1.0.0", "provider": "apple", "events": []},
         )
         assert response.status_code in (400, 422)
@@ -266,7 +298,7 @@ class TestSDKLogsValidation:
         api_key = ApiKeyFactory()
         response = client.post(
             _url(),
-            headers={"X-Open-Wearables-API-Key": api_key_secret(api_key)},
+            headers={"X-Open-Wearables-API-Key": api_key.plain_key},
             json=_payload({"eventType": "something_unknown", "timestamp": "2026-04-09T10:00:00Z"}),
         )
         assert response.status_code in (400, 422)
@@ -275,7 +307,7 @@ class TestSDKLogsValidation:
         api_key = ApiKeyFactory()
         response = client.post(
             _url(),
-            headers={"X-Open-Wearables-API-Key": api_key_secret(api_key)},
+            headers={"X-Open-Wearables-API-Key": api_key.plain_key},
             json={"provider": "apple", "events": [DEVICE_STATE_EVENT]},
         )
         assert response.status_code in (400, 422)

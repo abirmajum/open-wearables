@@ -7,7 +7,6 @@ from sqlalchemy.orm import Session
 from app.services.sdk_token_service import create_sdk_user_token
 from app.utils.auth import get_current_developer, get_sdk_auth
 from tests.factories import ApiKeyFactory, DeveloperFactory
-from tests.utils import api_key_secret
 
 
 class TestGetSDKAuth:
@@ -30,10 +29,10 @@ class TestGetSDKAuth:
         """Valid API key should return SDKAuthContext."""
         api_key = ApiKeyFactory()
 
-        result = await get_sdk_auth(db=db, token=None, x_open_wearables_api_key=api_key_secret(api_key))
+        result = await get_sdk_auth(db=db, token=None, x_open_wearables_api_key=api_key.plain_key)
 
         assert result.auth_type == "api_key"
-        assert result.api_key_id == api_key.id
+        assert result.api_key_id == str(api_key.id)
 
     @pytest.mark.asyncio
     async def test_no_auth_raises_401(self, db: Session) -> None:
@@ -58,7 +57,7 @@ class TestGetSDKAuth:
         user_id = "123e4567-e89b-12d3-a456-426614174001"
         token = create_sdk_user_token("app_123", user_id)
 
-        result = await get_sdk_auth(db=db, token=token, x_open_wearables_api_key=api_key_secret(api_key))
+        result = await get_sdk_auth(db=db, token=token, x_open_wearables_api_key=api_key.plain_key)
 
         assert result.auth_type == "sdk_token"
         assert str(result.user_id) == user_id

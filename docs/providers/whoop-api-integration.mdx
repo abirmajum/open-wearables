@@ -1,13 +1,13 @@
 ---
 title: "Whoop API Integration"
-description: "Connect Whoop via OAuth 2.0. Syncs workouts, sleep with stages, recovery scores, HRV, SpO2, and body measurements in real time via webhooks. Requires an active Whoop membership."
+description: "Connect Whoop via OAuth 2.0. Syncs workouts, sleep with stages, recovery scores, HRV, SpO2, and body measurements in real time via webhooks."
 keywords: ["whoop api", "whoop data integration", "whoop health data", "whoop api open source"]
 "og:title": "Whoop API Integration | Open Wearables"
-"og:description": "Connect Whoop via OAuth 2.0. Syncs workouts, sleep, recovery scores, HRV, and SpO2. Requires Whoop membership."
+"og:description": "Connect Whoop via OAuth 2.0. Syncs workouts, sleep, recovery scores, HRV, and SpO2."
 "og:url": "https://docs.openwearables.io/providers/whoop-api-integration"
 "og:type": "article"
 "twitter:title": "Whoop API Integration | Open Wearables"
-"twitter:description": "Connect Whoop via OAuth 2.0. Syncs workouts, sleep, recovery scores, HRV, and SpO2. Requires Whoop membership."
+"twitter:description": "Connect Whoop via OAuth 2.0. Syncs workouts, sleep, recovery scores, HRV, and SpO2."
 "twitter:card": "summary_large_image"
 ---
 
@@ -27,7 +27,7 @@ Whoop provides access to workout, sleep, recovery, and body measurement data thr
 | Sleep (with stage durations) | Yes — aggregate totals only, no per-stage timestamps |
 | Recovery (score, resting HR, HRV, SpO2, skin temp) | Yes |
 | Body measurements (height, weight) | Yes |
-| Cycle aggregates (daily strain, energy) | Yes — scored cycles only; energy stored as a daily total in kcal |
+| Cycle aggregates (daily strain, energy, steps) | Yes — scored cycles only; energy (kcal) and steps are per-cycle totals stored as daily values on the cycle start date (a Whoop cycle is not a midnight-to-midnight day) |
 | Continuous heart rate / activity samples | No (not available via API) |
 
 ### Workout field availability
@@ -88,15 +88,16 @@ Whoop reports sleep stages as **aggregate durations for the whole sleep**, not a
 
 ## Prerequisites
 
-- A Whoop account with an active membership
+- A Whoop account (no membership or device needed to get API credentials)
+- A Whoop user with a device and an active membership to test with real data. Whoop has no test accounts or mock data. New apps start on the [Sandbox tier](https://developer.whoop.com/docs/developing/app-approval), which only caps how many members can connect (10).
 
 ## Application walkthrough
 
 <Steps>
-  <Step title="Sign up for Whoop">
-    You must have a Whoop membership to develop on the Whoop Developer Platform. Your Whoop account is also your developer login.
+  <Step title="Create a Whoop account">
+    There is no separate developer account. You sign in to the Developer Dashboard with a regular Whoop account.
 
-    If you don't have one yet, [join Whoop here](https://www.whoop.com/).
+    The account can only be created in the Whoop mobile app ([iOS](https://apps.apple.com/app/whoop/id933944389), [Android](https://play.google.com/store/apps/details?id=com.whoop.android)), not on the web. You don't need a Whoop device or a membership to sign up, and a free account is enough to create an app and get a Client ID and Client Secret.
   </Step>
 
   <Step title="Create a Team in the Developer Dashboard">
@@ -105,7 +106,7 @@ Whoop reports sleep stages as **aggregate durations for the whole sleep**, not a
     Before creating an app, you'll be prompted to create a **Team**. Choose a name for your team and click **Create Team**.
 
     <Note>
-    You can invite other developers to your team later from the Team section of the Developer Dashboard. They'll need a Whoop account to be added.
+    You can invite other developers to your team later from the Team section of the Developer Dashboard. They'll need a Whoop account to be added, created in the mobile app the same way.
     </Note>
   </Step>
 
@@ -114,7 +115,7 @@ Whoop reports sleep stages as **aggregate durations for the whole sleep**, not a
 
     - **App Name**: Your application name
     - **Scopes**: Select the scopes your app needs (see table below)
-    - **Redirect URIs**: Add your OAuth callback URL (e.g. `http://localhost:8000/api/v1/oauth/whoop/callback` for local development)
+    - **Redirect URIs**: Your OAuth callback URL. Open Wearables derives this from your `API_BASE_URL` as `{API_BASE_URL}/api/v1/oauth/whoop/callback`, so register that exact URL here, e.g. `http://localhost:8000/api/v1/oauth/whoop/callback` for local development.
 
     After creating the app, you'll receive:
     - **Client ID**
@@ -129,10 +130,13 @@ Whoop reports sleep stages as **aggregate durations for the whole sleep**, not a
     Add the following to your `.env` file:
 
 ```bash
+# Public base URL of your API. The OAuth redirect URI is derived from this as
+# {API_BASE_URL}/api/v1/oauth/whoop/callback.
+API_BASE_URL=http://localhost:8000
+
 #--- Whoop ---#
 WHOOP_CLIENT_ID=your-whoop-client-id
 WHOOP_CLIENT_SECRET=your-whoop-client-secret
-API_BASE_URL=http://localhost:8000
 WHOOP_DEFAULT_SCOPE=offline read:cycles read:sleep read:recovery read:workout read:body_measurement read:profile
 ```
 
@@ -140,9 +144,9 @@ WHOOP_DEFAULT_SCOPE=offline read:cycles read:sleep read:recovery read:workout re
 
     | Variable | Description |
     |----------|-------------|
+    | `API_BASE_URL` | Public base URL of your API. The OAuth redirect URI is derived from it as `{API_BASE_URL}/api/v1/oauth/whoop/callback`, which must match a redirect URI registered in the Developer Dashboard |
     | `WHOOP_CLIENT_ID` | Client ID from the Whoop Developer Dashboard |
     | `WHOOP_CLIENT_SECRET` | Client Secret from the Whoop Developer Dashboard |
-    | `API_BASE_URL` | Open Wearables derives the server-side callback as `{API_BASE_URL}/api/v1/oauth/whoop/callback`. Register that exact URL in the Developer Dashboard. For `https://ow.rumihq.com`, register `https://ow.rumihq.com/api/v1/oauth/whoop/callback`. |
     | `WHOOP_DEFAULT_SCOPE` | OAuth scopes requested during authorization. The `offline` scope is required for refresh tokens |
 
   </Step>
@@ -167,7 +171,7 @@ WHOOP_DEFAULT_SCOPE=offline read:cycles read:sleep read:recovery read:workout re
 
     **2. Redirect the user** to the `authorization_url`. They will log in to Whoop and authorize your app.
 
-    **3. Whoop redirects back** to the server-side callback derived from `API_BASE_URL`. Open Wearables automatically exchanges the authorization code for access and refresh tokens.
+    **3. Whoop redirects back** to the callback URI derived from `API_BASE_URL` (`{API_BASE_URL}/api/v1/oauth/whoop/callback`). Open Wearables automatically exchanges the authorization code for access and refresh tokens.
 
     **4. Verify the connection** was created:
 
@@ -179,7 +183,7 @@ WHOOP_DEFAULT_SCOPE=offline read:cycles read:sleep read:recovery read:workout re
     You should see a connection with `"provider": "whoop"` and `"status": "active"`.
 
     <Note>
-      The `redirect_uri` parameter in the authorize call is where the **user** is sent after the flow completes (e.g., back to your app). It is separate from the server-side callback derived from `API_BASE_URL`, which Whoop sends the authorization code to. Do not point `redirect_uri` back to the Open Wearables callback; the API rejects that loop.
+      The `redirect_uri` parameter in the authorize call is where the **user** is sent after the flow completes (e.g., back to your app). This is separate from the **server-side** OAuth callback (`{API_BASE_URL}/api/v1/oauth/whoop/callback`) that Whoop sends the authorization code to.
     </Note>
   </Step>
 
@@ -386,3 +390,38 @@ A linked profile waiting for another profile's pull preserves its cursor until
 its own fan-out task completes. Historical pulls never advance the live cursor.
 This change does not initiate a backfill or repair gaps from earlier cursor moves;
 those require a separately requested historical sync.
+
+
+## Ongoing physiological cycles
+
+`GET /api/v1/users/{user_id}/summaries/cycles` returns the latest stored revision of
+WHOOP cycles whose `updated_at` falls inside `start_date` and `end_date`. It uses
+the normal API-key authentication and cursor pagination (`limit` 1–1000,
+`pagination.next_cursor`, `pagination.has_more`). Invalid cursors return 400;
+missing or invalid credentials return 401, and invalid query values return 422.
+The read endpoint makes no WHOOP API calls.
+
+Each cycle has a stable string `id`, `source`, `start_time`, nullable `end_time`,
+`updated_at`, `fetched_at`, `score_state`, `zone_offset`, and `provisional`.
+The nullable readings are `steps`, `strain`, `energy_kj`, `total_calories_kcal`,
+`avg_heart_rate_bpm`, and `max_heart_rate_bpm`. Kcal is kJ / 4.184 and includes
+basal energy. Heart rate is summarized over the cycle, not a live pulse.
+Null means unknown; zero remains zero. An open or unscored cycle is provisional.
+
+Replace repeated IDs rather than adding revisions. These intervals can cross
+midnight and must not be added to calendar-day totals. Ongoing cycles are kept
+outside the daily time series; closed scored cycles retain the existing daily
+normalization as a separate view. Older provider revisions cannot overwrite newer
+ones. `fetched_at` indicates a fetch; `updated_at` indicates data freshness.
+
+For bounded current-cycle refresh, set `CYCLE_SYNC_ENABLED=true` after the schema
+upgrade. `CYCLE_SYNC_INTERVAL_SECONDS` defaults to 900 and permits 900–1800 seconds.
+The task requests a two-day overlap, reuses connection eligibility and shared
+account leases, and leaves the general sync cursor untouched. Existing hourly
+pulls and webhooks remain the repair path. All service processes must use the
+same release. Consumers can use `sync.completed` to import the committed revision;
+no event body needs to contain the health measurements.
+
+Sleep-summary vitals are restricted to the same provider, original writer and
+device as the sleep record. `vital_provenance=same_provider_writer_device` identifies
+that guarantee; consumers of older OW releases should not infer it.

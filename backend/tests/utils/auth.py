@@ -24,7 +24,7 @@ def api_key_secret_for_id(api_key_id: UUID) -> str:
 
 
 def api_key_secret(api_key: ApiKey) -> str:
-    return api_key_secret_for_id(api_key.id)
+    return getattr(api_key, "plain_key", None) or api_key_secret_for_id(api_key.id)
 
 
 def api_key_headers(api_key: ApiKey | str) -> dict[str, str]:

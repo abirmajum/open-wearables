@@ -16,11 +16,18 @@ from uuid import UUID, uuid4
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from app.models import EventRecord, HealthScore
+from app.models import DataSource, EventRecord, HealthScore
 from app.schemas.enums import ProviderName
 from app.services.health_score_service import health_score_service
 from app.services.providers.whoop.data_247 import Whoop247Data
-from tests.factories import ApiKeyFactory, DataSourceFactory, EventRecordFactory, UserFactory, WorkoutDetailsFactory
+from tests.factories import (
+    ApiKeyFactory,
+    DataPointSeriesFactory,
+    DataSourceFactory,
+    EventRecordFactory,
+    UserFactory,
+    WorkoutDetailsFactory,
+)
 from tests.utils import api_key_headers
 
 
@@ -69,6 +76,12 @@ def test_whoop_sleep_import_to_public_api(client: TestClient, db: Session, tmp_p
         with patch.object(provider, "_fetch_paginated", return_value=([raw], False)):
             assert provider.load_and_save_sleep(db, user.id, start, end) == (1, False)
             assert provider.load_and_save_sleep(db, user.id, start, end) == (1, False)
+        same_source = db.query(DataSource).filter_by(user_id=user.id, provider=ProviderName.WHOOP).first()
+        foreign_source = DataSourceFactory(user=user, provider=ProviderName.APPLE, source="WHOOP")
+        observed = datetime(2026, 9, 20, 2, tzinfo=timezone.utc)
+        DataPointSeriesFactory(data_source=same_source, recorded_at=observed, value=60)
+        DataPointSeriesFactory(data_source=foreign_source, recorded_at=observed, value=120)
+        db.commit()
         params = {"start_date": start.isoformat(), "end_date": end.isoformat()}
         response = client.get(f"/api/v1/users/{user.id}/events/sleep", params=params, headers=headers)
         assert response.status_code == 200, response.text
@@ -78,6 +91,8 @@ def test_whoop_sleep_import_to_public_api(client: TestClient, db: Session, tmp_p
         summary = client.get(f"/api/v1/users/{user.id}/summaries/sleep", params=params, headers=headers)
         assert summary.status_code == 200, summary.text
         assert summary.json()["data"][0]["sessions"][0]["id"] == str(saved_id)
+        assert summary.json()["data"][0]["avg_heart_rate_bpm"] == 60
+        assert summary.json()["data"][0]["vital_provenance"] == "same_provider_writer_device"
         saved_score = db.query(HealthScore).filter_by(user_id=user.id, provider=ProviderName.WHOOP).one()
         assert saved_score.event_record_id == saved_id
         assert saved_score.components["need_from_sleep_debt_milli"]["value"] == 3600000
@@ -148,7 +163,7 @@ def test_whoop_sleep_import_to_public_api(client: TestClient, db: Session, tmp_p
     db.commit()
     response = client.get(
         f"/api/v1/users/{users[0].id}/events/workouts",
-        params={"start_date": start.isoformat(), "end_date": end.isoformat()},
+        params={"start_date": start.isoformat(), "end_date": end.isoformat(), "include": "zones"},
         headers=headers,
     )
     assert response.status_code == 200, response.text
