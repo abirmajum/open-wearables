@@ -24,7 +24,7 @@ from psycopg.errors import NumericValueOutOfRange
 from sqlalchemy import Engine, delete, select
 from sqlalchemy.orm import Session
 
-from app.models import DataPointSeries, DataSource, DataTypeCoverage, HealthScore, ProviderCycle, User
+from app.models import DataPointSeries, DataSource, DataTypeCoverage, HealthScore, ProviderCycle, ProviderPriority, User
 from app.schemas.enums import HealthScoreCategory, ProviderName, SeriesType, get_series_type_id
 from app.services.providers.whoop.data_247 import Whoop247Data
 from app.services.providers.whoop.strategy import WhoopStrategy
@@ -93,6 +93,7 @@ def test_whoop_cycle_http_journey(client: TestClient, db: Session, tmp_path: Pat
         # This user is committed outside the ordinary rollback fixture so both see it.
         concurrent_user_id = uuid4()
         with Session(engine) as concurrent_db:
+            existing_priority_ids = set(concurrent_db.scalars(select(ProviderPriority.id)))
             concurrent_db.add(User(id=concurrent_user_id, first_name="Concurrent fixture"))
             concurrent_db.commit()
         try:
@@ -133,6 +134,14 @@ def test_whoop_cycle_http_journey(client: TestClient, db: Session, tmp_path: Pat
         finally:
             with Session(engine) as concurrent_db:
                 concurrent_db.execute(delete(User).where(User.id == concurrent_user_id))
+                # Source creation may seed a global provider priority outside the
+                # rollback fixture; remove only rows this concurrent phase created.
+                concurrent_db.execute(
+                    delete(ProviderPriority).where(
+                        ProviderPriority.provider == ProviderName.WHOOP,
+                        ProviderPriority.id.not_in(existing_priority_ids),
+                    )
+                )
                 concurrent_db.commit()
 
         opened = pull()
