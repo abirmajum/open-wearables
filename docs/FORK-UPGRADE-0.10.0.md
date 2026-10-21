@@ -28,6 +28,15 @@ null; an explicit zero step count remains zero. An ongoing cycle never enters th
 legacy daily totals. Newer provider revisions replace older ones, including
 corrections that lower a count. User deletion cascades to owned cycles.
 
+New closed-cycle legacy projections now carry deterministic cycle ownership. Both
+polls and webhook-driven imports use accepted stored revisions, and corrections
+including null withdrawals update only owned projection rows. Same-day candidates
+select greatest overlap with that day, then latest start and cycle ID; the cycle
+API retains every interval. Pre-upgrade unowned daily rows and archived aggregates
+are deliberately preserved on conflict and may retain old readings. They are
+historical compatibility data, not the authoritative revision feed. This change
+adds no destructive reconciliation or schema migration.
+
 The new `CYCLE_SYNC_ENABLED` flag defaults to false. Enable it on the scheduler
 only after the coordinated release. `CYCLE_SYNC_INTERVAL_SECONDS` defaults to 900
 and is constrained to 900–1800. It queues a two-day WHOOP cycle refresh for active,

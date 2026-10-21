@@ -134,16 +134,25 @@ def test_whoop_truncated_page_reaches_cursor_guard(
 
 
 @pytest.mark.parametrize("kind", ["recovery", "cycles"])
-def test_whoop_record_failure_marks_partial(kind: str) -> None:
+def test_whoop_record_failure_is_not_success(kind: str) -> None:
     provider = Whoop247Data("whoop", "https://example.invalid", MagicMock())
-    normalizer = "normalize_cycle" if kind == "cycles" else "normalize_recovery"
-    with (
-        patch.object(provider, "_fetch_paginated", return_value=([{}], False)),
-        patch.object(provider, normalizer, side_effect=ValueError("invalid record")),
-    ):
-        count, partial = getattr(provider, f"load_and_save_{kind}")(MagicMock(), USER_ID, CURSOR, CURSOR)
-    assert count == 0
-    assert partial is True
+    db = MagicMock()
+    with patch.object(provider, "_fetch_paginated", return_value=([{}], False)):
+        if kind == "cycles":
+            # Canonical cycles and their projections are now one atomic batch.
+            # Failure must roll back and propagate into the existing cursor guard.
+            with (
+                patch.object(provider, "_save_cycles", side_effect=ValueError("invalid record")),
+                pytest.raises(ValueError, match="invalid record"),
+            ):
+                provider.load_and_save_cycles(db, USER_ID, CURSOR, CURSOR)
+            db.rollback.assert_called_once()
+            db.commit.assert_not_called()
+        else:
+            with patch.object(provider, "normalize_recovery", side_effect=ValueError("invalid record")):
+                count, partial = provider.load_and_save_recovery(db, USER_ID, CURSOR, CURSOR)
+            assert count == 0
+            assert partial is True
 
 
 def test_body_measurement_fetch_failure_propagates() -> None:
