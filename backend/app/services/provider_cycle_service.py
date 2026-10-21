@@ -18,6 +18,17 @@ class ProviderCycleService:
     def __init__(self) -> None:
         self.repository = ProviderCycleRepository()
 
+    def lock_user(self, db: DbSession, user_id: UUID) -> None:
+        self.repository.lock_user(db, user_id)
+
+    def list_whoop(self, db: DbSession, user_id: UUID) -> list[CycleSummary]:
+        return [CycleSummary.model_validate(row.payload) for row in self.repository.list_whoop(db, user_id)]
+
+    def clear_owned_projection(
+        self, db: DbSession, user_id: UUID, days: set[datetime], owned_ids: set[UUID]
+    ) -> tuple[set[tuple[datetime, int]], set[datetime]]:
+        return self.repository.clear_owned_projection(db, user_id, days, owned_ids)
+
     def save_whoop(self, db: DbSession, user_id: UUID, raw: dict[str, Any]) -> WriteCounts:
         score = (raw.get("score") or {}) if raw.get("score_state") == "SCORED" else {}
         energy = score.get("kilojoule")

@@ -214,6 +214,48 @@ class DataTypeCoverageRepository:
             )
         )
 
+    def lock_for_replacement(self, db_session: DbSession) -> None:
+        """Acquire before replacing series, in the same order as backfills/narrowing."""
+        db_session.execute(_LOCK_FOR_NARROWING)
+
+    def refresh_series(self, db_session: DbSession, user_id: UUID, provider: str, data_types: list[str]) -> None:
+        """Narrow affected series spans after replacements; include preserved archive data."""
+        db_session.execute(_LOCK_FOR_NARROWING)
+        for data_type in sorted(data_types):
+            params = {"user_id": user_id, "provider": provider, "data_type": data_type, "kind": DataTypeKind.SERIES}
+            db_session.execute(
+                text("""
+                SELECT 1 FROM data_type_coverage
+                WHERE user_id=:user_id AND provider=:provider AND data_type=:data_type AND kind=:kind
+                FOR UPDATE
+            """),
+                params,
+            )
+            db_session.execute(
+                text("""
+                WITH held AS (
+                    SELECT p.recorded_at AS stamp FROM data_point_series p
+                    JOIN data_source ds ON ds.id=p.data_source_id
+                    JOIN series_type_definition st ON st.id=p.series_type_definition_id
+                    WHERE ds.user_id=:user_id AND ds.provider=:provider AND st.code=:data_type
+                    UNION ALL
+                    SELECT a.bucket_start_at FROM data_point_series_archive a
+                    JOIN data_source ds ON ds.id=a.data_source_id
+                    JOIN series_type_definition st ON st.id=a.series_type_definition_id
+                    WHERE ds.user_id=:user_id AND ds.provider=:provider AND st.code=:data_type
+                ), span AS (SELECT min(stamp) AS first_at, max(stamp) AS last_at FROM held),
+                emptied AS (
+                    DELETE FROM data_type_coverage USING span
+                    WHERE user_id=:user_id AND provider=:provider AND data_type=:data_type AND kind=:kind
+                      AND span.first_at IS NULL
+                )
+                UPDATE data_type_coverage SET coverage_start=span.first_at, coverage_end=span.last_at
+                FROM span WHERE user_id=:user_id AND provider=:provider AND data_type=:data_type AND kind=:kind
+                  AND span.first_at IS NOT NULL
+            """),
+                params,
+            )
+
     def refresh_events(self, db_session: DbSession, keys: Iterable[EventKey]) -> None:
         """Recompute these (user, provider, category) spans from the records left, after some were removed.
 

@@ -414,6 +414,23 @@ outside the daily time series; closed scored cycles retain the existing daily
 normalization as a separate view. Older provider revisions cannot overwrite newer
 ones. `fetched_at` indicates a fetch; `updated_at` indicates data freshness.
 
+New closed-cycle daily rows are owned by their cycle and rebuilt from accepted
+stored revisions in the same transaction as the cycle update. Downward corrections,
+withdrawn readings and changed dates replace or remove those owned rows. Polls and
+sleep-triggered cycle imports use the same path. If multiple stored closed cycles
+map to one daily key, the cycle covering most of that day wins, with latest start
+and then cycle ID breaking ties; cycles are never summed. All canonical cycles
+remain individually available from `/summaries/cycles`.
+
+Pre-upgrade daily rows and archive aggregates do not retain reliable cycle
+ownership. A conflicting legacy row is preserved, including its old value, rather
+than silently deleting a possibly different cycle's measurement. **The daily API
+is historical compatibility data and may retain old values at these conflicts;
+this change does not repair all historical daily readings.** Use canonical cycle
+revisions for current WHOOP readings and corrections. Reconciliation of unowned
+history would require a separately reviewed backfill. Other users, devices,
+providers and workout-linked strain scores are not replaced.
+
 For bounded current-cycle refresh, set `CYCLE_SYNC_ENABLED=true` after the schema
 upgrade. `CYCLE_SYNC_INTERVAL_SECONDS` defaults to 900 and permits 900–1800 seconds.
 The task requests a two-day overlap, reuses connection eligibility and shared

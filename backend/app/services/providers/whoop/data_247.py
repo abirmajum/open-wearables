@@ -3,7 +3,7 @@
 from datetime import datetime, time, timedelta, timezone
 from decimal import Decimal
 from typing import Any
-from uuid import UUID, uuid4, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from app.config import settings
 from app.database import DbSession
@@ -11,6 +11,7 @@ from app.models import DataPointSeries, DataSource, EventRecord
 from app.repositories import EventRecordRepository, UserConnectionRepository
 from app.repositories.data_point_series_repository import WriteCounts
 from app.repositories.data_source_repository import DataSourceRepository
+from app.repositories.data_type_coverage_repository import data_type_coverage_repository
 from app.schemas.enums import HealthScoreCategory, ProviderName, SeriesType, get_series_type_id
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
@@ -19,6 +20,7 @@ from app.schemas.model_crud.activities import (
     ScoreComponent,
     TimeSeriesSampleCreate,
 )
+from app.schemas.responses.provider_cycle import CycleSummary
 from app.services.event_record_service import event_record_service
 from app.services.health_score_service import health_score_service
 from app.services.provider_cycle_service import provider_cycle_service
@@ -943,24 +945,7 @@ class Whoop247Data(Base247DataTemplate):
             return 0
 
         try:
-            provider_cycle_service.save_whoop(db, user_id, raw)
-            daily_samples, strain_score = self.normalize_cycle(raw, user_id)
-            if not daily_samples and not strain_score:
-                log_structured(
-                    self.logger,
-                    "info",
-                    f"Whoop cycle {raw.get('id')} carries no usable score",
-                    provider="whoop",
-                    task="load_closed_cycle",
-                    user_id=str(user_id),
-                    score_state=raw.get("score_state"),
-                )
-                db.commit()
-                return 1
-            if daily_samples:
-                timeseries_service.bulk_create_samples(db, daily_samples)
-            if strain_score:
-                health_score_service.bulk_create(db, [strain_score])
+            self._save_cycles(db, user_id, [raw])
             db.commit()
             return 1
         except Exception as e:
@@ -987,8 +972,7 @@ class Whoop247Data(Base247DataTemplate):
         Returns ([], None) for cycles Whoop has not scored yet, and for the one still
         in progress. SCORED does not mean final: Whoop scores the ongoing cycle too, and
         its strain climbs all day. A missing end is what marks it as still running, so
-        both checks are needed — health scores are written with on_conflict_do_nothing,
-        so an early partial value would win permanently over the real one.
+        both checks are needed to keep provisional readings out of daily totals.
         """
         if raw_cycle.get("score_state") != "SCORED" or not raw_cycle.get("end"):
             return [], None
@@ -1069,37 +1053,110 @@ class Whoop247Data(Base247DataTemplate):
         Returns (rows written across daily samples and strain scores, truncated).
         """
         raw_data, truncated = self._fetch_paginated(db, user_id, _CYCLE_ENDPOINT, start_time, end_time, "cycle")
+        try:
+            counts = self._save_cycles(db, user_id, raw_data)
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        return counts, truncated
+
+    @staticmethod
+    def _projection_day(cycle: CycleSummary) -> datetime | None:
+        return _cycle_day_start(cycle.start_time, cycle.end_time, cycle.zone_offset) if cycle.end_time else None
+
+    @staticmethod
+    def _projection_id(user_id: UUID, cycle_id: str, metric: str) -> UUID:
+        return uuid5(NAMESPACE_URL, f"open-wearables:whoop-cycle:{user_id}:{cycle_id}:{metric}")
+
+    def _save_cycles(self, db: DbSession, user_id: UUID, raw_cycles: list[dict[str, Any]]) -> WriteCounts:
+        """Atomically rebuild touched days from accepted snapshots, never from stale deliveries.
+
+        The legacy schema holds one whole-cycle value per day. Prefer greatest overlap
+        with that day, then latest start/id, independent of fetch or webhook order.
+        Unknown legacy rows have no cycle ownership and must not be overwritten.
+        """
+        if not raw_cycles:
+            return WriteCounts(0, 0)
+        provider_cycle_service.lock_user(db, user_id)
+        previous = {c.id: c for c in provider_cycle_service.list_whoop(db, user_id)}
+        accepted: set[str] = set()
+        counts = WriteCounts(0, 0)
+        for raw in raw_cycles:
+            written = provider_cycle_service.save_whoop(db, user_id, raw)
+            counts += written
+            if written:
+                accepted.add(str(raw["id"]))
+        if not accepted:
+            return counts
+        current = provider_cycle_service.list_whoop(db, user_id)
+        days = {
+            day
+            for cycle in [*previous.values(), *current]
+            if cycle.id in accepted and (day := self._projection_day(cycle)) is not None
+        }
+        if not days:
+            return counts
+        owned_ids = {
+            self._projection_id(user_id, cycle.id, metric)
+            for cycle in [*previous.values(), *current]
+            for metric in ("steps", "total_energy", "strain")
+        }
+        data_type_coverage_repository.lock_for_replacement(db)
+        blocked_samples, blocked_scores = provider_cycle_service.clear_owned_projection(db, user_id, days, owned_ids)
+        winners: dict[datetime, CycleSummary] = {}
+
+        def rank(cycle: CycleSummary, day: datetime) -> tuple[timedelta, datetime, str]:
+            assert cycle.end_time is not None
+            return (
+                min(cycle.end_time, day + timedelta(days=1)) - max(cycle.start_time, day),
+                cycle.start_time,
+                cycle.id,
+            )
+
+        for cycle in current:
+            day = self._projection_day(cycle)
+            if day not in days or cycle.score_state != "SCORED":
+                continue
+            assert day is not None
+            if day not in winners or rank(cycle, day) > rank(winners[day], day):
+                winners[day] = cycle
         samples: list[TimeSeriesSampleCreate] = []
-        health_scores: list[HealthScoreCreate] = []
-
-        cycle_counts = WriteCounts(0, 0)
-        for item in raw_data:
-            try:
-                cycle_counts += provider_cycle_service.save_whoop(db, user_id, item)
-                daily_samples, strain_score = self.normalize_cycle(item, user_id)
-                samples.extend(daily_samples)
-                if strain_score:
-                    health_scores.append(strain_score)
-            except Exception as e:
-                truncated = True
-                log_structured(
-                    self.logger,
-                    "warning",
-                    f"Failed to normalize cycle: {e}",
-                    provider="whoop",
-                    task="load_and_save_cycles",
-                    user_id=str(user_id),
-                )
-
-        counts = cycle_counts
+        scores: list[HealthScoreCreate] = []
+        for day, cycle in winners.items():
+            raw = {
+                "id": cycle.id,
+                "start": cycle.start_time.isoformat(),
+                "end": cycle.end_time.isoformat() if cycle.end_time else None,
+                "timezone_offset": cycle.zone_offset,
+                "score_state": cycle.score_state,
+                "step_count": cycle.steps,
+                "score": {
+                    "strain": cycle.strain,
+                    "kilojoule": cycle.energy_kj,
+                    "average_heart_rate": cycle.avg_heart_rate_bpm,
+                    "max_heart_rate": cycle.max_heart_rate_bpm,
+                },
+            }
+            daily, score = self.normalize_cycle(raw, user_id)
+            for sample in daily:
+                if (day, get_series_type_id(sample.series_type)) not in blocked_samples:
+                    samples.append(
+                        sample.model_copy(
+                            update={
+                                "id": self._projection_id(user_id, cycle.id, sample.series_type.value),
+                                "external_id": f"whoop-cycle:{cycle.id}",
+                            }
+                        )
+                    )
+            if score is not None and day not in blocked_scores:
+                scores.append(score.model_copy(update={"id": self._projection_id(user_id, cycle.id, "strain")}))
         if samples:
             counts += timeseries_service.bulk_create_samples(db, samples)
-        if health_scores:
-            counts += health_score_service.bulk_create(db, health_scores)
-        if raw_data:
-            db.commit()
-
-        return counts, truncated
+        if scores:
+            counts += health_score_service.bulk_create(db, scores)
+        data_type_coverage_repository.refresh_series(db, user_id, "whoop", ["steps", "total_energy"])
+        return counts
 
     # -------------------------------------------------------------------------
     # Activity Samples
