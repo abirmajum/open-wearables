@@ -12,7 +12,6 @@ from alembic.operations import Operations
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
-from testcontainers.postgres import PostgresContainer
 
 from app.services.api_key_service import api_key_service
 
@@ -33,23 +32,19 @@ def _configure_redis() -> None:
 
 
 @pytest.fixture(scope="module")
-def isolated_engine() -> Generator[Engine, None, None]:
-    with PostgresContainer(
-        image="postgres:18",
-        username="open-wearables",
-        password="open-wearables",
-        dbname="open_wearables_api_key_migration_test",
-        driver="psycopg",
-    ) as postgres:
-        test_engine = create_engine(postgres.get_connection_url())
-        try:
-            yield test_engine
-        finally:
-            test_engine.dispose()
+def isolated_engine(_postgres_url: str) -> Generator[Engine, None, None]:
+    # Keep the migration in its rolled-back private schema on the configured
+    # fixture server. CI's network guard permits that server, not a second
+    # independently allocated container port.
+    test_engine = create_engine(_postgres_url)
+    try:
+        yield test_engine
+    finally:
+        test_engine.dispose()
 
 
-def _load_migration() -> ModuleType:
-    path = Path(__file__).parents[2] / "migrations/versions/2026_09_04_1200-a3f4e5d6c7b8_secure_api_key_storage.py"
+def _load_migration(filename: str = "2026_09_04_1200-a3f4e5d6c7b8_secure_api_key_storage.py") -> ModuleType:
+    path = Path(__file__).parents[2] / "migrations/versions" / filename
     spec = spec_from_file_location("secure_api_key_storage", path)
     assert spec is not None
     assert spec.loader is not None
@@ -98,6 +93,15 @@ def test_legacy_key_survives_secure_storage_migration(isolated_engine: Engine) -
             assert isinstance(row.id, UUID)
             assert row.key_hash == sha256(legacy_secret.encode("utf-8")).hexdigest()
             assert row.display_prefix == legacy_secret[:11]
+
+            upstream = _load_migration("2026_09_10_1200-a7c3e9f1b2d4_hash_api_keys.py")
+            upstream.op = Operations(MigrationContext.configure(connection))
+            upstream.upgrade()
+            upstream.upgrade()  # adaptation is idempotent
+            adapted = connection.execute(sa.text("SELECT id,key_hash,key_prefix FROM api_key")).one()
+            assert adapted.id == row.id
+            assert adapted.key_hash == row.key_hash
+            assert adapted.key_prefix == row.display_prefix
 
             with Session(bind=connection) as session:
                 authenticated = api_key_service.validate_api_key(session, legacy_secret)

@@ -1,22 +1,29 @@
 from .api_key import ApiKey
 from .application import Application
 from .archival_setting import ArchivalSetting
+from .data_migration import DataMigration
 from .data_point_series import DataPointSeries
 from .data_point_series_archive import DataPointSeriesArchive
 from .data_source import DataSource
+from .data_type_coverage import DataTypeCoverage
 from .developer import Developer
 from .device_type_priority import DeviceTypePriority
 from .event_record import EventRecord
 from .event_record_detail import DetailType, EventRecordDetail
 from .health_score import HealthScore
 from .invitation import Invitation
+from .meal_details import MealDetails
 from .menstrual_cycle_details import MenstrualCycleDetails
 from .personal_record import PersonalRecord
+from .provider_cycle import ProviderCycle
 from .provider_priority import ProviderPriority
 from .provider_setting import ProviderSetting
 from .refresh_token import RefreshToken
 from .series_type_definition import SeriesTypeDefinition
 from .sleep_details import SleepDetails
+from .sync_run import SyncRun
+from .sync_run_data_type import SyncRunDataType
+from .telemetry_state import TelemetryState
 from .user import User
 from .user_connection import UserConnection
 from .user_invitation_code import UserInvitationCode
@@ -33,12 +40,14 @@ __all__ = [
     "ApiKey",
     "Application",
     "ArchivalSetting",
+    "DataMigration",
     "Developer",
     "DataSource",
     "DataPointSeriesArchive",
     "DeviceTypePriority",
     "Invitation",
     "ProviderPriority",
+    "ProviderCycle",
     "ProviderSetting",
     "RefreshToken",
     "User",
@@ -46,13 +55,18 @@ __all__ = [
     "UserInvitationCode",
     "EventRecord",
     "EventRecordDetail",
+    "MealDetails",
     "MenstrualCycleDetails",
     "SleepDetails",
     "WorkoutDetails",
     "PersonalRecord",
     "DataPointSeries",
+    "DataTypeCoverage",
     "SeriesTypeDefinition",
+    "SyncRun",
+    "SyncRunDataType",
     "HealthScore",
     "DetailType",
     "DETAIL_MODELS",
+    "TelemetryState",
 ]

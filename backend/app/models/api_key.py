@@ -1,25 +1,22 @@
 from uuid import UUID
 
-from sqlalchemy import String
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped
 
 from app.database import BaseDbModel
-from app.mappings import FKDeveloper, PrimaryKey, str_64
+from app.mappings import FKDeveloper, PrimaryKey, Unique, str_32, str_64
 
 
 class ApiKey(BaseDbModel):
-    """Global API key for external service access."""
+    """Global API key for external service access.
+
+    The raw key value is never stored: only its SHA-256 hash (for lookup) and a short
+    prefix (for display). The full value is returned once, on create or rotate.
+    """
 
     __tablename__ = "api_key"
 
     id: Mapped[PrimaryKey[UUID]]
-    key_hash: Mapped[str_64] = mapped_column(unique=True, index=True)
-    display_prefix: Mapped[str] = mapped_column(String(12))
+    key_hash: Mapped[Unique[str_64]]  # sha256 hex digest of the raw key
+    key_prefix: Mapped[str_32]  # first characters of the raw key, shown in the UI
     name: Mapped[str]
     created_by: Mapped[FKDeveloper | None]
-
-    def __repr__(self) -> str:
-        return (
-            f"<ApiKey(id={self.id!r}, name={self.name!r}, "
-            f"display_prefix={self.display_prefix!r}, created_by={self.created_by!r})>"
-        )
