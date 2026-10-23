@@ -25,6 +25,9 @@ jobs:
   # a dispatch can't move latest/nightly or overwrite a release/nightly-<sha>
   # tag. TAG is passed via env, not inline ${{ }}, to avoid shell injection.
   validate:
+    # These images belong to the upstream Docker Hub namespace. Rumi's fork
+    # builds on Railway and must not run this publisher without upstream access.
+    if: github.repository == 'the-momentum/open-wearables'
     runs-on: ubuntu-latest
     steps:
       - name: Validate manual tag
