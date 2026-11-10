@@ -41,6 +41,8 @@ from app.schemas.enums import (
 from app.schemas.utils import ArchivalSettingUpdate
 from app.services.aggregate_backfill_service import aggregate_backfill_service
 from app.services.archival_service import archival_service
+from app.services.providers.whoop.data_247 import Whoop247Data
+from app.services.providers.whoop.strategy import WhoopStrategy
 from app.utils.exceptions import InvalidInputError
 from tests.factories import (
     DataPointSeriesFactory,
@@ -793,6 +795,56 @@ class TestHistoryValuesMovedToTheBackup:
             EventRecordAggregate.series_type_definition_id == get_series_type_id(SeriesType.steps),
         )
         assert session.sum == Decimal("1000")
+
+    def test_whoops_day_and_recovery_values_are_copied_and_stay_samples(self, db: Session) -> None:
+        """The fork still writes them as samples, which raw /timeseries returns."""
+        whoop = DataSourceFactory(provider=ProviderName.WHOOP, source="whoop", device_model=None, device_type="band")
+        sleep = EventRecordFactory(
+            data_source=whoop,
+            category="sleep",
+            type="sleep",
+            start_datetime=datetime(2025, 6, 1, 20, tzinfo=timezone.utc),
+            end_datetime=datetime(2025, 6, 2, 4, tzinfo=timezone.utc),
+            duration_seconds=8 * 3600,
+        )
+        midnight = datetime(2025, 6, 1, 21, tzinfo=timezone.utc)  # 2025-06-02 00:00 at +03:00
+        _sample(db, whoop, SeriesType.total_energy, midnight, "2270.557", zone_offset="+03:00", is_daily_total=True)
+        _sample(db, whoop, SeriesType.resting_heart_rate, datetime(2025, 6, 2, 4, 15, tzinfo=timezone.utc), "54")
+
+        aggregate_backfill_service.run(db, budget_seconds=60)
+
+        assert self._values(db, SeriesSample) == [Decimal("54"), Decimal("2270.557")]
+        assert db.query(SeriesSampleBackup).count() == 0
+        assert _days(db) == [("total_energy", date(2025, 6, 2), "+03:00", Decimal("2270.557"), None)]
+        assert [(row.record_id, row.avg) for row in db.query(EventRecordAggregate)] == [(sleep.id, Decimal("54"))]
+
+    def test_a_legacy_whoop_day_still_holds_off_the_cycle_projection(self, db: Session) -> None:
+        """A day total no projected cycle owns stays as it was after the backfill, as before it."""
+        whoop = DataSourceFactory(provider=ProviderName.WHOOP, source="whoop", device_model=None, device_type="band")
+        midnight = datetime(2026, 3, 10, 23, tzinfo=timezone.utc)  # 2026-03-11 00:00 at +01:00
+        _sample(db, whoop, SeriesType.total_energy, midnight, "321", zone_offset="+01:00", is_daily_total=True)
+        aggregate_backfill_service.run(db, budget_seconds=60)
+        data_247 = WhoopStrategy().data_247
+        assert isinstance(data_247, Whoop247Data)
+
+        data_247._save_cycles(
+            db,
+            whoop.user_id,
+            [
+                {
+                    "id": 1001,
+                    "score_state": "SCORED",
+                    "start": "2026-03-10T22:30:00.000Z",
+                    "end": "2026-03-11T22:10:00.000Z",
+                    "updated_at": "2026-03-11T22:30:00.000Z",
+                    "timezone_offset": "+01:00",
+                    "score": {"kilojoule": 8368, "strain": 10.2},
+                }
+            ],
+        )
+
+        assert _days(db) == [("total_energy", date(2026, 3, 11), "+01:00", Decimal("321"), None)]
+        assert self._values(db, SeriesSample) == [Decimal("321")]
 
     def test_a_session_value_without_its_session_stays_a_reading(self, db: Session) -> None:
         """The history could not copy it onto a sleep, so it is left where it was."""

@@ -807,17 +807,21 @@ class Whoop247Data(Base247DataTemplate):
             value = normalized_recovery.get(field_name)
             if value is not None:
                 try:
-                    samples_to_create.append(
-                        TimeSeriesSampleCreate(
-                            id=uuid4(),
-                            user_id=user_id,
-                            source=self.provider_name,
-                            recorded_at=timestamp,
-                            value=Decimal(str(value)),
-                            series_type=series_type,
-                            session=SessionValue(record_id=sleep.id) if sleep else None,
-                        )
+                    sample = TimeSeriesSampleCreate(
+                        id=uuid4(),
+                        user_id=user_id,
+                        source=self.provider_name,
+                        recorded_at=timestamp,
+                        value=Decimal(str(value)),
+                        series_type=series_type,
                     )
+                    # Raw /timeseries returns the sample at the recovery's time, as before 1.0; the session value
+                    # ties the vitals to the sleep they were scored on.
+                    samples_to_create.append(sample)
+                    if sleep:
+                        samples_to_create.append(
+                            sample.model_copy(update={"session": SessionValue(record_id=sleep.id)})
+                        )
                 except Exception as e:
                     logger.warning(
                         "Failed to build recovery sample",
@@ -1172,14 +1176,15 @@ class Whoop247Data(Base247DataTemplate):
             daily, score = self.normalize_cycle(raw, user_id)
             for sample in daily:
                 if (day, get_series_type_id(sample.series_type)) not in blocked_samples:
-                    samples.append(
-                        sample.model_copy(
-                            update={
-                                "id": self._projection_id(user_id, cycle.id, sample.series_type.value),
-                                "external_id": f"whoop-cycle:{cycle.id}",
-                            }
-                        )
+                    owned = sample.model_copy(
+                        update={
+                            "id": self._projection_id(user_id, cycle.id, sample.series_type.value),
+                            "external_id": f"whoop-cycle:{cycle.id}",
+                        }
                     )
+                    # The provider day row serves the summaries; the daily-total sample keeps the day in raw
+                    # /timeseries, as before 1.0.
+                    samples += [owned, owned.model_copy(update={"period": None})]
             if score is not None and day not in blocked_scores:
                 scores.append(score.model_copy(update={"id": self._projection_id(user_id, cycle.id, "strain")}))
         if samples:

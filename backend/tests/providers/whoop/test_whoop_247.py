@@ -9,9 +9,10 @@ from sqlalchemy.orm import Session
 
 from app.models import EventRecordAggregate
 from app.schemas.enums import SeriesType, get_series_type_id
-from app.schemas.model_crud.activities import CalendarPeriod, EventRecordDetailCreate
+from app.schemas.model_crud.activities import CalendarPeriod, EventRecordDetailCreate, TimeSeriesQueryParams
 from app.services.providers.whoop.data_247 import Whoop247Data
 from app.services.providers.whoop.strategy import WhoopStrategy
+from app.services.timeseries_service import timeseries_service
 
 
 def test_cycle_day_values_carry_the_local_day_the_cycle_covers() -> None:
@@ -54,6 +55,84 @@ def test_recovery_values_point_at_the_sleep_they_were_scored_on(db: Session) -> 
     assert {row.record_id for row in rows.values()} == {sleep.id}
     assert rows[get_series_type_id(SeriesType.resting_heart_rate)].avg == Decimal("52")
     assert rows[get_series_type_id(SeriesType.oxygen_saturation)].avg == Decimal("97.5")
+
+
+def test_recovery_values_stay_readings_at_the_recovery_time(db: Session) -> None:
+    """Rumi reads WHOOP's recovery vitals from raw /timeseries at the time WHOOP scored them, as before 1.0."""
+    from tests.factories import DataSourceFactory, EventRecordFactory, UserFactory
+
+    user = UserFactory()
+    EventRecordFactory(
+        category="sleep", external_id="whoop-sleep-1", data_source=DataSourceFactory(user=user, provider="whoop")
+    )
+    data_247 = WhoopStrategy().data_247
+    normalized, _ = data_247.normalize_recovery(
+        {
+            "sleep_id": "whoop-sleep-1",
+            "score_state": "SCORED",
+            "created_at": "2026-03-11T06:40:00.000Z",
+            "score": {"resting_heart_rate": 52, "spo2_percentage": 97.5},
+        },
+        user.id,
+    )
+
+    data_247.save_recovery_data(db, user.id, normalized)
+    result = timeseries_service.get_timeseries(
+        db,
+        user.id,
+        [SeriesType.resting_heart_rate, SeriesType.oxygen_saturation],
+        TimeSeriesQueryParams(
+            start_datetime=datetime(2026, 3, 11, tzinfo=timezone.utc),
+            end_datetime=datetime(2026, 3, 12, tzinfo=timezone.utc),
+        ),
+    )
+
+    scored_at = datetime(2026, 3, 11, 6, 40, tzinfo=timezone.utc)
+    assert sorted((s.type, s.timestamp, s.value, s.source.provider) for s in result.data) == [
+        (SeriesType.oxygen_saturation, scored_at, 97.5, "whoop"),
+        (SeriesType.resting_heart_rate, scored_at, 52.0, "whoop"),
+    ]
+
+
+def test_a_closed_cycle_keeps_its_day_totals_in_raw_timeseries(db: Session) -> None:
+    """Rumi reads WHOOP's day energy from raw /timeseries as a daily total at the day's local midnight."""
+    from tests.factories import UserFactory
+
+    user = UserFactory()
+    data_247 = WhoopStrategy().data_247
+    assert isinstance(data_247, Whoop247Data)
+
+    data_247._save_cycles(
+        db,
+        user.id,
+        [
+            {
+                "id": 1001,
+                "score_state": "SCORED",
+                "start": "2026-03-10T22:30:00.000Z",
+                "end": "2026-03-11T22:10:00.000Z",
+                "updated_at": "2026-03-11T22:30:00.000Z",
+                "timezone_offset": "+01:00",
+                "score": {"kilojoule": 8368, "strain": 10.2},
+                "step_count": 9000,
+            }
+        ],
+    )
+    result = timeseries_service.get_timeseries(
+        db,
+        user.id,
+        [SeriesType.total_energy, SeriesType.steps],
+        TimeSeriesQueryParams(
+            start_datetime=datetime(2026, 3, 10, tzinfo=timezone.utc),
+            end_datetime=datetime(2026, 3, 12, tzinfo=timezone.utc),
+        ),
+    )
+
+    local_midnight = datetime(2026, 3, 10, 23, tzinfo=timezone.utc)
+    assert sorted((s.type, s.timestamp, s.value, s.is_daily_total) for s in result.data) == [
+        (SeriesType.steps, local_midnight, 9000.0, True),
+        (SeriesType.total_energy, local_midnight, 2000.002208, True),
+    ]
 
 
 def _recovery(user_id: object, sleep_id: str) -> dict:

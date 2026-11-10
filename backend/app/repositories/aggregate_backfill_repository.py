@@ -192,7 +192,7 @@ class AggregateBackfillRepository:
     ) -> int:
         """The source's day and session values of the days from ``from_day`` up to ``to_day``, stored as samples, as
         provider rows in the aggregate tables where the provider holds none yet; then those samples moved to
-        series_sample_backup. Returns the rows written."""
+        series_sample_backup, unless their rule keeps them. Returns the rows written."""
         written, moves = 0, []
         for rule, statement in _HISTORY:
             if ProviderName(provider) not in rule.providers:
@@ -210,7 +210,8 @@ class AggregateBackfillRepository:
                 **_stat_params(rule),
             }
             written += db_session.execute(statement, params).rowcount  # ty: ignore[unresolved-attribute]
-            moves.append((_MOVES[rule], params))
+            if not rule.keep_samples:
+                moves.append((_MOVES[rule], params))
         # After every copy: a sample two rules match is still there for the second.
         for move, params in moves:
             db_session.execute(move, params)

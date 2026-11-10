@@ -3,7 +3,8 @@
 Frozen history, on purpose not derived from the providers' current mappings: it describes rows already
 written, so it must not move when a provider's mapping does. The aggregate backfill copies what these
 rules match into series_aggregate and event_record_aggregate and moves those samples to series_sample_backup, so
-series_sample holds readings only.
+series_sample holds readings only. The fork still writes WHOOP's day and recovery values as samples beside their
+aggregate rows, so the backfill leaves its old ones in place too.
 """
 
 from dataclasses import dataclass
@@ -50,6 +51,8 @@ class HistoryRule:
     where: str = "TRUE"
     day: DayAnchor | None = None
     session: SessionMatch | None = None
+    # Copied, but left in series_sample rather than moved to the backup.
+    keep_samples: bool = False
 
 
 def _own(*series: SeriesType) -> tuple[tuple[SeriesType, StatColumn | None], ...]:
@@ -177,7 +180,12 @@ HISTORY_RULES: tuple[HistoryRule, ...] = (
         session=SessionMatch.SLEEP_BY_ID_OR_END,
     ),
     # Whoop cycles: the local midnight of the cycle's day (its start before 2026-09-30).
-    HistoryRule(frozenset({ProviderName.WHOOP}), _own(SeriesType.total_energy, SeriesType.steps), day=DayAnchor.LOCAL),
+    HistoryRule(
+        frozenset({ProviderName.WHOOP}),
+        _own(SeriesType.total_energy, SeriesType.steps),
+        day=DayAnchor.LOCAL,
+        keep_samples=True,
+    ),
     # Whoop recovery was stored at its creation, after the sleep it scores, without the sleep's id.
     HistoryRule(
         frozenset({ProviderName.WHOOP}),
@@ -188,6 +196,7 @@ HISTORY_RULES: tuple[HistoryRule, ...] = (
             SeriesType.skin_temperature,
         ),
         session=SessionMatch.SLEEP_ENDED_BEFORE,
+        keep_samples=True,
     ),
     HistoryRule(
         frozenset({ProviderName.SENSORBIO}),
