@@ -128,7 +128,7 @@ _HELD_SERIES_SPANS = f"""
     SELECT ds.user_id, ds.provider, std.code AS data_type, CAST(:series AS varchar) AS kind,
            min(s.first_at) AS coverage_start, max(s.last_at) AS coverage_end
     FROM (
-        {_pair_spans("data_point_series", "recorded_at")}
+        {_pair_spans("series_sample", "recorded_at")}
         UNION ALL
         {_pair_spans("data_point_series_archive", "bucket_start_at")}
     ) s
@@ -234,10 +234,16 @@ class DataTypeCoverageRepository:
             db_session.execute(
                 text("""
                 WITH held AS (
-                    SELECT p.recorded_at AS stamp FROM data_point_series p
+                    SELECT p.recorded_at AS stamp FROM series_sample p
                     JOIN data_source ds ON ds.id=p.data_source_id
                     JOIN series_type_definition st ON st.id=p.series_type_definition_id
                     WHERE ds.user_id=:user_id AND ds.provider=:provider AND st.code=:data_type
+                    UNION ALL
+                    SELECT g.period_start FROM series_aggregate g
+                    JOIN data_source ds ON ds.id=g.data_source_id
+                    JOIN series_type_definition st ON st.id=g.series_type_definition_id
+                    WHERE ds.user_id=:user_id AND ds.provider=:provider AND st.code=:data_type
+                      AND g.computed_by='provider' AND g.period_kind='day'
                     UNION ALL
                     SELECT a.bucket_start_at FROM data_point_series_archive a
                     JOIN data_source ds ON ds.id=a.data_source_id
@@ -355,6 +361,12 @@ class DataTypeCoverageRepository:
         if data_types is not None:
             stmt = stmt.where(DataTypeCoverage.data_type.in_(list(data_types)))
         return list(db_session.execute(stmt).scalars().all())
+
+    def exists_for_provider(self, db_session: DbSession, user_id: UUID, provider: str) -> bool:
+        stmt = select(DataTypeCoverage.user_id).where(
+            DataTypeCoverage.user_id == user_id, DataTypeCoverage.provider == provider
+        )
+        return db_session.execute(stmt.limit(1)).first() is not None
 
     def get(
         self, db_session: DbSession, user_id: UUID, provider: str, data_type: str, kind: DataTypeKind

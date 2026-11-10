@@ -62,7 +62,17 @@ def main() -> int:
     return supervise(
         [
             [*common, "--pool=threads", "-Q", "default,sdk_sync,garmin_sync,webhook_sync", "-n", "io@%h"],
-            [*common, "--pool=prefork", "--concurrency=2", "-Q", "xml_sync", "-n", "cpu@%h"],
+            [
+                *common,
+                "--pool=prefork",
+                "--concurrency=2",
+                "--prefetch-multiplier=1",
+                "--disable-prefetch",
+                "-Q",
+                "xml_sync",
+                "-n",
+                "cpu@%h",
+            ],
         ]
     )
 

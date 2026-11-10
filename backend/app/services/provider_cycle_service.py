@@ -11,7 +11,7 @@ from app.repositories.data_point_series_repository import WriteCounts
 from app.repositories.provider_cycle_repository import ProviderCycleRepository
 from app.schemas.responses.provider_cycle import CycleSummary
 from app.schemas.utils import PaginatedResponse, Pagination, TimeseriesMetadata
-from app.utils.exceptions import InvalidCursorError, handle_exceptions
+from app.utils.exceptions import InvalidCursorError
 
 
 class ProviderCycleService:
@@ -59,7 +59,6 @@ class ProviderCycleService:
             ),
         )
 
-    @handle_exceptions
     def page(
         self, db: DbSession, user_id: UUID, start: datetime, end: datetime, cursor: str | None, limit: int
     ) -> PaginatedResponse[CycleSummary]:

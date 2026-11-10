@@ -1,13 +1,11 @@
-import logging
-
 from fastapi import APIRouter
 from sqlalchemy import text
 
 from app.database import DbSession, engine
-from app.utils.structured_logging import log_structured
+from app.utils.structured_logging import get_logger
 
 healthcheck_router = APIRouter()
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def database_is_ready() -> bool:
@@ -20,7 +18,7 @@ def database_is_ready() -> bool:
         with engine.connect() as connection:
             connection.execute(text("SELECT 1"))
     except Exception:
-        log_structured(logger, "warning", "Database readiness check failed", action="database_readiness_failed")
+        logger.warning("Database readiness check failed", action="database_readiness_failed")
         return False
     return True
 
@@ -49,7 +47,7 @@ async def database_health(db: DbSession) -> dict[str, str | dict[str, str]]:
             "pool": pool_status,
         }
     except Exception:
-        log_structured(logger, "warning", "Database health check failed", action="database_health_check_failed")
+        logger.warning("Database health check failed", action="database_health_check_failed")
         return {
             "status": "unhealthy",
         }

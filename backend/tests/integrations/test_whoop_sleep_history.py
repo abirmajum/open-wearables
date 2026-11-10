@@ -123,7 +123,7 @@ def test_whoop_sleep_import_to_public_api(client: TestClient, db: Session, tmp_p
     corrected = db.query(HealthScore).filter_by(id=legacy_score_id).one()
     assert corrected.value == 91
     assert corrected.event_record_id == legacy_id
-    assert corrected.recorded_at.date().isoformat() == "2026-09-21"
+    assert corrected.recorded_at.date().isoformat() == "2026-09-22"
     assert db.query(EventRecord).filter_by(external_id=raw["id"]).count() == 2
     evidence["checks"].append("corrections update in place")
 

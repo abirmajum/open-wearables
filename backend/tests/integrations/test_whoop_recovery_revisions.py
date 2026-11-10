@@ -9,7 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from app.models import DataPointSeries, DataSource, HealthScore
+from app.models import DataSource, HealthScore, SeriesSample
 from app.schemas.enums import HealthScoreCategory, ProviderName, SeriesType, get_series_type_id
 from app.services.health_score_service import health_score_service
 from app.services.providers.whoop.data_247 import Whoop247Data
@@ -96,13 +96,12 @@ def test_revisions_replace_legacy_score_in_public_apis(client: TestClient, db: S
         assert current["value"] == value
         assert current["components"]["hrv_rmssd_milli"]["value"] == 66.5
         sample = (
-            db.query(DataPointSeries)
-            .join(DataSource, DataPointSeries.data_source_id == DataSource.id)
+            db.query(SeriesSample)
+            .join(DataSource, SeriesSample.data_source_id == DataSource.id)
             .filter(
                 DataSource.user_id == user.id,
-                DataPointSeries.series_type_definition_id
-                == get_series_type_id(SeriesType.heart_rate_variability_rmssd),
-                DataPointSeries.recorded_at == stored.recorded_at,
+                SeriesSample.series_type_definition_id == get_series_type_id(SeriesType.heart_rate_variability_rmssd),
+                SeriesSample.recorded_at == stored.recorded_at,
             )
             .one()
         )

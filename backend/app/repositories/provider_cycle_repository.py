@@ -5,10 +5,10 @@ from sqlalchemy import delete, literal_column, or_, select, text, tuple_
 from sqlalchemy.dialects.postgresql import insert
 
 from app.database import DbSession
-from app.models import DataPointSeries, DataPointSeriesArchive, DataSource, HealthScore
+from app.models import DataPointSeriesArchive, DataSource, HealthScore, SeriesAggregate, SeriesSample
 from app.models.provider_cycle import ProviderCycle
 from app.repositories.data_point_series_repository import WriteCounts
-from app.schemas.enums import HealthScoreCategory, ProviderName, SeriesType, get_series_type_id
+from app.schemas.enums import ComputedBy, HealthScoreCategory, PeriodKind, ProviderName, SeriesType, get_series_type_id
 
 
 class ProviderCycleRepository:
@@ -41,11 +41,11 @@ class ProviderCycleRepository:
             DataSource.source_app_id.is_(None),
         )
         db.execute(
-            delete(DataPointSeries).where(
-                DataPointSeries.data_source_id.in_(sources),
-                DataPointSeries.id.in_(owned_ids),
-                DataPointSeries.recorded_at.in_(days),
-                DataPointSeries.is_daily_total.is_(True),
+            delete(SeriesSample).where(
+                SeriesSample.data_source_id.in_(sources),
+                SeriesSample.id.in_(owned_ids),
+                SeriesSample.recorded_at.in_(days),
+                SeriesSample.is_daily_total.is_(True),
             )
         )
         db.execute(
@@ -60,8 +60,8 @@ class ProviderCycleRepository:
         )
         occupied_samples = set(
             db.execute(
-                select(DataPointSeries.recorded_at, DataPointSeries.series_type_definition_id).where(
-                    DataPointSeries.data_source_id.in_(sources), DataPointSeries.recorded_at.in_(days)
+                select(SeriesSample.recorded_at, SeriesSample.series_type_definition_id).where(
+                    SeriesSample.data_source_id.in_(sources), SeriesSample.recorded_at.in_(days)
                 )
             ).tuples()
         )
@@ -84,6 +84,20 @@ class ProviderCycleRepository:
                 for stamp, kind in archived
                 if stamp.astimezone(timezone.utc).date() == day.astimezone(timezone.utc).date()
             )
+        # Since 1.0 the projection is a provider day row, which keeps no per-row ownership. A day row is ours
+        # unless an unowned legacy sample or archive row holds that day, which the projection never claims.
+        projected = [get_series_type_id(SeriesType.steps), get_series_type_id(SeriesType.total_energy)]
+        db.execute(
+            delete(SeriesAggregate).where(
+                SeriesAggregate.data_source_id.in_(sources),
+                SeriesAggregate.computed_by == ComputedBy.PROVIDER,
+                SeriesAggregate.period_kind == PeriodKind.DAY,
+                SeriesAggregate.series_type_definition_id.in_(projected),
+                tuple_(SeriesAggregate.period_start, SeriesAggregate.series_type_definition_id).in_(
+                    [(day, kind) for day in days for kind in projected if (day, kind) not in occupied_samples]
+                ),
+            )
+        )
         occupied_scores = set(
             db.scalars(
                 select(HealthScore.recorded_at).where(
