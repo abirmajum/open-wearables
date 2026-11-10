@@ -670,6 +670,113 @@ class TestSleepPagingPerDate:
 
 
 class TestGetRecoverySummaries:
+    DAY = date(2026, 11, 8)
+    START = _dt("2026-11-07T00:00:00+00:00")
+    END = _dt("2026-11-09T00:00:00+00:00")
+
+    def _whoop_with_apple_and_garmin(self, db: Session) -> Any:
+        """A WHOOP-scored morning on a day Apple and Garmin also measured resting HR and HRV, at the default
+        priorities that rank both above WHOOP. WHOOP's score has no data source, as WHOOP writes it."""
+        priorities = ProviderPriorityRepository(ProviderPriority)
+        for provider, rank in ((ProviderName.APPLE, 1), (ProviderName.GARMIN, 2), (ProviderName.WHOOP, 5)):
+            priorities.upsert(db, provider, rank)
+        user = UserFactory()
+        whoop = DataSourceFactory(user=user, provider=ProviderName.WHOOP, source="whoop", device_type="band")
+        apple = DataSourceFactory(user=user, provider=ProviderName.APPLE, source="Apple Watch", device_type="watch")
+        garmin = DataSourceFactory(user=user, provider=ProviderName.GARMIN, source="garmin", device_type="watch")
+        night = EventRecordFactory(
+            data_source=whoop,
+            category="sleep",
+            type="sleep",
+            start_datetime=_dt("2026-11-07T20:30:00+00:00"),
+            end_datetime=_dt("2026-11-08T04:30:00+00:00"),
+            duration_seconds=28800,
+            zone_offset="+03:00",
+        )
+        SleepDetailsFactory(event_record=night, sleep_efficiency_score=Decimal("88.1"))
+        provider_day(db, whoop, SeriesType.resting_heart_rate, self.DAY, avg=Decimal("58"))
+        provider_day(db, apple, SeriesType.resting_heart_rate, self.DAY, avg=Decimal("56"))
+        provider_day(db, apple, SeriesType.heart_rate_variability_sdnn, self.DAY, avg=Decimal("61.5"))
+        provider_day(db, garmin, SeriesType.resting_heart_rate, self.DAY, avg=Decimal("52"))
+        HealthScoreFactory(
+            data_source_id=None,
+            user_id=user.id,
+            provider=ProviderName.WHOOP,
+            category=HealthScoreCategory.RECOVERY,
+            recorded_at=_dt("2026-11-08T04:45:00+00:00"),
+            zone_offset="+03:00",
+            value=Decimal("41"),
+            components={
+                "resting_heart_rate": {"value": 58},
+                "hrv_rmssd_milli": {"value": 36.04},
+                "spo2_percentage": {"value": 95.4},
+            },
+        )
+        return user
+
+    def test_by_default_a_day_is_its_score_and_the_vitals_sent_with_it(
+        self, db: Session, service: SummariesService
+    ) -> None:
+        """Apple and Garmin rank above WHOOP but scored nothing: they neither replace nor fill WHOOP's row."""
+        user = self._whoop_with_apple_and_garmin(db)
+
+        result = service.get_recovery_summaries(db, user.id, self.START, self.END, cursor=None, limit=10)
+
+        assert [summary.model_dump() for summary in result.data] == [
+            {
+                "date": self.DAY,
+                "source": {
+                    "provider": "whoop",
+                    "source": None,
+                    "device": None,
+                    "device_type": None,
+                    "device_id": None,
+                    "device_name": None,
+                },
+                "sleep_duration_seconds": None,
+                "sleep_efficiency_percent": None,
+                "resting_heart_rate_bpm": 58,
+                "avg_hrv_sdnn_ms": None,
+                "avg_hrv_rmssd_ms": 36.04,
+                "avg_spo2_percent": 95.4,
+                "recovery_score": 41,
+            }
+        ]
+
+    @pytest.mark.parametrize(
+        ("provider", "expected"),
+        [
+            (ProviderName.APPLE, [("apple", 56, 61.5, None, None, None)]),
+            (ProviderName.GARMIN, [("garmin", 52, None, None, None, None)]),
+            (ProviderName.WHOOP, [("whoop", 58, None, 36.04, 28800, 41)]),
+        ],
+    )
+    def test_a_provider_gets_only_its_own_values(
+        self,
+        db: Session,
+        service: SummariesService,
+        provider: ProviderName,
+        expected: list[tuple[str, int, float | None, float | None, int | None, int | None]],
+    ) -> None:
+        user = self._whoop_with_apple_and_garmin(db)
+
+        result = service.get_recovery_summaries(
+            db, user.id, self.START, self.END, cursor=None, limit=10, provider=provider
+        )
+
+        assert [
+            (
+                day.source.provider,
+                day.resting_heart_rate_bpm,
+                day.avg_hrv_sdnn_ms,
+                day.avg_hrv_rmssd_ms,
+                day.sleep_duration_seconds,
+                day.recovery_score,
+            )
+            for day in result.data
+        ] == expected
+        assert {day.date for day in result.data} == {self.DAY}
+
     def test_days_without_a_recovery_score_come_from_the_series_and_sleep(
         self, db: Session, service: SummariesService
     ) -> None:
@@ -690,11 +797,13 @@ class TestGetRecoverySummaries:
         SleepDetailsFactory(event_record=night, sleep_efficiency_score=Decimal("95"))
         provider_day(db, apple, SeriesType.heart_rate_variability_sdnn, date(2026, 1, 3), avg=Decimal("48"))
 
-        result = service.get_recovery_summaries(
-            db, user.id, _dt("2026-01-01T00:00:00+00:00"), _dt("2026-01-04T00:00:00+00:00"), cursor=None, limit=10
-        )
-
-        garmin_day, apple_day = result.data
+        start, end = _dt("2026-01-01T00:00:00+00:00"), _dt("2026-01-04T00:00:00+00:00")
+        (garmin_day,) = service.get_recovery_summaries(
+            db, user.id, start, end, cursor=None, limit=10, provider=ProviderName.GARMIN
+        ).data
+        (apple_day,) = service.get_recovery_summaries(
+            db, user.id, start, end, cursor=None, limit=10, provider=ProviderName.APPLE
+        ).data
         assert (garmin_day.date, garmin_day.source.provider) == (date(2026, 1, 2), "garmin")
         assert garmin_day.resting_heart_rate_bpm == 52
         assert garmin_day.avg_hrv_rmssd_ms == 65.0
@@ -723,7 +832,13 @@ class TestGetRecoverySummaries:
         )
 
         result = service.get_recovery_summaries(
-            db, user.id, _dt("2026-01-01T00:00:00+00:00"), _dt("2026-01-04T00:00:00+00:00"), cursor=None, limit=10
+            db,
+            user.id,
+            _dt("2026-01-01T00:00:00+00:00"),
+            _dt("2026-01-04T00:00:00+00:00"),
+            cursor=None,
+            limit=10,
+            provider=ProviderName.WHOOP,
         )
 
         assert [(day.date, day.resting_heart_rate_bpm, day.recovery_score) for day in result.data] == [

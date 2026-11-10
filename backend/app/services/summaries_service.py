@@ -101,6 +101,8 @@ RECOVERY_COMPONENTS = {
     "avg_hrv_rmssd": "hrv_rmssd_milli",
     "avg_spo2": "spo2_percentage",
 }
+# A recovery row's source, as the activity summary keys its rows.
+RECOVERY_IDENTITY = ("recovery_date", "provider", "source", "device_model", "device_type")
 # Taken whole from the best-ranked source that has them, as the activity summary's metric groups.
 RECOVERY_METRIC_GROUPS: tuple[tuple[str, ...], ...] = (
     *((key,) for key in RECOVERY_SERIES.values()),
@@ -121,6 +123,15 @@ def _midnight(day: date) -> datetime:
 def _activity_key(row: dict, date_key: str = "activity_date") -> tuple:
     """The compound key an activity cursor points at: date, then source, then device."""
     return (row[date_key], row["source"] or "", row.get("device_model") or "")
+
+
+def _score_components(score: dict) -> dict[str, float]:
+    """The recovery vitals a provider sent with its score, by the key recovery rows carry."""
+    return {
+        name: float(score[component])
+        for name, component in RECOVERY_COMPONENTS.items()
+        if score.get(component) is not None
+    }
 
 
 def _interruptions_count(sessions: list[dict]) -> int | None:
@@ -384,10 +395,17 @@ class SummariesService:
         end_date: datetime,
         cursor: str | None,
         limit: int,
+        provider: ProviderName | None = None,
     ) -> PaginatedResponse[RecoverySummary]:
-        """Daily recovery summaries: the day's vitals, main sleep and recovery score, best source per date."""
+        """Daily recovery summaries, one per date.
+
+        Without ``provider``: the best-ranked source's recovery score with the vitals it sent alongside it, as the
+        fork returned before 1.0. With ``provider``: that provider's vitals, main sleep and score, filled from its
+        own rows only.
+        """
+        days = self._scored_recovery_days if provider is None else partial(self._recovery_days, provider=provider)
         results = self._page_days(
-            db_session, user_id, start_date, end_date, cursor, limit, "asc", self._recovery_days, "recovery_date"
+            db_session, user_id, start_date, end_date, cursor, limit, "asc", days, "recovery_date"
         )
 
         has_more = len(results) > limit
@@ -695,11 +713,32 @@ class SummariesService:
             db_session, user_id, results, date_key="activity_date", fill=ACTIVITY_METRIC_GROUPS
         )
 
-    def _recovery_days(self, db_session: DbSession, user_id: UUID, start: datetime, end: datetime) -> list[dict]:
-        """One row per day in [start, end) from the vitals' day and night values, the main sleep and the
-        recovery score, best source per date."""
+    def _scored_recovery_days(self, db_session: DbSession, user_id: UUID, start: datetime, end: datetime) -> list[dict]:
+        """One row per day in [start, end) with a recovery score: the best-ranked source's earliest score that
+        day and the vitals sent with it, nothing taken from other rows."""
         first_day, last_day = utc_date(start), utc_date(end - timedelta(microseconds=1))
-        identity = ("recovery_date", "provider", "source", "device_model", "device_type")
+        rows: dict[tuple, dict] = {}
+        for score in self.health_score_repo.get_recovery_scores(db_session, user_id, first_day, last_day):
+            rows.setdefault(
+                tuple(score[field] for field in RECOVERY_IDENTITY),
+                {
+                    **{field: score[field] for field in RECOVERY_IDENTITY},
+                    "sleep_duration_seconds": None,
+                    "sleep_efficiency_percent": None,
+                    **dict.fromkeys(RECOVERY_SERIES.values()),
+                    **_score_components(score),
+                    "recovery_score": score["recovery_score"],
+                },
+            )
+        results = sorted(rows.values(), key=lambda r: _activity_key(r, "recovery_date"))
+        return self._filter_by_priority(db_session, user_id, results, date_key="recovery_date")
+
+    def _recovery_days(
+        self, db_session: DbSession, user_id: UUID, start: datetime, end: datetime, provider: ProviderName
+    ) -> list[dict]:
+        """One row per day in [start, end) from the provider's vitals' day and night values, main sleep and
+        recovery score; its rows for one day are merged, never with another provider's."""
+        first_day, last_day = utc_date(start), utc_date(end - timedelta(microseconds=1))
 
         nights = self.event_record_repo.night_values(
             db_session, user_id, [get_series_type_id(t) for t in RECOVERY_SERIES], first_day, last_day
@@ -720,37 +759,34 @@ class SummariesService:
             key: {name: round(sum(v) / len(v), 1) for name, v in by_name.items()} for key, by_name in readings.items()
         }
         sleeps = {
-            tuple(sleep[field] for field in identity): sleep
+            tuple(sleep[field] for field in RECOVERY_IDENTITY): sleep
             for sleep in self.event_record_repo.daily_sleep_totals(db_session, user_id, first_day, last_day)
         }
         # A day's earliest score.
         scores: dict[tuple, dict] = {}
         for score in self.health_score_repo.get_recovery_scores(db_session, user_id, first_day, last_day):
-            scores.setdefault(tuple(score[field] for field in identity), score)
+            scores.setdefault(tuple(score[field] for field in RECOVERY_IDENTITY), score)
 
         results = []
         for key in metrics.keys() | sleeps.keys() | scores.keys():
             score = scores.get(key, {})
-            # The metrics a provider sent with its score fill what the series lack.
-            components = {
-                name: float(score[component])
-                for name, component in RECOVERY_COMPONENTS.items()
-                if score.get(component) is not None
-            }
             results.append(
                 {
-                    **dict(zip(identity, key, strict=True)),
+                    **dict(zip(RECOVERY_IDENTITY, key, strict=True)),
                     "sleep_duration_seconds": None,
                     "sleep_efficiency_percent": None,
                     **sleeps.get(key, {}),
                     **dict.fromkeys(RECOVERY_SERIES.values()),
-                    **components,
+                    # The metrics a provider sent with its score fill what the series lack.
+                    **_score_components(score),
                     **metrics.get(key, {}),
                     "recovery_score": score.get("recovery_score"),
                 }
             )
 
-        results.sort(key=lambda r: _activity_key(r, "recovery_date"))
+        results = sorted(
+            (r for r in results if r["provider"] == provider), key=lambda r: _activity_key(r, "recovery_date")
+        )
         return self._filter_by_priority(
             db_session, user_id, results, date_key="recovery_date", fill=RECOVERY_METRIC_GROUPS
         )

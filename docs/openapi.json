@@ -1737,7 +1737,7 @@
           "External: Summaries"
         ],
         "summary": "Get Recovery Summary",
-        "description": "Returns daily recovery metrics (resting HR, HRV, SpO2, main sleep, recovery score).\n\nOne row per day from the highest-priority source, for every provider that supplies the\nunderlying data. The recovery score is set only where a recovery-score record exists.",
+        "description": "Returns daily recovery metrics (resting HR, HRV, SpO2, main sleep, recovery score).\n\nWithout ``provider``, one row per day with a recovery score: the highest-priority scoring source,\nwith the resting HR, HRV and SpO2 it sent alongside the score and no sleep fields.\nWith ``provider``, one row per day from that provider's vitals, main sleep and recovery score,\nnever filled from another provider.",
         "operationId": "get_recovery_summary_api_v1_users__user_id__summaries_recovery_get",
         "security": [
           {
@@ -1814,6 +1814,24 @@
               "default": 50,
               "title": "Limit"
             }
+          },
+          {
+            "name": "provider",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/ProviderName"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Restrict summaries to a single provider",
+              "title": "Provider"
+            },
+            "description": "Restrict summaries to a single provider"
           },
           {
             "name": "X-Open-Wearables-API-Key",

@@ -1722,8 +1722,10 @@ class TestRecoverySummaryEndpoint:
         assert item["avg_hrv_sdnn_ms"] is None
         assert item["avg_spo2_percent"] == 97.0
 
-    def test_fields_a_winning_device_lacks_come_from_other_sources(self, client: TestClient, db: Session) -> None:
-        """WHOOP's scores carry no data source; its band's vitals and another watch's SDNN still share the day."""
+    def test_fields_a_winning_device_lacks_come_from_its_providers_other_sources(
+        self, client: TestClient, db: Session
+    ) -> None:
+        """WHOOP's scores carry no data source; asked for WHOOP, its bands' vitals still share the scored day."""
         user = UserFactory()
         band = DataSourceFactory(user=user, provider=ProviderName.WHOOP, source="whoop", device_type="band")
         other_band = DataSourceFactory(user=user, provider=ProviderName.WHOOP, source="whoop", device_type="band")
@@ -1740,7 +1742,9 @@ class TestRecoverySummaryEndpoint:
         )
 
         response = client.get(
-            self._url(user.id), headers=api_key_headers(ApiKeyFactory().plain_key), params=self.BASE_PARAMS
+            self._url(user.id),
+            headers=api_key_headers(ApiKeyFactory().plain_key),
+            params={**self.BASE_PARAMS, "provider": "whoop"},
         )
 
         assert response.status_code == 200
