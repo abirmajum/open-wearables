@@ -16,6 +16,28 @@ its scheduler flag; Docker publishing restricted to upstream.
 
 ## Decisions where 1.0 changed the same behavior
 
+Rumi reads WHOOP through this fork in production, so where 1.0 changed what Rumi
+reads, the fork keeps the answer it gave before 1.0.
+
+- **Recovery summary.** 1.0 builds each day from the highest-priority source and fills
+  missing fields from lower-priority ones, so at the default priorities (Apple 1,
+  Garmin 2, WHOOP 5) a WHOOP and Apple day came back labelled `apple`, with Apple's
+  resting HR and SDNN beside WHOOP's score. Without `provider`, the fork returns what
+  it did before 1.0: per day, the best-ranked source's recovery score with the vitals
+  sent alongside it and no sleep fields. Garmin and Apple write no recovery score, so
+  they never displace WHOOP's day. With `provider`, the fork returns 1.0's row for
+  that provider only: its day vitals, main sleep and score, never filled from another
+  provider.
+- **WHOOP samples in raw `/timeseries`.** 1.0 writes WHOOP recovery vitals only as
+  sleep session values and cycle energy and steps only as provider day rows, and its
+  aggregate backfill moves the old samples to `series_sample_backup`. Rumi reads them
+  from raw `/timeseries`. The fork writes each one as a sample too, at the recovery's
+  time or the day's local midnight with `is_daily_total: true`, beside its aggregate
+  row. The backfill copies WHOOP's old samples into the aggregate tables but leaves
+  them in `series_sample`.
+- **`is_daily_total`.** 1.0 stores every sample with a null flag. Rumi sums steps and
+  energy only where it is `false` and keys measurements on it, so samples keep the
+  flag their writer gives them, as before.
 - **Sleep vitals.** Upstream 1.0 fills a sleep's missing vitals from the user's other
   devices. The fork keeps the sleep's own provider, writer and device only, so
   `vital_provenance: same_provider_writer_device` stays true. Rumi reads that field.
@@ -24,9 +46,11 @@ its scheduler flag; Docker publishing restricted to upstream.
   script `restamp_provider_sleep_scores.py` moves stored scores, including linked
   ones; the rehearsal below checks a linked fork score.
 - **WHOOP cycle projection.** 1.0 stores provider day values in `series_aggregate`,
-  which keeps no per-row ID. The projection now writes those day rows. On a touched
-  day it removes its old day row, unless an unowned pre-upgrade sample or archive
-  row holds that day: those still block the projection, as before.
+  which keeps no per-row ID. The projection now writes those day rows beside its
+  samples. On a touched day it removes its old day row, unless an unowned pre-upgrade
+  sample or archive row holds that day: those still block the projection, as before.
+  The aggregate backfill leaves WHOOP's samples in `series_sample`, so they keep
+  blocking it after the backfill too.
 - **Activity `provider` filter.** Applied to upstream's day aggregates before source
   priority, so the metrics upstream fills from lower-priority sources also come
   only from the requested provider.
