@@ -869,9 +869,7 @@ class TestDataPointSeriesRepository:
             series_type: expected for series_type, (_, expected) in values.items()
         }
 
-    def test_a_sample_is_stored_without_a_daily_total_flag(
-        self, db: Session, series_repo: DataPointSeriesRepository
-    ) -> None:
+    def test_a_sample_keeps_its_daily_total_flag(self, db: Session, series_repo: DataPointSeriesRepository) -> None:
         user = UserFactory()
         ts = datetime(2099, 1, 4, tzinfo=timezone.utc)
         bulk, single = (
@@ -892,7 +890,7 @@ class TestDataPointSeriesRepository:
         db.commit()
 
         stored = db.query(SeriesSample.is_daily_total).filter(SeriesSample.id.in_([bulk.id, single.id])).all()
-        assert [flag for (flag,) in stored] == [None, None]
+        assert [flag for (flag,) in stored] == [False, False]
 
     # ------------------------------------------------------------------
     # get_daily_activity_aggregates — prefer-daily-total-else-sum logic

@@ -5,6 +5,7 @@ Tests the full import flow for Apple HealthKit data via SDK.
 """
 
 import json
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -18,10 +19,11 @@ from app.constants.series_types.sdk import get_series_type_from_metric_type
 from app.models import DataSource, EventRecord, EventRecordAggregate, MealDetails, SeriesSample, WorkoutDetails
 from app.schemas.enums import ProviderName, SeriesType, get_series_type_id
 from app.schemas.enums.series_types import get_series_type_from_id
-from app.schemas.model_crud.activities import EventRecordQueryParams
+from app.schemas.model_crud.activities import EventRecordQueryParams, TimeSeriesQueryParams
 from app.schemas.providers.mobile_sdk import SyncRequest as SDKSyncRequest
 from app.services.event_record_service import event_record_service
 from app.services.sdk.import_service import ImportService
+from app.services.timeseries_service import timeseries_service
 from tests.factories import DataSourceFactory, EventRecordFactory, UserFactory
 
 SDK_ENVELOPE: dict[str, str] = {
@@ -432,6 +434,34 @@ class TestAppleSDKImport:
         result = import_service.load_data(db, sample_sdk_payload, str(user.id))
 
         assert result["records_saved"] >= 0
+
+    def test_raw_timeseries_flags_summable_readings_as_not_daily_totals(
+        self,
+        db: Session,
+        import_service: ImportService,
+        sample_sdk_payload: dict[str, Any],
+    ) -> None:
+        """Rumi sums steps and energy only where is_daily_total is false, as the fork returned it before 1.0."""
+        user = UserFactory()
+        steps = sample_sdk_payload["data"]["records"][0]
+        heart_rate = {**steps, "id": "HR-1", "type": "HKQuantityTypeIdentifierHeartRate", "unit": "count/min"}
+        payload = {**SDK_ENVELOPE, "data": {"records": [steps, {**heart_rate, "value": 72}]}}
+
+        import_service.load_data(db, payload, str(user.id))
+        result = timeseries_service.get_timeseries(
+            db,
+            user.id,
+            [SeriesType.steps, SeriesType.heart_rate],
+            TimeSeriesQueryParams(
+                start_datetime=datetime(2022, 5, 28, tzinfo=timezone.utc),
+                end_datetime=datetime(2022, 5, 30, tzinfo=timezone.utc),
+            ),
+        )
+
+        assert sorted((sample.type, sample.value, sample.is_daily_total) for sample in result.data) == [
+            (SeriesType.heart_rate, 72.0, None),
+            (SeriesType.steps, 66.0, False),
+        ]
 
     def test_types_written_reach_the_response(
         self,
