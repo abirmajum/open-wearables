@@ -118,6 +118,17 @@ class UnsupportedProviderError(InvalidInputError):
         super().__init__(f"Provider '{provider}' does not support {operation}.")
 
 
+class ProviderNotConfiguredError(InvalidInputError):
+    """The server has no OAuth client credentials for the provider, so no user can connect it."""
+
+    code = "PROVIDER_NOT_CONFIGURED"
+
+    def __init__(self, provider: str) -> None:
+        super().__init__(
+            f"{provider_label(provider)} is not configured on this server: its OAuth client ID and secret are missing"
+        )
+
+
 class InvalidCursorError(InvalidInputError):
     code = "INVALID_CURSOR"
 

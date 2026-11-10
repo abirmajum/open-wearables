@@ -10,6 +10,7 @@ Tests the /api/v1/oauth endpoints including:
 from unittest.mock import MagicMock
 from uuid import uuid4
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
@@ -17,6 +18,8 @@ from app.config import settings
 from app.schemas.enums import ProviderName
 from tests.factories import DeveloperFactory
 from tests.utils import developer_auth_headers
+
+pytestmark = pytest.mark.usefixtures("oauth_credentials")
 
 
 class TestOAuthAuthorizeEndpoint:
@@ -130,6 +133,23 @@ class TestOAuthAuthorizeEndpoint:
 
         # Assert
         assert response.status_code == 422
+
+    @pytest.mark.parametrize(
+        ("provider", "missing", "label"),
+        [("garmin", "garmin_client_secret", "Garmin"), ("whoop", "whoop_client_id", "Whoop")],
+    )
+    def test_authorize_without_provider_credentials_is_rejected(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch, provider: str, missing: str, label: str
+    ) -> None:
+        monkeypatch.setattr(settings, missing, None)
+
+        response = client.get(f"/api/v1/oauth/{provider}/authorize", params={"user_id": str(uuid4())})
+
+        assert response.status_code == 400
+        assert (response.json()["code"], response.json()["detail"]) == (
+            "PROVIDER_NOT_CONFIGURED",
+            f"{label} is not configured on this server: its OAuth client ID and secret are missing",
+        )
 
     def test_authorize_non_oauth_provider(self, client: TestClient, db: Session) -> None:
         """Test authorization with provider that doesn't support OAuth."""

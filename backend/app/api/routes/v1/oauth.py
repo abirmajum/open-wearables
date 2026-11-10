@@ -21,7 +21,12 @@ from app.services import DeveloperDep, user_connection_service
 from app.services.provider_settings_service import provider_settings_service
 from app.services.providers.base_strategy import BaseProviderStrategy
 from app.services.providers.factory import ProviderFactory
-from app.utils.exceptions import InvalidInputError, UnsupportedProviderError, unknown_provider
+from app.utils.exceptions import (
+    InvalidInputError,
+    ProviderNotConfiguredError,
+    UnsupportedProviderError,
+    unknown_provider,
+)
 
 router = APIRouter()
 factory = ProviderFactory()
@@ -87,6 +92,8 @@ def authorize_provider(
             "redirect_uri must be an application return URL, not the Open Wearables provider callback"
         )
     strategy = get_oauth_strategy(resolve_provider(provider))
+    if not strategy.credentials_configured:
+        raise ProviderNotConfiguredError(strategy.name)
 
     assert strategy.oauth
     auth_url, state = strategy.oauth.get_authorization_url(user_id, redirect_uri)

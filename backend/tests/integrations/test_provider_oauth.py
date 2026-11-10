@@ -7,12 +7,15 @@ Tests complete OAuth authorization flows for Garmin, Polar, and Suunto providers
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
 from app.schemas.auth import ConnectionStatus
 from tests.factories import DeveloperFactory, UserConnectionFactory, UserFactory
 from tests.utils import api_key_headers, developer_auth_headers
+
+pytestmark = pytest.mark.usefixtures("oauth_credentials")
 
 
 class TestGarminOAuth:

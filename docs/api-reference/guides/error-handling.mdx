@@ -119,6 +119,7 @@ An error that needs no code of its own has the name of its HTTP status: `BAD_REQ
 | `INVALID_DATETIME` | 400 | A date parameter is neither ISO 8601 nor a Unix timestamp |
 | `RECONCILE_TOO_MANY_DAYS` | 400 | A `source_selection=reconcile` period needs more days merged than the server allows; `days`, `max_days` and `queued` say by how much |
 | `UNSUPPORTED_PROVIDER` | 400 | The provider does not support this operation |
+| `PROVIDER_NOT_CONFIGURED` | 400 | The provider's OAuth client ID or secret is not set on this server, so users cannot connect it |
 | `PROVIDER_TOKEN_UNAVAILABLE` | 400 | The user's connection has no API token (an SDK-based provider) |
 | `INVITATION_EXPIRED` | 400 | The developer invitation has expired |
 | `INVITATION_ALREADY_ACCEPTED` | 400 | The developer invitation has already been used |
