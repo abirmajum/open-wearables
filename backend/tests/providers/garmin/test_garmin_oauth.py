@@ -118,7 +118,7 @@ class TestGarminOAuth:
         mock_httpx_get: MagicMock,
         garmin_oauth: GarminOAuth,
     ) -> None:
-        """Test fetching Garmin user info handles errors gracefully."""
+        """A failed user ID lookup fails the connection instead of saving it without an ID."""
         # Arrange
         token_response = OAuthTokenResponse(
             access_token="test_access_token",
@@ -129,13 +129,8 @@ class TestGarminOAuth:
 
         mock_httpx_get.side_effect = httpx.HTTPError("API Error")
 
-        # Act
-        user_info = garmin_oauth._get_provider_user_info(token_response, "internal_user_id")
-
-        # Assert - should return None values on error
-        assert user_info["user_id"] is None
-        assert user_info["username"] is None
-        assert user_info["scope"] is None
+        with pytest.raises(ProviderError, match="did not return the account's user ID"):
+            garmin_oauth._get_provider_user_info(token_response, "internal_user_id")
 
     @patch("httpx.get")
     def test_get_provider_user_info_returns_scope(

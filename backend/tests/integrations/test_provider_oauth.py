@@ -7,10 +7,12 @@ Tests complete OAuth authorization flows for Garmin, Polar, and Suunto providers
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
+from app.models import UserConnection
 from app.schemas.auth import ConnectionStatus
 from tests.factories import DeveloperFactory, UserConnectionFactory, UserFactory
 from tests.utils import api_key_headers, developer_auth_headers
@@ -111,6 +113,39 @@ class TestGarminOAuth:
 
         # Assert
         assert response.status_code in [302, 303, 307, 400, 422]
+
+    @pytest.mark.parametrize("user_id_answer", [{}, httpx.ConnectError("unreachable")])
+    def test_garmin_callback_without_a_user_id_saves_no_connection(
+        self, client: TestClient, db: Session, user_id_answer: dict | Exception
+    ) -> None:
+        user = UserFactory()
+        state = client.get("/api/v1/oauth/garmin/authorize", params={"user_id": str(user.id)}).json()["state"]
+        token = MagicMock(status_code=200)
+        token.json.return_value = {
+            "access_token": "fictional-access",
+            "refresh_token": "fictional-refresh",
+            "expires_in": 3600,
+            "token_type": "Bearer",
+        }
+        lookup = MagicMock(status_code=200)
+        lookup.json.return_value = user_id_answer
+
+        with (
+            patch("httpx.post", return_value=token),
+            patch("httpx.get", side_effect=user_id_answer if isinstance(user_id_answer, Exception) else None) as get,
+        ):
+            get.return_value = lookup
+            response = client.get(
+                "/api/v1/oauth/garmin/callback",
+                params={"code": "fictional-code", "state": state},
+                follow_redirects=False,
+            )
+
+        assert response.status_code == 502
+        assert response.json()["detail"] == (
+            "Garmin did not return the account's user ID, so the connection was not saved. Try connecting again."
+        )
+        assert db.query(UserConnection).filter_by(user_id=user.id, provider="garmin").count() == 0
 
 
 class TestPolarOAuth:
