@@ -40,7 +40,6 @@ def sync_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         "emit_sync_progress",
         "emit_sync_completed",
         "emit_sync_failed",
-        "log_and_capture_error",
         "try_record_data_types",
     ):
         monkeypatch.setattr(sync_module, name, MagicMock())

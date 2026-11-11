@@ -10,13 +10,13 @@ from app.schemas.enums import ProviderName
 
 
 def test_whoop_callback_uri_is_derived_from_production_api_base_url() -> None:
-    settings = Settings(secret_key="test-secret", api_base_url="https://ow.rumihq.com")
+    settings = Settings(secret_key="test-secret-key-of-at-least-32-chars", api_base_url="https://ow.rumihq.com")
 
     assert settings.oauth_redirect_uri(ProviderName.WHOOP) == "https://ow.rumihq.com/api/v1/oauth/whoop/callback"
 
 
 def test_oauth_callback_uri_does_not_duplicate_a_trailing_base_url_slash() -> None:
-    settings = Settings(secret_key="test-secret", api_base_url="https://ow.rumihq.com/")
+    settings = Settings(secret_key="test-secret-key-of-at-least-32-chars", api_base_url="https://ow.rumihq.com/")
 
     assert settings.oauth_redirect_uri(ProviderName.WHOOP) == "https://ow.rumihq.com/api/v1/oauth/whoop/callback"
 

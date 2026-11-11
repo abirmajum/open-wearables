@@ -38,9 +38,10 @@ def get_activity_summary(
 ) -> PaginatedResponse[ActivitySummary]:
     """Returns daily aggregated activity metrics.
 
-    Aggregates time-series data (steps, energy, heart rate, etc.) by day. When
-    ``provider`` is supplied, all metrics and source provenance come only from
-    that provider.
+    Each day reports its highest-priority source; metrics it lacks are filled from lower-priority sources.
+    When ``provider`` is supplied, all metrics and source provenance come only from that provider.
+
+    Aggregates time-series data (steps, energy, heart rate, etc.) by day.
     """
     start_datetime = parse_query_datetime(start_date)
     end_datetime = parse_query_end_datetime(end_date)
@@ -97,21 +98,18 @@ def get_recovery_summary(
     _api_key: ApiKeyDep,
     cursor: str | None = None,
     limit: PageLimitQueryParam = DEFAULT_PAGE_SIZE,
+    provider: Annotated[ProviderName | None, Query(description="Restrict summaries to a single provider")] = None,
 ) -> PaginatedResponse[RecoverySummary]:
-    """Returns daily recovery metrics (recovery score, HRV, resting HR, SpO2).
+    """Returns daily recovery metrics (resting HR, HRV, SpO2, main sleep, recovery score).
 
-    **Warning - known limitation:** this endpoint currently returns data **only for WHOOP**.
-    Metrics are read from stored recovery-score records, which today are produced solely by
-    WHOOP, so users connected only to other providers (e.g. Apple Health) receive an empty
-    result even when the underlying resting HR, HRV and SpO2 are available. This is a bug.
-
-    These values will soon be computed from the timeseries we already store in the database
-    rather than from what a single provider reports, at which point recovery metrics will be
-    returned for all providers that supply the underlying data.
+    Without ``provider``, one row per day with a recovery score: the highest-priority scoring source,
+    with the resting HR, HRV and SpO2 it sent alongside the score and no sleep fields.
+    With ``provider``, one row per day from that provider's vitals, main sleep and recovery score,
+    never filled from another provider.
     """
     start_datetime = parse_query_datetime(start_date)
     end_datetime = parse_query_end_datetime(end_date)
-    return summaries_service.get_recovery_summaries(db, user_id, start_datetime, end_datetime, cursor, limit)
+    return summaries_service.get_recovery_summaries(db, user_id, start_datetime, end_datetime, cursor, limit, provider)
 
 
 @router.get("/users/{user_id}/summaries/body")
