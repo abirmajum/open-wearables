@@ -14,6 +14,8 @@ from sqlalchemy.orm import Session
 from tests.factories import ApiKeyFactory, DeveloperFactory, UserConnectionFactory, UserFactory
 from tests.utils import api_key_headers
 
+pytestmark = pytest.mark.usefixtures("oauth_credentials")
+
 
 @pytest.fixture
 def sample_polar_exercise() -> dict[str, Any]:

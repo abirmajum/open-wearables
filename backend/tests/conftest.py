@@ -12,6 +12,7 @@ import os
 import socket
 import sys
 from collections.abc import Generator
+from contextlib import ExitStack
 from typing import Any
 from unittest.mock import MagicMock, patch
 from urllib.parse import urlparse
@@ -19,6 +20,7 @@ from urllib.parse import urlparse
 import pytest
 import redis as redis_lib
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import Session, sessionmaker
 from testcontainers.postgres import PostgresContainer
@@ -325,6 +327,18 @@ def mock_dashboard_stats_refresh() -> Generator[MagicMock, None, None]:
     """
     with patch("app.services.dashboard_stats_cache.celery_app") as mock:
         yield mock
+
+
+@pytest.fixture
+def oauth_credentials() -> Generator[None, None, None]:
+    """Fictional OAuth client credentials for every cloud provider, as on a configured server."""
+    with ExitStack() as stack:
+        for name in type(settings).model_fields:
+            if name.endswith("_client_id"):
+                stack.enter_context(patch.object(settings, name, "fictional-client-id"))
+            elif name.endswith("_client_secret"):
+                stack.enter_context(patch.object(settings, name, SecretStr("fictional-client-secret")))
+        yield
 
 
 @pytest.fixture(autouse=True)

@@ -11,6 +11,7 @@ from app.schemas.model_crud.credentials import (
     ProviderEndpoints,
 )
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
+from app.utils.exceptions import ProviderError
 from app.utils.structured_logging import get_logger
 
 logger = get_logger(__name__)
@@ -57,18 +58,30 @@ class GarminOAuth(BaseOAuthTemplate):
         return response.json().get("userId")
 
     def _get_provider_user_info(self, token_response: OAuthTokenResponse, user_id: str) -> dict[str, str | None]:
-        """Fetches Garmin user ID and API permissions."""
-        # Fetch user ID (critical - fail returns all None)
+        """Fetches Garmin user ID and API permissions.
+
+        Raises ProviderError without a user ID: Garmin's webhooks name only that ID, so a
+        connection saved without it would look active and never receive data.
+        """
+        upstream_status = None
         try:
             user_id_response = httpx.get(
                 f"{self.api_base_url}/partner-gateway/rest/user/id",
                 headers={"Authorization": f"Bearer {token_response.access_token}"},
                 timeout=30.0,
             )
+            upstream_status = user_id_response.status_code
             user_id_response.raise_for_status()
             provider_user_id = user_id_response.json().get("userId")
-        except Exception:
-            return {"user_id": None, "username": None, "scope": None}
+        except Exception as e:
+            logger.warning("Garmin user ID lookup failed", provider="garmin", user_id=user_id, exc_info=e)
+            provider_user_id = None
+        if not provider_user_id:
+            raise ProviderError(
+                "garmin",
+                "Garmin did not return the account's user ID, so the connection was not saved. Try connecting again.",
+                upstream_status=upstream_status,
+            )
 
         # Fetch permissions (best-effort - fail returns scope as None)
         scope: str | None = None
