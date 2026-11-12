@@ -173,7 +173,8 @@ services:
       - sh
       - -c
       - |
-        : "$${SVIX_JWT_SECRET:=$$SECRET_KEY}"
+        # Same default as the backend: derive_secret(SECRET_KEY, "svix-jwt-secret")
+        : "$${SVIX_JWT_SECRET:=$$(printf %s svix-jwt-secret | openssl dgst -sha256 -hmac "$$SECRET_KEY" -r | cut -d' ' -f1)}"
         export SVIX_JWT_SECRET
         exec svix-server "$$@"
       - --

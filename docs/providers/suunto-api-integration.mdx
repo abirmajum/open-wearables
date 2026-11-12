@@ -43,7 +43,7 @@ Access requires membership in the **Suunto Developer Program** - you must apply 
 | **Polling (pull)** | Open Wearables fetches workouts (`/v3/workouts/`) and 24/7 data (`/247samples/*`, `/247/daily-activity-statistics`) over REST for historical sync and as a fallback. |
 
 <Note>
-Webhook payloads are signed with HMAC-SHA256 over the raw request body, delivered in the `X-HMAC-SHA256-Signature` header. Open Wearables verifies this against `SUUNTO_WEBHOOK_SECRET` (which defaults to your app `SECRET_KEY`). See the configuration step below.
+Webhook payloads are signed with HMAC-SHA256 over the raw request body, delivered in the `X-HMAC-SHA256-Signature` header. Open Wearables verifies this against `SUUNTO_WEBHOOK_SECRET`, which is derived from your app `SECRET_KEY` when unset, so Suunto never receives `SECRET_KEY` itself. See the configuration step below.
 </Note>
 
 ## What you need by the end
@@ -110,7 +110,7 @@ SUUNTO_CLIENT_ID=public-client-id
 SUUNTO_CLIENT_SECRET=private-secret-id
 SUUNTO_SUBSCRIPTION_KEY=private-subscription-id
 # SUUNTO_DEFAULT_SCOPE=
-# Optional: defaults to SECRET_KEY. Configure the same value as your Suunto notification secret.
+# Optional: derived from SECRET_KEY. Configure the same value as your Suunto notification secret.
 # SUUNTO_WEBHOOK_SECRET=your-secret
 ```
 
@@ -123,7 +123,7 @@ SUUNTO_SUBSCRIPTION_KEY=private-subscription-id
     | `SUUNTO_CLIENT_SECRET` | Client secret you set in your Suunto OAuth settings |
     | `SUUNTO_SUBSCRIPTION_KEY` | Subscription key from your Developer API subscription. Sent as the `Ocp-Apim-Subscription-Key` header on every API request |
     | `SUUNTO_DEFAULT_SCOPE` | OAuth scope requested during authorization. Left empty by default, which omits `scope=` from the authorize URL (matching Suunto's default `workout` grant) |
-    | `SUUNTO_WEBHOOK_SECRET` | HMAC-SHA256 secret used to verify incoming webhook signatures. Defaults to your app `SECRET_KEY` - set it explicitly only if Suunto signs your notifications with a different secret |
+    | `SUUNTO_WEBHOOK_SECRET` | HMAC-SHA256 secret used to verify incoming webhook signatures. When unset, it is derived from `SECRET_KEY` (never `SECRET_KEY` itself) - run `make webhook_secret p=suunto` to print it, or set your own random value |
   </Step>
 
   <Step title="Connect a user via OAuth">
@@ -171,7 +171,16 @@ SUUNTO_SUBSCRIPTION_KEY=private-subscription-id
     {API_BASE_URL}/api/v1/providers/suunto/webhooks
     ```
 
-    Suunto signs each request body with HMAC-SHA256 and sends the result in the `X-HMAC-SHA256-Signature` header. Open Wearables verifies it against `SUUNTO_WEBHOOK_SECRET` (defaulting to `SECRET_KEY`), so make sure the notification secret configured with Suunto matches that value.
+    Suunto signs each request body with HMAC-SHA256 and sends the result in the `X-HMAC-SHA256-Signature` header. Open Wearables verifies it against `SUUNTO_WEBHOOK_SECRET`, so make sure the notification secret configured with Suunto matches that value. If you left it unset, print the derived value where the backend runs:
+
+    ```bash
+    make webhook_secret p=suunto
+    # or: docker compose exec app uv run python scripts/webhook_secret.py suunto
+    ```
+
+    <Warning>
+    Earlier versions defaulted `SUUNTO_WEBHOOK_SECRET` to `SECRET_KEY` itself. If you registered that value with Suunto, rotate `SECRET_KEY` (anyone who can read it can sign API sessions), then register the new webhook secret with Suunto.
+    </Warning>
 
     <Note>
     The endpoint acknowledges within Suunto's 2-second timeout and enqueues processing in the background. If webhooks aren't configured, periodic REST polling still keeps data current.

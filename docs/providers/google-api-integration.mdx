@@ -343,7 +343,7 @@ Google Health webhooks are **notify-only**: each notification names the changed 
 
 Two distinct secrets are involved:
 
-- **`GOOGLE_WEBHOOK_SECRET`** — a bearer token you register with Google that it echoes back in the `Authorization` header of every notification, so Open Wearables can verify the ping is genuine. Defaults to `SECRET_KEY` if unset.
+- **`GOOGLE_WEBHOOK_SECRET`** — a bearer token you register with Google that it echoes back in the `Authorization` header of every notification, so Open Wearables can verify the ping is genuine. Derived from `SECRET_KEY` if unset (Google never receives `SECRET_KEY` itself); `make webhook_secret p=google_health` prints it.
 - **Service-account credentials** — used only to *register* the subscriber (a project-level admin call). Not involved in receiving notifications.
 
 <Info>
@@ -387,7 +387,7 @@ Subscribers live at the **project** level (`POST /v4/projects/{project}/subscrib
     ```bash
     GOOGLE_PROJECT_ID=your-project-number   # the numeric project NUMBER, not the ID
     GOOGLE_SERVICE_ACCOUNT_FILE=config/health-webhooks-key.json   # unset = use ADC
-    # GOOGLE_WEBHOOK_SECRET=your-token   # optional; defaults to SECRET_KEY
+    # GOOGLE_WEBHOOK_SECRET=your-token   # optional; derived from SECRET_KEY
     ```
 
     <Warning>
@@ -408,7 +408,7 @@ Subscribers live at the **project** level (`POST /v4/projects/{project}/subscrib
 |----------|-------------|---------|
 | `GOOGLE_PROJECT_ID` | GCP project **number** (not ID) that owns the subscriber. Get it with `gcloud projects describe YOUR_PROJECT_ID --format='value(projectNumber)'`. | — |
 | `GOOGLE_SERVICE_ACCOUNT_FILE` | Path to the SA JSON key; unset uses ADC | — |
-| `GOOGLE_WEBHOOK_SECRET` | Bearer secret Google echoes on notifications | `SECRET_KEY` |
+| `GOOGLE_WEBHOOK_SECRET` | Bearer secret Google echoes on notifications | Derived from `SECRET_KEY` |
 
 ### Managing subscribers without app credentials (gcloud / console)
 
@@ -424,8 +424,10 @@ update / delete) won't work — they require project credentials. Use the comman
 
 <Warning>
 The `endpointAuthorization.secret` you set here **must** equal `"Bearer "` + the app's
-`GOOGLE_WEBHOOK_SECRET` (which defaults to `SECRET_KEY`). If they don't match, every
-notification fails signature verification and Open Wearables returns 401.
+`GOOGLE_WEBHOOK_SECRET`. When that is unset, the app derives it from `SECRET_KEY`; print it with
+`make webhook_secret p=google_health`. If they don't match, every notification fails signature
+verification and Open Wearables returns 401. Earlier versions used `SECRET_KEY` itself: if you
+registered that value, rotate `SECRET_KEY` and update the subscriber with the new secret.
 </Warning>
 
 All calls authenticate with your own gcloud identity, which must hold the Health API
