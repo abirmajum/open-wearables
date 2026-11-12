@@ -161,6 +161,7 @@ The defaults in `.env.example` are development values. Override at least these f
 | `ADMIN_PASSWORD` | password for the admin account seeded on first start (required: with `ENVIRONMENT=production` the seed and the login refuse the default; if the account whose email matches `ADMIN_EMAIL` still has the default, its password is changed to this value at startup) |
 | `CORS_ORIGINS` | your frontend origin, e.g. `["https://app.example.com"]` |
 | `FRONTEND_URL` | public URL of the frontend |
+| `OAUTH_REDIRECT_ALLOWED_ORIGINS` | origins of your own apps that pass `redirect_uri` to the OAuth authorize endpoint, e.g. `["https://yourapp.com"]` (`FRONTEND_URL` and `CORS_ORIGINS` are always allowed) |
 | `API_BASE_URL` | public URL of the API, used for provider OAuth redirect URIs |
 | `VITE_API_URL` | URL of the API as reached from the browser |
 | `LOG_FORMAT` | `json` if a log collector reads the container output (see [Logs](#logs)) |

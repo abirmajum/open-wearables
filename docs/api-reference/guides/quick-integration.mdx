@@ -78,6 +78,23 @@ curl -X GET "http://localhost:8000/api/v1/oauth/garmin/authorize?user_id=550e840
 
 Redirect the user to `authorization_url`. After they authorize, they'll be redirected back to your `redirect_uri`.
 
+The endpoint needs credentials: an API key, a developer token, or the user's own SDK token (which only works for its own `user_id`; another user's ID returns `403`). An unknown `user_id` returns `404`.
+
+<Note>
+  `redirect_uri` is optional. If you send it, its origin (scheme, host and port) must be `FRONTEND_URL`, one of `CORS_ORIGINS`, or one of `OAUTH_REDIRECT_ALLOWED_ORIGINS` on the server. Otherwise the request fails with `400`:
+
+  ```json
+  {
+    "title": "Bad Request",
+    "status": 400,
+    "detail": "redirect_uri origin is not allowed; add it to OAUTH_REDIRECT_ALLOWED_ORIGINS on the server",
+    "code": "BAD_REQUEST"
+  }
+  ```
+
+  For this example, the backend would need `OAUTH_REDIRECT_ALLOWED_ORIGINS=["https://yourapp.com"]`.
+</Note>
+
 <Warning>
   Provider names must be **lowercase**: `garmin`, `polar`, `suunto`, `apple`
 </Warning>

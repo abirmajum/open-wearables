@@ -54,6 +54,9 @@ class Settings(BaseSettings):
     paging_limit: int = 100
     cors_origins: list[AnyHttpUrl] = []
     cors_allow_all: bool = False
+    # Origins (scheme://host[:port]) the OAuth flow may send the browser back to after the
+    # provider callback, besides FRONTEND_URL and CORS_ORIGINS. Custom app schemes work too.
+    oauth_redirect_allowed_origins: list[str] = []
 
     # None → derived in derive_access_log_level (prod: errors only, else: all)
     access_log_level: AccessLogLevel | None = None
@@ -307,6 +310,8 @@ class Settings(BaseSettings):
     user_invitation_code_redeem_window_seconds: int = 900
     user_invitation_code_redeem_ip_limit: int = 10
     user_invitation_code_redeem_global_limit: int = 1000
+    # Lifetime of the token in a pairing link (/users/{id}/pair?token=...)
+    pairing_token_expire_days: int = 7
 
     # AWS SETTINGS
     aws_bucket_name: str | None = None

@@ -1,3 +1,4 @@
+from datetime import datetime
 from enum import StrEnum
 
 from pydantic import BaseModel
@@ -34,6 +35,13 @@ class TokenResponse(BaseModel):
     expires_in: int | None = None  # seconds
     # Set only by login, the one place that sees the password in plain text.
     password_change: PasswordChangePrompt | None = None
+
+
+class PairingTokenResponse(BaseModel):
+    """Token for a user's pairing link; it can only start a provider OAuth flow for that user."""
+
+    token: str
+    expires_at: datetime
 
 
 class RefreshTokenRequest(BaseModel):

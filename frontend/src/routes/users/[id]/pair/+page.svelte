@@ -4,6 +4,7 @@
 	import EmptyState from '$lib/components/ui/EmptyState.svelte';
 	import PairingShell from '$lib/components/pairing/PairingShell.svelte';
 	import ProviderChoice from '$lib/components/pairing/ProviderChoice.svelte';
+	import { PAIRING_LINK_INVALID } from '$lib/pairing/links';
 	import type { ActionData, PageData } from './$types';
 
 	let { data, form }: { data: PageData; form: ActionData } = $props();
@@ -19,7 +20,9 @@
 			<Alert>{form.message}</Alert>
 		{/if}
 
-		{#if data.providers.length === 0}
+		{#if !data.token}
+			<Alert>{PAIRING_LINK_INVALID}</Alert>
+		{:else if data.providers.length === 0}
 			<div class="rounded-xl border border-border bg-surface">
 				<EmptyState
 					icon={Unplug}
@@ -29,7 +32,7 @@
 			</div>
 		{:else}
 			{#each data.providers as provider (provider.provider)}
-				<ProviderChoice {provider} returnUrl={data.returnUrl} />
+				<ProviderChoice {provider} returnUrl={data.returnUrl} token={data.token} />
 			{/each}
 		{/if}
 	</div>

@@ -14,9 +14,9 @@ export function createCopier(resetMs = RESET_MS) {
 		get copied() {
 			return copied;
 		},
-		async copy(text: string) {
+		async copy(text: string | Promise<string>) {
 			try {
-				await navigator.clipboard.writeText(text);
+				await navigator.clipboard.writeText(await text);
 				copied = true;
 				clearTimeout(timer);
 				timer = setTimeout(() => (copied = false), resetMs);
