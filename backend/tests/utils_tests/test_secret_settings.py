@@ -1,4 +1,4 @@
-"""SECRET_KEY is refused at startup when guessable; the Strava verify token is derived from it."""
+"""SECRET_KEY is refused at startup when guessable; secrets shared with providers are derived from it."""
 
 import pytest
 from pydantic import ValidationError
@@ -56,3 +56,34 @@ class TestStravaWebhookVerifyToken:
 
     def test_own_token_is_kept(self) -> None:
         assert self._token("b" * 64) == "b" * 64
+
+
+class TestSharedWebhookSecrets:
+    """Secrets a provider or the Svix server receives are derived from SECRET_KEY, never SECRET_KEY itself."""
+
+    @pytest.mark.parametrize(
+        ("field", "purpose"),
+        [
+            ("suunto_webhook_secret", "suunto-webhook-secret"),
+            ("google_webhook_secret", "google-webhook-secret"),
+            ("oura_webhook_verification_token", "oura-webhook-verification-token"),
+            ("svix_jwt_secret", "svix-jwt-secret"),
+        ],
+    )
+    @pytest.mark.parametrize("value", [None, ""])
+    def test_unset_secret_is_derived_from_secret_key(self, field: str, purpose: str, value: str | None) -> None:
+        secret = getattr(Settings(secret_key=STRONG_SECRET_KEY, **{field: value}), field)
+
+        assert secret is not None
+        assert secret.get_secret_value() == derive_secret(STRONG_SECRET_KEY, purpose)
+        assert secret.get_secret_value() != STRONG_SECRET_KEY
+
+    @pytest.mark.parametrize(
+        "field",
+        ["suunto_webhook_secret", "google_webhook_secret", "oura_webhook_verification_token", "svix_jwt_secret"],
+    )
+    def test_own_secret_is_kept(self, field: str) -> None:
+        secret = getattr(Settings(secret_key=STRONG_SECRET_KEY, **{field: "b" * 64}), field)
+
+        assert secret is not None
+        assert secret.get_secret_value() == "b" * 64

@@ -197,8 +197,9 @@ class Settings(BaseSettings):
     suunto_redirect_uri: str | None = None  # Deprecated: use API_BASE_URL
     suunto_subscription_key: SecretStr | None = None
     suunto_default_scope: str = ""
+    # Derived from secret_key if not set (scripts/webhook_secret.py prints it) - configure the
+    # same value in the Suunto developer portal.
     suunto_webhook_secret: SecretStr | None = None
-    # Derived from secret_key if not set — configure the same value in Suunto developer portal.
 
     # GARMIN OAUTH SETTINGS
     garmin_client_id: str | None = None
@@ -269,7 +270,7 @@ class Settings(BaseSettings):
         "https://www.googleapis.com/auth/googlehealth.settings.readonly"
     )
     # Bearer secret Google echoes in the Authorization header of every webhook
-    # notification. Defaults to secret_key (see derive_google_webhook_secret).
+    # notification. Derived from secret_key if not set (see derive_google_webhook_secret).
     google_webhook_secret: SecretStr | None = None
     # GCP project NUMBER (not ID) for Health API subscriber registration.
     google_project_id: str | None = None
@@ -369,7 +370,8 @@ class Settings(BaseSettings):
     # (no svix-server container) never build a client, emit, or register event types.
     outgoing_webhooks_enabled: bool = False
     svix_server_url: str = "http://svix-server:8071"
-    # Signing secret used by the Svix server to verify JWTs.  Must match SVIX_JWT_SECRET in docker-compose.
+    # Signing secret used by the Svix server to verify JWTs.  Must match SVIX_JWT_SECRET in docker-compose,
+    # which derives the same default from SECRET_KEY.
     svix_jwt_secret: SecretStr | None = None
     # Bearer token for the Svix API.  If unset, auto-generated from svix_jwt_secret at startup.
     svix_auth_token: SecretStr | None = None
@@ -417,13 +419,14 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def derive_svix_jwt_secret(self) -> "Settings":
         if self.svix_jwt_secret is None or self.svix_jwt_secret.get_secret_value() == "":
-            self.svix_jwt_secret = SecretStr(self.secret_key)
+            self.svix_jwt_secret = SecretStr(derive_secret(self.secret_key, "svix-jwt-secret"))
         return self
 
     @model_validator(mode="after")
     def derive_suunto_webhook_secret(self) -> "Settings":
+        # Shared with Suunto, so it must not be SECRET_KEY itself
         if self.suunto_webhook_secret is None or self.suunto_webhook_secret.get_secret_value() == "":
-            self.suunto_webhook_secret = SecretStr(self.secret_key)
+            self.suunto_webhook_secret = SecretStr(derive_secret(self.secret_key, "suunto-webhook-secret"))
         return self
 
     @model_validator(mode="after")
@@ -439,13 +442,16 @@ class Settings(BaseSettings):
             self.oura_webhook_verification_token is None
             or self.oura_webhook_verification_token.get_secret_value() == ""
         ):
-            self.oura_webhook_verification_token = SecretStr(self.secret_key)
+            self.oura_webhook_verification_token = SecretStr(
+                derive_secret(self.secret_key, "oura-webhook-verification-token")
+            )
         return self
 
     @model_validator(mode="after")
     def derive_google_webhook_secret(self) -> "Settings":
+        # Registered with Google, so it must not be SECRET_KEY itself
         if self.google_webhook_secret is None or self.google_webhook_secret.get_secret_value() == "":
-            self.google_webhook_secret = SecretStr(self.secret_key)
+            self.google_webhook_secret = SecretStr(derive_secret(self.secret_key, "google-webhook-secret"))
         return self
 
     @field_validator("secret_key", mode="after")

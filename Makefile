@@ -58,6 +58,9 @@ reset_db:  ## Truncate all tables in the database (WARNING: deletes all data)
 garmin_webhook_url:  ## Print the webhook URL to set for every data type in the Garmin portal
 	@$(DOCKER_EXEC) uv run python scripts/garmin_webhook_url.py
 
+webhook_secret:  ## Print the webhook secret to register with a provider. Use 'make webhook_secret p=suunto' (or p=google_health)
+	@$(DOCKER_EXEC) uv run python scripts/webhook_secret.py $(p)
+
 frontend_install:  ## Install frontend dependencies
 	cd frontend && bun install --frozen-lockfile
 
