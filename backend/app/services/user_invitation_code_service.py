@@ -4,6 +4,7 @@ from uuid import UUID, uuid4
 
 from app.config import settings
 from app.database import DbSession
+from app.integrations import rate_limiter
 from app.models.user_invitation_code import UserInvitationCode
 from app.repositories.user_invitation_code_repository import UserInvitationCodeRepository
 from app.schemas.auth import SDKTokenOrigin
@@ -14,10 +15,11 @@ from app.schemas.model_crud.credentials import (
 )
 from app.services.refresh_token_service import refresh_token_service
 from app.services.user_service import user_service
-from app.utils.exceptions import NotFoundError
+from app.utils.exceptions import NotFoundError, TooManyRequestsError
 
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 CODE_LENGTH = 8
+_REDEEM_RATE_KEY = "rate_limit:invitation_code_redeem:"
 
 
 class UserInvitationCodeService:
@@ -49,6 +51,18 @@ class UserInvitationCodeService:
         )
         row = self.crud.create(db_session, code_data)
         return UserInvitationCodeRead.model_validate(row)
+
+    def enforce_redeem_rate_limit(self, client_ip: str | None) -> None:
+        """Cap redeem attempts per client IP, then across all clients, so codes cannot be brute-forced.
+
+        The IP is checked first, so a client that is already blocked does not use up the global budget.
+        """
+        window = settings.user_invitation_code_redeem_window_seconds
+        ip_count = rate_limiter.hit(f"{_REDEEM_RATE_KEY}ip:{client_ip or 'unknown'}", window)
+        if ip_count > settings.user_invitation_code_redeem_ip_limit:
+            raise TooManyRequestsError("Too many invitation code attempts, try again later")
+        if rate_limiter.hit(f"{_REDEEM_RATE_KEY}global", window) > settings.user_invitation_code_redeem_global_limit:
+            raise TooManyRequestsError("Too many invitation code attempts, try again later")
 
     def redeem(self, db_session: DbSession, code: str) -> InvitationCodeRedeemResponse:
         """Redeem an invitation code and return SDK tokens."""

@@ -1,5 +1,6 @@
 """Unit tests for user invitation code service."""
 
+import time
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 from uuid import uuid4
@@ -16,7 +17,7 @@ from app.services.user_invitation_code_service import (
     CODE_LENGTH,
     user_invitation_code_service,
 )
-from app.utils.exceptions import NotFoundError
+from app.utils.exceptions import NotFoundError, TooManyRequestsError
 from tests.factories import DeveloperFactory, UserFactory
 
 
@@ -229,3 +230,56 @@ class TestRedeem:
 
         # Assert
         assert user_invitation_code_service.redeem(db, generated.code).user_id == user.id
+
+
+class TestEnforceRedeemRateLimit:
+    """Tests for enforce_redeem_rate_limit method."""
+
+    def test_ip_limit_blocks_only_that_ip(self) -> None:
+        # Arrange
+        with patch.object(settings, "user_invitation_code_redeem_ip_limit", 2):
+            user_invitation_code_service.enforce_redeem_rate_limit("10.0.0.1")
+            user_invitation_code_service.enforce_redeem_rate_limit("10.0.0.1")
+
+            # Act / Assert
+            with pytest.raises(TooManyRequestsError):
+                user_invitation_code_service.enforce_redeem_rate_limit("10.0.0.1")
+            user_invitation_code_service.enforce_redeem_rate_limit("10.0.0.2")
+
+    def test_global_limit_applies_across_ips(self) -> None:
+        # Arrange
+        with patch.object(settings, "user_invitation_code_redeem_global_limit", 3):
+            for i in range(3):
+                user_invitation_code_service.enforce_redeem_rate_limit(f"10.0.0.{i}")
+
+            # Act / Assert
+            with pytest.raises(TooManyRequestsError):
+                user_invitation_code_service.enforce_redeem_rate_limit("10.0.0.99")
+
+    def test_blocked_ip_does_not_use_up_global_budget(self) -> None:
+        # Arrange
+        with (
+            patch.object(settings, "user_invitation_code_redeem_ip_limit", 1),
+            patch.object(settings, "user_invitation_code_redeem_global_limit", 2),
+        ):
+            user_invitation_code_service.enforce_redeem_rate_limit("10.0.0.1")
+            for _ in range(5):
+                with pytest.raises(TooManyRequestsError):
+                    user_invitation_code_service.enforce_redeem_rate_limit("10.0.0.1")
+
+            # Act / Assert
+            user_invitation_code_service.enforce_redeem_rate_limit("10.0.0.2")
+
+    def test_window_expires(self) -> None:
+        # Arrange
+        with (
+            patch.object(settings, "user_invitation_code_redeem_ip_limit", 1),
+            patch.object(settings, "user_invitation_code_redeem_window_seconds", 1),
+        ):
+            user_invitation_code_service.enforce_redeem_rate_limit("10.0.0.1")
+            with pytest.raises(TooManyRequestsError):
+                user_invitation_code_service.enforce_redeem_rate_limit("10.0.0.1")
+            time.sleep(1.1)
+
+            # Act / Assert
+            user_invitation_code_service.enforce_redeem_rate_limit("10.0.0.1")

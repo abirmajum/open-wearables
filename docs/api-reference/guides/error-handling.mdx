@@ -372,6 +372,7 @@ Earlier releases answered errors with `{"detail": "..."}` only. The current form
 | 404 | Not Found | Resource doesn't exist, or the user hasn't connected the provider |
 | 409 | Conflict | Duplicate resource, or the provider connection needs reauthorization |
 | 422 | Unprocessable Content | Request validation failed (see `errors`) |
+| 429 | Too Many Requests | Too many invitation code redeem attempts; wait for the rate limit window to pass |
 | 500 | Server Error | Internal error (please report) |
 | 501 | Not Implemented | The provider doesn't support this data type or operation |
 | 502 | Bad Gateway | The provider's API or object storage failed |
