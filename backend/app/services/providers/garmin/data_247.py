@@ -61,6 +61,9 @@ _ACTIVITY_DETAILS_SERIES_TYPES: frozenset[SeriesType] = frozenset(st for _, st i
     SeriesType.air_temperature
 }
 
+# activityFiles callbackURLs come from the push payload and are sent the user's token: only Garmin's API host.
+GARMIN_FILE_HOSTS = frozenset({"apis.garmin.com"})
+
 # Garmin splits a large push into requests seconds apart, so a slot's types are joined within this window; a later
 # push of the slot replaces it, as the Health API requires (§7.2), and starts afresh.
 EPOCH_SLOT_TTL_SECONDS = 15 * 60
@@ -1910,6 +1913,7 @@ class Garmin247Data(Base247DataTemplate):
                                 oauth=self.oauth,
                                 provider_name=self.provider_name,
                                 url=callback_url,
+                                allowed_hosts=GARMIN_FILE_HOSTS,
                             )
                         except Exception as e:
                             logger.warning(

@@ -150,7 +150,9 @@ def test_download_retries_with_token_refreshed_elsewhere(db: Session, connection
         return httpx.Response(status_code, content=b"file", request=request)
 
     with patch("app.services.providers.api_client.httpx.get", side_effect=get):
-        content = download_binary_content(db, connection.user_id, repo, MagicMock(), "whoop", f"{API_BASE_URL}/file")
+        content = download_binary_content(
+            db, connection.user_id, repo, MagicMock(), "whoop", f"{API_BASE_URL}/file", {"api.example.com"}
+        )
 
     assert content == b"file"
     assert sent_auth == [f"Bearer {stale_token}", "Bearer refreshed-by-another-worker"]

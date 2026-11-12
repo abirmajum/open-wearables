@@ -1,8 +1,10 @@
 """Simple API client for making authenticated requests to provider APIs."""
 
 import time
+from collections.abc import Collection
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import urljoin, urlsplit
 from uuid import UUID
 
 import httpx
@@ -13,6 +15,7 @@ from app.integrations.redis_client import get_redis_client
 from app.repositories import UserConnectionRepository
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.utils.exceptions import (
+    InvalidInputError,
     ProviderError,
     ProviderNotConnectedError,
     ProviderTokenUnavailableError,
@@ -27,6 +30,9 @@ logger = get_logger(__name__)
 # Rate limiting configuration (Garmin: 100 req / 60s window)
 MAX_RETRIES = 3
 RETRY_BASE_DELAY = 15.0  # Base delay for exponential backoff (seconds): 15s, 30s, 60s
+
+# Redirects followed by download_binary_content; every hop is checked against its allowed hosts.
+MAX_DOWNLOAD_REDIRECTS = 5
 
 # Tokens are refreshed this long before they expire.
 TOKEN_REFRESH_BUFFER = timedelta(minutes=5)
@@ -422,6 +428,26 @@ def make_authenticated_request(
     raise ProviderError(provider_name, f"Failed to complete request to {provider_label(provider_name)} after retries")
 
 
+def _require_allowed_download_url(url: str, allowed_hosts: Collection[str], provider_name: str) -> None:
+    """Reject a download URL that is not https on one of the provider's own hosts.
+
+    The URL carries the user's bearer token, so it must never reach a host the provider does not own.
+    """
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError as e:
+        raise InvalidInputError(f"Invalid {provider_label(provider_name)} download URL") from e
+    if (
+        parts.scheme != "https"
+        or (parts.hostname or "").lower() not in allowed_hosts
+        or parts.username is not None
+        or parts.password is not None
+        or port not in (None, 443)
+    ):
+        raise InvalidInputError(f"{provider_label(provider_name)} download URL is not on an allowed host")
+
+
 def download_binary_content(
     db: DbSession,
     user_id: UUID,
@@ -429,26 +455,42 @@ def download_binary_content(
     oauth: BaseOAuthTemplate,
     provider_name: str,
     url: str,
+    allowed_hosts: Collection[str],
 ) -> bytes:
     """Download binary content from a full URL using OAuth Bearer authentication.
 
     Used for endpoints that return binary data (e.g. Garmin activityFiles FIT download).
     The URL may contain additional auth params (e.g. token=...) alongside the Bearer header.
+    The URL, and every redirect, must be https on one of ``allowed_hosts``: it comes from a
+    webhook payload and is sent the user's token.
     Retries up to MAX_RETRIES times on 429 with exponential backoff.
     """
+    _require_allowed_download_url(url, allowed_hosts, provider_name)
     access_token = get_valid_token(db, user_id, provider_name, connection_repo, oauth)
     headers = {"Authorization": f"Bearer {access_token}"}
     token_reloaded = False
+    redirects = 0
+    attempt = 0
 
-    for attempt in range(MAX_RETRIES + 1):
+    while attempt <= MAX_RETRIES:
         try:
             response = httpx.get(
-                url, headers=headers, timeout=settings.provider_request_timeout_seconds, follow_redirects=True
+                url, headers=headers, timeout=settings.provider_request_timeout_seconds, follow_redirects=False
             )
         except httpx.RequestError as e:
             raise ProviderError(provider_name) from e
+        if response.is_redirect:
+            redirects += 1
+            if redirects > MAX_DOWNLOAD_REDIRECTS:
+                raise ProviderError(
+                    provider_name, f"Too many redirects downloading from {provider_label(provider_name)}"
+                )
+            url = urljoin(url, response.headers["Location"])
+            _require_allowed_download_url(url, allowed_hosts, provider_name)
+            continue
         if response.status_code == 401 and not token_reloaded and attempt < MAX_RETRIES:
             token_reloaded = True
+            attempt += 1
             if new_token := _reload_token_after_401(db, user_id, provider_name, connection_repo, oauth, access_token):
                 access_token = new_token
                 headers["Authorization"] = f"Bearer {access_token}"
@@ -463,6 +505,7 @@ def download_binary_content(
                 backoff_delay=backoff_delay,
             )
             time.sleep(backoff_delay)
+            attempt += 1
             continue
         if response.status_code in (401, 403):
             _note_auth_failure(db, user_id, provider_name, oauth)

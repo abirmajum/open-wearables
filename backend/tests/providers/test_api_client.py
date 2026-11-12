@@ -14,6 +14,7 @@ import pytest
 
 from app.services.providers import api_client
 from app.utils.exceptions import (
+    InvalidInputError,
     ProviderAuthRejectedError,
     ProviderError,
     ProviderNotConnectedError,
@@ -175,7 +176,7 @@ class TestMakeAuthenticatedRequest:
 @patch("app.services.providers.api_client.get_valid_token", return_value="token")
 @patch("app.services.providers.api_client.httpx.get")
 class TestDownloadBinaryContent:
-    def _download(self) -> bytes:
+    def _download(self, url: str = URL) -> bytes:
         args = _request_args()
         return api_client.download_binary_content(
             db=args["db"],
@@ -183,8 +184,60 @@ class TestDownloadBinaryContent:
             connection_repo=args["connection_repo"],
             oauth=args["oauth"],
             provider_name="garmin",
-            url=URL,
+            url=url,
+            allowed_hosts={"api.provider.test"},
         )
+
+    def test_downloads_from_an_allowed_host_without_following_redirects(
+        self, mock_get: MagicMock, mock_token: MagicMock
+    ) -> None:
+        mock_get.return_value = _response(200, content=b"fit")
+
+        assert self._download() == b"fit"
+        assert mock_get.call_args.kwargs["follow_redirects"] is False
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://evil.example/x",
+            "http://api.provider.test/v1/data",
+            "https://api.provider.test.evil.example/x",
+            "https://user@api.provider.test/x",
+            "https://api.provider.test:8443/x",
+            "https://169.254.169.254/latest/meta-data",
+            "file:///etc/passwd",
+        ],
+    )
+    def test_a_url_off_the_allowed_hosts_is_never_fetched(
+        self, mock_get: MagicMock, mock_token: MagicMock, url: str
+    ) -> None:
+        with pytest.raises(InvalidInputError):
+            self._download(url)
+
+        mock_get.assert_not_called()
+        mock_token.assert_not_called()
+
+    def test_a_redirect_off_the_allowed_hosts_is_not_followed(self, mock_get: MagicMock, mock_token: MagicMock) -> None:
+        mock_get.return_value = _response(302, headers={"Location": "https://evil.example/steal"})
+
+        with pytest.raises(InvalidInputError):
+            self._download()
+
+        assert [c.args[0] for c in mock_get.call_args_list] == [URL]
+
+    def test_a_redirect_on_an_allowed_host_is_followed(self, mock_get: MagicMock, mock_token: MagicMock) -> None:
+        mock_get.side_effect = [_response(302, headers={"Location": "/v1/file"}), _response(200, content=b"fit")]
+
+        assert self._download() == b"fit"
+        assert [c.args[0] for c in mock_get.call_args_list] == [URL, "https://api.provider.test/v1/file"]
+
+    def test_a_redirect_loop_stops(self, mock_get: MagicMock, mock_token: MagicMock) -> None:
+        mock_get.return_value = _response(302, headers={"Location": URL})
+
+        with pytest.raises(ProviderError):
+            self._download()
+
+        assert mock_get.call_count == api_client.MAX_DOWNLOAD_REDIRECTS + 1
 
     def test_error_response(self, mock_get: MagicMock, mock_token: MagicMock) -> None:
         mock_get.return_value = _response(403, text="forbidden")

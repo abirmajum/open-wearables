@@ -694,6 +694,23 @@ class TestGarmin247Data:
         assert count == 3
         assert [row.avg for row in db.query(SeriesAggregate)] == [Decimal("84")]
 
+    def test_activity_file_callback_off_garmin_is_never_fetched(self, garmin_247: Garmin247Data, db: Session) -> None:
+        """A forged callbackURL must not receive the user's Garmin token."""
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="garmin")
+        item = {
+            "userId": "garmin_user_123",
+            "activityId": 123,
+            "fileType": "FIT",
+            "callbackURL": "https://evil.example/x",
+        }
+
+        with patch("app.services.providers.api_client.httpx.get") as mock_get:
+            count = garmin_247.process_items_batch(db, user.id, "activityFiles", [item])
+
+        assert count == 0
+        mock_get.assert_not_called()
+
     def test_process_items_batch_hrv_missing_start_time(self, garmin_247: Garmin247Data, db: Session) -> None:
         """Test saving HRV data with missing start time."""
         user = UserFactory()
