@@ -176,3 +176,38 @@ class TestRedeemInvitationCode:
 
         # Assert
         assert response.status_code == 422
+
+
+class TestRedeemInvitationCodeRateLimit:
+    """Brute-force protection on POST /api/v1/invitation-code/redeem"""
+
+    def test_repeated_failed_redeems_from_one_ip_return_429(
+        self, client: TestClient, db: Session, api_v1_prefix: str
+    ) -> None:
+        # Arrange
+        limit = settings.user_invitation_code_redeem_ip_limit
+        for _ in range(limit):
+            response = client.post(f"{api_v1_prefix}/invitation-code/redeem", json={"code": "ZZZZZZZZ"})
+            assert response.status_code == 404
+
+        # Act
+        response = client.post(f"{api_v1_prefix}/invitation-code/redeem", json={"code": "ZZZZZZZZ"})
+
+        # Assert
+        assert response.status_code == 429
+        assert response.json()["code"] == "TOO_MANY_REQUESTS"
+
+    def test_blocked_ip_cannot_redeem_a_valid_code(self, client: TestClient, db: Session, api_v1_prefix: str) -> None:
+        # Arrange
+        developer = DeveloperFactory()
+        user = UserFactory()
+        headers = developer_auth_headers(developer.id)
+        code = client.post(f"{api_v1_prefix}/users/{user.id}/invitation-code", headers=headers).json()["code"]
+        for _ in range(settings.user_invitation_code_redeem_ip_limit):
+            client.post(f"{api_v1_prefix}/invitation-code/redeem", json={"code": "ZZZZZZZZ"})
+
+        # Act
+        response = client.post(f"{api_v1_prefix}/invitation-code/redeem", json={"code": code})
+
+        # Assert
+        assert response.status_code == 429

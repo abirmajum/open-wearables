@@ -306,6 +306,10 @@ class Settings(BaseSettings):
 
     # SDK INVITATION CODE SETTINGS
     user_invitation_code_expire_days: int = 7
+    # Redeem is public, so guesses are capped per client IP and across all clients per window
+    user_invitation_code_redeem_window_seconds: int = 900
+    user_invitation_code_redeem_ip_limit: int = 10
+    user_invitation_code_redeem_global_limit: int = 1000
     # Lifetime of the token in a pairing link (/users/{id}/pair?token=...)
     pairing_token_expire_days: int = 7
 

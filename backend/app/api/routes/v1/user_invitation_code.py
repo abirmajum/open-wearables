@@ -1,6 +1,6 @@
 from uuid import UUID
 
-from fastapi import APIRouter, status
+from fastapi import APIRouter, Request, status
 
 from app.database import DbSession
 from app.schemas.model_crud.credentials import (
@@ -10,6 +10,7 @@ from app.schemas.model_crud.credentials import (
 )
 from app.services import DeveloperDep
 from app.services.user_invitation_code_service import user_invitation_code_service
+from app.utils.problem import problem_doc
 
 router = APIRouter()
 
@@ -43,9 +44,17 @@ def generate_invitation_code(
 
 @router.post(
     "/invitation-code/redeem",
+    responses={
+        **problem_doc(
+            429,
+            "Too many redeem attempts from this client, or from all clients, in the current window",
+            "Too many invitation code attempts, try again later",
+        ),
+    },
 )
 def redeem_invitation_code(
     payload: UserInvitationCodeRedeem,
+    request: Request,
     db: DbSession,
 ) -> InvitationCodeRedeemResponse:
     """Redeem a single-use invitation code for SDK tokens.
@@ -58,5 +67,9 @@ def redeem_invitation_code(
     the SDK example apps. It is not the standard integration path - if your app
     has its own backend, mint and forward a token with
     `POST /api/v1/users/{user_id}/token` instead of redeeming codes on the client.
+
+    Rate limited: by default 10 attempts per client IP and 1000 attempts across all
+    clients per 15 minutes, successful or not. Further attempts get `429`.
     """
+    user_invitation_code_service.enforce_redeem_rate_limit(request.client.host if request.client else None)
     return user_invitation_code_service.redeem(db, payload.code)
