@@ -10090,7 +10090,7 @@
           "External: Mobile SDK"
         ],
         "summary": "Redeem Invitation Code",
-        "description": "Redeem a single-use invitation code for SDK tokens.\n\nPublic endpoint (no authentication required). Exchanges a valid, non-expired,\nsingle-use invitation code for `access_token`, `refresh_token`, and `user_id`.\nThe returned token is write-only to the `/sdk/*` endpoints.\n\nThis backs the standalone onboarding flow used by the Open Wearables app and\nthe SDK example apps. It is not the standard integration path - if your app\nhas its own backend, mint and forward a token with\n`POST /api/v1/users/{user_id}/token` instead of redeeming codes on the client.",
+        "description": "Redeem a single-use invitation code for SDK tokens.\n\nPublic endpoint (no authentication required). Exchanges a valid, non-expired,\nsingle-use invitation code for `access_token`, `refresh_token`, and `user_id`.\nThe returned token is write-only to the `/sdk/*` endpoints.\n\nThis backs the standalone onboarding flow used by the Open Wearables app and\nthe SDK example apps. It is not the standard integration path - if your app\nhas its own backend, mint and forward a token with\n`POST /api/v1/users/{user_id}/token` instead of redeeming codes on the client.\n\nRate limited: by default 10 attempts per client IP and 1000 attempts across all\nclients per 15 minutes, successful or not. Further attempts get `429`.",
         "operationId": "redeem_invitation_code_api_v1_invitation_code_redeem_post",
         "requestBody": {
           "content": {
@@ -10109,6 +10109,22 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/InvitationCodeRedeemResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many redeem attempts from this client, or from all clients, in the current window",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                },
+                "example": {
+                  "title": "Too Many Requests",
+                  "status": 429,
+                  "detail": "Too many invitation code attempts, try again later",
+                  "code": "TOO_MANY_REQUESTS"
                 }
               }
             }
