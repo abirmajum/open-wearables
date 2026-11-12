@@ -93,7 +93,7 @@ def _path_template(path: str, path_params: dict[str, Any]) -> str:
 
 
 def caller_type(authorization: str | None, api_key: str | None) -> str:
-    """Which credential the request presented: developer_jwt, sdk_token, api_key or none.
+    """Which credential the request presented: developer_jwt, sdk_token, pairing_token, api_key or none.
 
     Mirrors the precedence of the auth dependencies (JWT first, then API key). Expiry
     is ignored - the status class already tells whether the call was accepted.
@@ -109,7 +109,7 @@ def caller_type(authorization: str | None, api_key: str | None) -> str:
         except JWTError:
             claims = None
         if claims is not None:
-            return "sdk_token" if claims.get("scope") == "sdk" else "developer_jwt"
+            return {"sdk": "sdk_token", "pairing": "pairing_token"}.get(claims.get("scope"), "developer_jwt")
     if api_key:
         return "api_key"
     return "none"

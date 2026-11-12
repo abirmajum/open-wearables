@@ -8,7 +8,8 @@ from app.config import settings
 from app.constants.provider_urls import from_url_slug
 from app.schemas.enums import ProviderName
 from app.utils.webhook_callback import callback_token
-from tests.factories import ApiKeyFactory
+from tests.factories import ApiKeyFactory, UserFactory
+from tests.utils import api_key_headers
 
 
 class TestUrlSlugMapping:
@@ -44,14 +45,16 @@ class TestAuthorizeRoute:
         """Google redirects to whichever callback path was registered, so both must route."""
         response = client.get(
             f"{api_v1_prefix}/oauth/{slug}/authorize",
-            params={"user_id": "123e4567-e89b-12d3-a456-426614174000"},
+            params={"user_id": str(UserFactory().id)},
+            headers=api_key_headers(ApiKeyFactory()),
         )
         assert response.status_code != 404
 
     def test_unknown_provider_is_rejected(self, client: TestClient, api_v1_prefix: str) -> None:
         response = client.get(
             f"{api_v1_prefix}/oauth/nonsense/authorize",
-            params={"user_id": "123e4567-e89b-12d3-a456-426614174000"},
+            params={"user_id": str(UserFactory().id)},
+            headers=api_key_headers(ApiKeyFactory()),
         )
         assert response.status_code == 422
         assert response.json()["code"] == "VALIDATION_ERROR"
@@ -61,7 +64,8 @@ class TestAuthorizeRoute:
         """health_connect resolves but has no OAuth, so it is a 400 rather than a 404."""
         response = client.get(
             f"{api_v1_prefix}/oauth/health_connect/authorize",
-            params={"user_id": "123e4567-e89b-12d3-a456-426614174000"},
+            params={"user_id": str(UserFactory().id)},
+            headers=api_key_headers(ApiKeyFactory()),
         )
         assert response.status_code == 400
 

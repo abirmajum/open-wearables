@@ -47,3 +47,9 @@ export function readUserInput(form: FormData): UserInput {
 		external_user_id: field('external_user_id')
 	};
 }
+
+/** Mirrors backend `PairingTokenResponse`. */
+type PairingToken = { token: string; expires_at: string };
+
+export const createPairingToken = (userId: string, accessToken: string) =>
+	apiPost<PairingToken>(`/api/v1/users/${userId}/pairing-token`, accessToken);

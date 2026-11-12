@@ -1,17 +1,26 @@
 import { describe, expect, it } from 'vitest';
-import { pairingLink, safeReturnUrl } from './links';
+import { pairingLink, pairingSuccessUrl, safeReturnUrl } from './links';
 
 describe('pairingLink', () => {
 	it('builds an absolute link an admin can paste into a message', () => {
-		expect(pairingLink('https://app.example.com', 'abc-123')).toBe(
-			'https://app.example.com/users/abc-123/pair'
+		expect(pairingLink('https://app.example.com', 'abc-123', 'tok.en')).toBe(
+			'https://app.example.com/users/abc-123/pair?token=tok.en'
 		);
 	});
 
 	// origin from a proxy or config sometimes arrives with a trailing slash.
 	it('does not double the slash', () => {
-		expect(pairingLink('https://app.example.com/', 'abc-123')).toBe(
-			'https://app.example.com/users/abc-123/pair'
+		expect(pairingLink('https://app.example.com/', 'abc-123', 'tok.en')).toBe(
+			'https://app.example.com/users/abc-123/pair?token=tok.en'
+		);
+	});
+});
+
+describe('pairingSuccessUrl', () => {
+	// "Connect another device" on the success page needs the token again.
+	it('keeps the token for the next provider', () => {
+		expect(pairingSuccessUrl('https://app.example.com', 'abc-123', 'oura', null, 'tok.en')).toBe(
+			'https://app.example.com/users/abc-123/pair/success?provider=oura&token=tok.en'
 		);
 	});
 });

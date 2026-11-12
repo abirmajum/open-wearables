@@ -844,6 +844,123 @@
         }
       }
     },
+    "/api/v1/users/{user_id}/pairing-token": {
+      "post": {
+        "tags": [
+          "External: Users"
+        ],
+        "summary": "Create User Pairing Token",
+        "description": "Issue the token for a user's pairing link.\n\nIt only lets its holder start a provider OAuth flow for this user, and expires\nafter PAIRING_TOKEN_EXPIRE_DAYS (default 7).",
+        "operationId": "create_user_pairing_token_api_v1_users__user_id__pairing_token_post",
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "User Id"
+            }
+          },
+          {
+            "name": "X-Open-Wearables-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Open-Wearables-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PairingTokenResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                },
+                "example": {
+                  "title": "Unauthorized",
+                  "status": 401,
+                  "detail": "Authentication required: provide JWT token or API key",
+                  "code": "UNAUTHORIZED"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "User not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                },
+                "example": {
+                  "title": "Not Found",
+                  "status": 404,
+                  "detail": "User with ID: 123e4567-e89b-12d3-a456-426614174000 not found.",
+                  "code": "NOT_FOUND"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationProblem"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "description": "Client error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "description": "Server error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/users/{user_id}/personal-record": {
       "get": {
         "tags": [
@@ -4805,8 +4922,13 @@
           "External: Providers"
         ],
         "summary": "Get Provider Authorization URL",
-        "description": "Initiate OAuth flow for a provider.\n\nReturns authorization URL where user should be redirected to log in.",
+        "description": "Initiate OAuth flow for a provider.\n\nTakes an API key or developer token, or a user's SDK or pairing token for that same user.\nReturns authorization URL where user should be redirected to log in.",
         "operationId": "authorize_provider_api_v1_oauth__provider__authorize_get",
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
         "parameters": [
           {
             "name": "provider",
@@ -4842,10 +4964,26 @@
                   "type": "null"
                 }
               ],
-              "description": "Optional application URL to redirect the user to after the provider callback completes",
+              "description": "Optional application URL to redirect the user to after the provider callback completes. Its origin must be FRONTEND_URL, one of CORS_ORIGINS or one of OAUTH_REDIRECT_ALLOWED_ORIGINS.",
               "title": "Redirect Uri"
             },
-            "description": "Optional application URL to redirect the user to after the provider callback completes"
+            "description": "Optional application URL to redirect the user to after the provider callback completes. Its origin must be FRONTEND_URL, one of CORS_ORIGINS or one of OAUTH_REDIRECT_ALLOWED_ORIGINS."
+          },
+          {
+            "name": "X-Open-Wearables-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Open-Wearables-Api-Key"
+            }
           }
         ],
         "responses": {
@@ -18675,6 +18813,26 @@
           "has_more"
         ],
         "title": "Pagination"
+      },
+      "PairingTokenResponse": {
+        "properties": {
+          "token": {
+            "type": "string",
+            "title": "Token"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Expires At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "token",
+          "expires_at"
+        ],
+        "title": "PairingTokenResponse",
+        "description": "Token for a user's pairing link; it can only start a provider OAuth flow for that user."
       },
       "PasswordChange": {
         "properties": {

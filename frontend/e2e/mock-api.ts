@@ -108,6 +108,9 @@ let issued = 0;
 const validAccessTokens = new Set<string>();
 const validRefreshTokens = new Set<string>();
 // Backend GET routes without auth: a stale bearer token there is ignored, not refused.
+// The token a pairing link carries; the API accepts it on authorize only, for that user.
+const PAIRING_PREFIX = 'pairing-';
+
 const PUBLIC_PATHS = new Set([
 	'/api/v1/oauth/providers',
 	'/api/v1/meta/coverage',
@@ -190,6 +193,7 @@ const server = Bun.serve({
 		if (
 			bearer !== undefined &&
 			!(request.method === 'GET' && PUBLIC_PATHS.has(pathname)) &&
+			!bearer.startsWith(PAIRING_PREFIX) &&
 			!validAccessTokens.has(bearer)
 		) {
 			return json({ detail: 'Could not validate credentials' }, 401);
@@ -267,14 +271,36 @@ const server = Bun.serve({
 		const authorizeMatch = pathname.match(/^\/api\/v1\/oauth\/([^/]+)\/authorize$/);
 		if (authorizeMatch) {
 			const provider = authorizeMatch[1];
+			const params = new URL(request.url).searchParams;
+			if (!bearer) {
+				return problem(
+					401,
+					'Authentication required: provide SDK token or API key',
+					'UNAUTHORIZED'
+				);
+			}
+			if (bearer.startsWith(PAIRING_PREFIX) && bearer !== PAIRING_PREFIX + params.get('user_id')) {
+				return problem(403, 'Token does not match user_id', 'FORBIDDEN');
+			}
 			// Enabled but missing its client credentials: on the pairing page, and still failing.
 			if (provider === 'suunto') {
 				return problem(400, 'Provider credentials are not configured.', 'BAD_REQUEST');
 			}
 			// A real provider sends the browser to redirect_uri once the person
 			// consents, so handing it straight back walks the same path.
-			const redirectUri = new URL(request.url).searchParams.get('redirect_uri') ?? '/';
+			const redirectUri = params.get('redirect_uri') ?? '/';
 			return json({ authorization_url: redirectUri, state: 'state-1' });
+		}
+
+		const pairingTokenMatch = pathname.match(/^\/api\/v1\/users\/([^/]+)\/pairing-token$/);
+		if (pairingTokenMatch && request.method === 'POST') {
+			if (!bearer || bearer.startsWith(PAIRING_PREFIX)) {
+				return problem(401, 'Could not validate credentials', 'UNAUTHORIZED');
+			}
+			return json({
+				token: PAIRING_PREFIX + pairingTokenMatch[1],
+				expires_at: new Date(Date.now() + 7 * 86_400_000).toISOString()
+			});
 		}
 
 		if (pathname === '/api/v1/webhooks/event-types') {

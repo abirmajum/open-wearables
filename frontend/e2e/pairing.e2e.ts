@@ -2,31 +2,33 @@ import { expect, test } from '@playwright/test';
 
 const USER = '00000000-0000-4000-8000-000000000007';
 const PAIR = `/users/${USER}/pair`;
+const TOKEN = `pairing-${USER}`;
+const LINK = `${PAIR}?token=${TOKEN}`;
 
 // No signIn(): whoever opens a pairing link has no account here, and a page
 // that only works for a signed-in admin would be useless.
 test('opens for someone with no session at all', async ({ page }) => {
-	await page.goto(PAIR);
+	await page.goto(LINK);
 
 	await expect(page.getByRole('heading', { name: 'Connect a device' })).toBeVisible();
 	await expect(page.getByRole('button', { name: /Garmin/ })).toBeVisible();
-	await expect(page).toHaveURL(PAIR);
+	await expect(page).toHaveURL(LINK);
 });
 
 test('walks the provider round trip and names what connected', async ({ page }) => {
-	await page.goto(PAIR);
+	await page.goto(LINK);
 	await page.getByRole('button', { name: /Garmin/ }).click();
 
-	await expect(page).toHaveURL(new RegExp(`${PAIR}/success\\?provider=garmin$`));
+	await expect(page).toHaveURL(`${PAIR}/success?provider=garmin&token=${TOKEN}`);
 	await expect(page.getByRole('heading', { name: 'Garmin is connected' })).toBeVisible();
 	await expect(page.getByRole('link', { name: 'Connect another device' })).toHaveAttribute(
 		'href',
-		PAIR
+		LINK
 	);
 });
 
 test('reports a provider that cannot be reached instead of a blank page', async ({ page }) => {
-	await page.goto(PAIR);
+	await page.goto(LINK);
 	await page.getByRole('button', { name: /Suunto/ }).click();
 
 	await expect(page.getByRole('alert')).toContainText('Provider credentials are not configured');
@@ -35,7 +37,7 @@ test('reports a provider that cannot be reached instead of a blank page', async 
 
 // Disabled in Settings, so a user cannot be sent to it at all.
 test('offers only the providers that are switched on', async ({ page }) => {
-	await page.goto(PAIR);
+	await page.goto(LINK);
 	await expect(page.getByRole('button', { name: /Garmin/ })).toBeVisible();
 	await expect(page.getByRole('button', { name: /Whoop/ })).toHaveCount(0);
 });
@@ -43,7 +45,7 @@ test('offers only the providers that are switched on', async ({ page }) => {
 test('carries a return link through the provider, and only if it is a web address', async ({
 	page
 }) => {
-	await page.goto(`${PAIR}?redirect_url=https%3A%2F%2Fclient.example.com%2Fdone`);
+	await page.goto(`${LINK}&redirect_url=https%3A%2F%2Fclient.example.com%2Fdone`);
 	await page.getByRole('button', { name: /Oura/ }).click();
 
 	await expect(page.getByRole('link', { name: 'Continue' })).toHaveAttribute(
@@ -54,9 +56,26 @@ test('carries a return link through the provider, and only if it is a web addres
 
 // The pairing link is public, so its query string is attacker-controlled.
 test('drops a hostile return link rather than rendering it', async ({ page }) => {
-	await page.goto(`${PAIR}?redirect_url=javascript%3Aalert(1)`);
+	await page.goto(`${LINK}&redirect_url=javascript%3Aalert(1)`);
 	await page.getByRole('button', { name: /Oura/ }).click();
 
 	await expect(page.getByRole('heading', { name: 'Oura is connected' })).toBeVisible();
 	await expect(page.getByRole('link', { name: 'Continue' })).toHaveCount(0);
+});
+
+// The link is the only credential its holder has, so without it nothing starts.
+test('refuses a link without its token', async ({ page }) => {
+	await page.goto(PAIR);
+
+	await expect(page.getByText('This pairing link is invalid or has expired')).toBeVisible();
+	await expect(page.getByRole('button', { name: /Garmin/ })).toHaveCount(0);
+});
+
+test("refuses another user's token", async ({ page }) => {
+	await page.goto(`${PAIR}?token=pairing-00000000-0000-4000-8000-000000000001`);
+	await page.getByRole('button', { name: /Garmin/ }).click();
+
+	await expect(page.getByRole('alert')).toContainText(
+		'This pairing link is invalid or has expired'
+	);
 });

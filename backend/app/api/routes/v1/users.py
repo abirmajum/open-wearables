@@ -4,6 +4,7 @@ from uuid import UUID
 from fastapi import APIRouter, Query, status
 
 from app.database import DbSession
+from app.schemas.auth import PairingTokenResponse
 from app.schemas.model_crud.user_management import (
     UserCreate,
     UserDetailRead,
@@ -14,6 +15,7 @@ from app.schemas.model_crud.user_management import (
 )
 from app.schemas.utils import OldPaginatedResponse
 from app.services import ApiKeyDep, user_service
+from app.services.sdk_token_service import create_pairing_token
 from app.utils.problem import problem_doc
 
 router = APIRouter()
@@ -73,3 +75,21 @@ def delete_user(user_id: UUID, db: DbSession, _api_key: ApiKeyDep):
 @router.patch("/users/{user_id}", response_model=UserRead)
 def update_user(user_id: UUID, payload: UserUpdate, db: DbSession, _api_key: ApiKeyDep):
     return user_service.update(db, user_id, payload, raise_404=True)
+
+
+@router.post(
+    "/users/{user_id}/pairing-token",
+    responses={
+        **problem_doc(401, "Authentication required", "Authentication required: provide JWT token or API key"),
+        **problem_doc(404, "User not found", "User with ID: 123e4567-e89b-12d3-a456-426614174000 not found."),
+    },
+)
+def create_user_pairing_token(user_id: UUID, db: DbSession, _api_key: ApiKeyDep) -> PairingTokenResponse:
+    """Issue the token for a user's pairing link.
+
+    It only lets its holder start a provider OAuth flow for this user, and expires
+    after PAIRING_TOKEN_EXPIRE_DAYS (default 7).
+    """
+    user_service.get(db, user_id, raise_404=True)
+    token, expires_at = create_pairing_token(user_id)
+    return PairingTokenResponse(token=token, expires_at=expires_at)

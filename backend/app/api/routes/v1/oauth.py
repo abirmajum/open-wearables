@@ -17,12 +17,14 @@ from app.schemas.model_crud.data_priority import (
     ProviderSettingRead,
     ProviderSettingUpdate,
 )
-from app.services import DeveloperDep, user_connection_service
+from app.services import DeveloperDep, user_connection_service, user_service
 from app.services.provider_settings_service import provider_settings_service
 from app.services.providers.base_strategy import BaseProviderStrategy
 from app.services.providers.factory import ProviderFactory
+from app.utils.auth import UserScopedAuthDep
 from app.utils.exceptions import (
     InvalidInputError,
+    PermissionDeniedError,
     ProviderNotConfiguredError,
     UnsupportedProviderError,
     unknown_provider,
@@ -59,6 +61,24 @@ def _is_provider_callback_url(provider: ProviderName, redirect_uri: str) -> bool
     return candidate is not None and candidate == callback
 
 
+def _origin(url: str) -> tuple[str, str, int | None] | None:
+    target = _normalise_callback_target(url)
+    if target is None or not target[0] or not target[1]:
+        return None
+    return target[:3]
+
+
+def _is_allowed_redirect_uri(redirect_uri: str) -> bool:
+    """The post-callback redirect may only go to an origin the operator configured."""
+    allowed = {
+        origin
+        for url in (settings.frontend_url, *map(str, settings.cors_origins), *settings.oauth_redirect_allowed_origins)
+        if (origin := _origin(url)) is not None
+    }
+    candidate = _origin(redirect_uri)
+    return candidate is not None and candidate in allowed
+
+
 def get_oauth_strategy(provider: ProviderName) -> BaseProviderStrategy:
     """Helper to get provider strategy and ensure it supports OAuth."""
     strategy = factory.get_provider(provider.value)
@@ -76,24 +96,38 @@ def get_oauth_strategy(provider: ProviderName) -> BaseProviderStrategy:
 )
 def authorize_provider(
     provider: str,
+    db: DbSession,
+    auth: UserScopedAuthDep,
     user_id: Annotated[UUID, Query(description="User ID to connect")],
     redirect_uri: Annotated[
         str | None,
-        Query(description="Optional application URL to redirect the user to after the provider callback completes"),
+        Query(
+            description="Optional application URL to redirect the user to after the provider callback completes. "
+            "Its origin must be FRONTEND_URL, one of CORS_ORIGINS or one of OAUTH_REDIRECT_ALLOWED_ORIGINS."
+        ),
     ] = None,
 ):
     """
     Initiate OAuth flow for a provider.
 
+    Takes an API key or developer token, or a user's SDK or pairing token for that same user.
     Returns authorization URL where user should be redirected to log in.
     """
-    if redirect_uri and _is_provider_callback_url(resolve_provider(provider), redirect_uri):
+    if auth.auth_type in ("sdk_token", "pairing_token") and auth.user_id != user_id:
+        raise PermissionDeniedError("Token does not match user_id")
+    provider_name = resolve_provider(provider)
+    if redirect_uri and _is_provider_callback_url(provider_name, redirect_uri):
         raise InvalidInputError(
             "redirect_uri must be an application return URL, not the Open Wearables provider callback"
         )
-    strategy = get_oauth_strategy(resolve_provider(provider))
+    if redirect_uri and not _is_allowed_redirect_uri(redirect_uri):
+        raise InvalidInputError(
+            "redirect_uri origin is not allowed; add it to OAUTH_REDIRECT_ALLOWED_ORIGINS on the server"
+        )
+    strategy = get_oauth_strategy(provider_name)
     if not strategy.credentials_configured:
         raise ProviderNotConfiguredError(strategy.name)
+    user_service.get(db, user_id, raise_404=True)
 
     assert strategy.oauth
     auth_url, state = strategy.oauth.get_authorization_url(user_id, redirect_uri)

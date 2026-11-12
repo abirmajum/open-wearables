@@ -52,6 +52,9 @@ async def get_current_developer(
                 detail="SDK tokens cannot access this endpoint",
                 headers={"WWW-Authenticate": "Bearer"},
             )
+        # Developer tokens carry no scope; any other scoped token (pairing) is not one
+        if payload.get("scope") is not None:
+            raise credentials_exception
 
         developer_id: str = payload.get("sub")
         if developer_id is None:
@@ -80,8 +83,8 @@ async def get_current_developer_optional(
     try:
         payload = jwt.decode(token, settings.secret_key, algorithms=[settings.algorithm])
 
-        # SDK tokens are not developer tokens - return None to allow fallback to API key
-        if payload.get("scope") == "sdk":
+        # Scoped (SDK, pairing) tokens are not developer tokens - return None to allow fallback to API key
+        if payload.get("scope") is not None:
             return None
 
         developer_id: str = payload.get("sub")
@@ -168,3 +171,34 @@ async def get_combined_auth(
 
 
 CombinedAuthDep = Annotated[SDKAuthContext, Depends(get_combined_auth)]
+
+
+async def get_user_scoped_auth(
+    db: DbSession,
+    token: Annotated[str | None, Depends(oauth2_scheme)] = None,
+    x_open_wearables_api_key: str | None = Header(None, alias="X-Open-Wearables-API-Key"),
+) -> SDKAuthContext:
+    """``get_combined_auth`` that also takes a pairing token (the public pairing link).
+
+    Both ``sdk_token`` and ``pairing_token`` callers speak only for ``auth.user_id``,
+    so the endpoint has to check it against the user it acts on.
+    """
+    if token:
+        try:
+            payload = jwt.decode(token, settings.secret_key, algorithms=[settings.algorithm])
+        except JWTError:
+            payload = {}
+        if payload.get("scope") == "pairing":
+            try:
+                return SDKAuthContext(auth_type="pairing_token", user_id=UUID(payload["sub"]))
+            except (KeyError, TypeError, ValueError):
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Invalid pairing token",
+                    headers={"WWW-Authenticate": "Bearer"},
+                ) from None
+
+    return await get_combined_auth(db, token, x_open_wearables_api_key)
+
+
+UserScopedAuthDep = Annotated[SDKAuthContext, Depends(get_user_scoped_auth)]
