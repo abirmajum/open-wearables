@@ -6,6 +6,8 @@ _PREFIX = "app.integrations.celery.tasks"
 class CeleryTask(StrEnum):
     """Registered Celery task names. Must stay import-free so any layer can use it."""
 
+    SERVICE_HEARTBEAT = f"{_PREFIX}.service_health_task.service_heartbeat"
+
     RUN_DAILY_ARCHIVAL = f"{_PREFIX}.archival_task.run_daily_archival"
     ROLL_UP_QUEUED_DAYS = f"{_PREFIX}.archival_task.roll_up_queued_days"
     DROP_RECONCILED_DAYS = f"{_PREFIX}.archival_task.drop_reconciled_days"

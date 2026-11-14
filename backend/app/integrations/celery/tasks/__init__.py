@@ -41,6 +41,7 @@ from .renew_oura_webhooks_task import renew_oura_webhooks
 from .repair_condensed_series_task import repair_condensed_series
 from .seed_data_task import generate_seed_data
 from .send_email_task import send_invitation_email_task
+from .service_health_task import service_heartbeat
 from .strava_stream_retry_task import retry_strava_stream_ingest
 from .sync_vendor_data_task import sync_vendor_data
 from .telemetry_task import send_telemetry_ping
@@ -48,6 +49,7 @@ from .webhook_push_task import process_webhook_push
 from .withings.notify_sync_task import sync_user_subscriptions as sync_withings_user_subscriptions
 
 __all__ = [
+    "service_heartbeat",
     # Garmin backfill (30-day webhook-based sync)
     "GARMIN_BACKFILL_DATA_TYPES",
     "check_garmin_triggered_timeout",

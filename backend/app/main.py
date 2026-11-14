@@ -47,6 +47,7 @@ from app.utils.problem import (
     add_problem_responses,
     problem_response,
 )
+from app.utils.service_health import services_are_ready
 from app.utils.structured_logging import get_logger
 
 # Configure logging to use stdout instead of stderr
@@ -151,6 +152,17 @@ def readiness() -> JSONResponse | dict[str, str]:
     if database_is_ready():
         return {"status": "ready"}
     return JSONResponse(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, content={"status": "not_ready"})
+
+
+@api.get("/services-readyz", include_in_schema=False, response_model=None)
+def service_readiness() -> JSONResponse | dict[str, str]:
+    """Monitoring only: database, Redis, recent queue progress and enabled Svix."""
+    ready = database_is_ready() and services_are_ready()
+    return JSONResponse(
+        status_code=status.HTTP_200_OK if ready else status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"status": "ready" if ready else "not_ready"},
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 def _capture_error_body(request: Request, status_code: int, detail: object) -> None:
