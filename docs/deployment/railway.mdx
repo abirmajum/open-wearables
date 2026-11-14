@@ -90,6 +90,37 @@ separate dependency check: it returns `200 {"status":"ready"}` only when the
 Backend can run a database query, otherwise `503 {"status":"not_ready"}`. Neither
 endpoint returns connection details or credentials.
 
+For outage alerting across backend services, monitor `/services-readyz`. It checks
+the database, Redis, a recent Beat-to-worker heartbeat on every configured Celery
+queue, and Svix's health endpoint when outgoing webhooks are enabled. It returns
+only `200 {"status":"ready"}` or `503 {"status":"not_ready"}`, with caching disabled.
+Beat sends a tiny task to each queue every 30 seconds; each task writes one Redis
+key with a 120-second TTL. A stopped Beat or stuck/stopped consumer therefore
+turns this check red after the last heartbeat expires. Queued probes expire after
+30 seconds so a recovered backlog cannot indefinitely hide a dead scheduler.
+
+Deploy the API, Beat and workers from the same revision, and allow the first
+heartbeat cycle to finish. Use this endpoint for external monitoring only; keep
+Railway's restart healthcheck on `/healthz`. Three failed one-minute probes give
+roughly a five-minute detection window for a lost heartbeat. This does not check
+individual wearable vendors, user OAuth grants, webhook recipient delivery,
+Flower or the developer portal. No user data is used or returned by the probes.
+
+Validate outage and recovery behavior locally with Docker available:
+
+```bash
+cd backend
+uv sync --group dev
+uv run python scripts/testing/service_readiness_e2e.py /tmp/ow-service-health-evidence
+```
+
+The command creates disposable Postgres/Redis containers and real Celery Beat
+and consumers, calls the application through HTTP, and stops only its own
+fixtures. It uses an HTTP fixture for Svix and accelerates Redis-key expiry
+for the stopped-consumer/scheduler checks. It writes `report.json` and logs to
+the new output directory, then removes its containers and processes. This proves
+probe behavior without stopping shared services or accessing real user data.
+
 Before releasing a Whoop-enabled deployment, set these **Backend** environment
 variable names in Railway (use Railway secrets for secret values):
 

@@ -17,6 +17,7 @@ from app.integrations.otel import init_otel, shutdown_otel
 from app.services import raw_payload_storage
 from app.utils.config_utils import LogFormat
 from app.utils.logging_setup import configure_logging
+from app.utils.service_health import HEARTBEAT_INTERVAL_SECONDS
 from app.utils.structured_logging import get_logger
 
 logger = get_logger(__name__)
@@ -268,6 +269,15 @@ def create_celery() -> Celery:
             "kwargs": {},
         },
     }
+
+    # Test scheduling and consumption of each configured queue without touching user data.
+    for queue in CeleryQueue:
+        cast(dict[str, Any], celery_app.conf.beat_schedule)[f"service-heartbeat-{queue}"] = {
+            "task": CeleryTask.SERVICE_HEARTBEAT,
+            "schedule": HEARTBEAT_INTERVAL_SECONDS,
+            "args": (str(queue),),
+            "options": {"queue": str(queue), "expires": HEARTBEAT_INTERVAL_SECONDS},
+        }
 
     # Summaries, day reads and our sleep and workout statistics are served from the rollup's rows,
     # so it runs on every instance; the lifecycle flag only governs retention and its tab.
