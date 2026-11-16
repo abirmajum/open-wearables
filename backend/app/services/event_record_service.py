@@ -946,6 +946,30 @@ class EventRecordService(
 
         return records, total_count
 
+    @staticmethod
+    def _page(
+        records: list[tuple[EventRecord, DataSource]], params: EventRecordQueryParams
+    ) -> tuple[list[tuple[EventRecord, DataSource]], bool, str | None, str | None]:
+        """The page of records fetched one past the limit, whether more follow, and its next and previous cursors.
+
+        A backward page keeps the records nearest its cursor and has a previous cursor only while more precede it.
+        """
+        limit = params.limit or 20
+        has_more = len(records) > limit
+        is_backward = bool(params.cursor and params.cursor.startswith("prev_"))
+        if has_more:
+            records = records[-limit:] if is_backward else records[:limit]
+        if not records:
+            return records, has_more, None, None
+        first, last = records[0][0], records[-1][0]
+        next_cursor = encode_cursor(last.start_datetime, last.id, "next") if has_more else None
+        previous_cursor = (
+            encode_cursor(first.start_datetime, first.id, "prev")
+            if params.cursor and (has_more or not is_backward)
+            else None
+        )
+        return records, has_more, next_cursor, previous_cursor
+
     def get_records_response(
         self,
         db_session: DbSession,
@@ -1009,39 +1033,7 @@ class EventRecordService(
         # Ensure total_count is always an int (not None)
         total_count = total_count if total_count is not None else 0
 
-        limit = params.limit or 20
-        has_more = len(records) > limit
-
-        # Check if this is backward pagination
-        is_backward = params.cursor and params.cursor.startswith("prev_")
-
-        # Trim to limit
-        if has_more:
-            records = records[-limit:] if is_backward else records[:limit]
-
-        # Generate cursors
-        next_cursor = None
-        previous_cursor = None
-
-        if records:
-            # Always generate next_cursor if has_more
-            if has_more:
-                last_record, _ = records[-1]
-                next_cursor = encode_cursor(last_record.start_datetime, last_record.id, "next")
-
-            # Generate previous_cursor only if:
-            # 1. We used a cursor to get here (not the first page)
-            # 2. There are more items before (for backward) OR we're doing forward navigation
-            if params.cursor:
-                # For backward navigation: only set previous_cursor if has_more
-                # For forward navigation: always set previous_cursor
-                if is_backward:
-                    if has_more:
-                        first_record, _ = records[0]
-                        previous_cursor = encode_cursor(first_record.start_datetime, first_record.id, "prev")
-                else:
-                    first_record, _ = records[0]
-                    previous_cursor = encode_cursor(first_record.start_datetime, first_record.id, "prev")
+        records, has_more, next_cursor, previous_cursor = self._page(records, params)
 
         statistics = self.crud.get_workout_statistics(db_session, [r.id for r, _ in records])
         computed_hr = self._resolve_avg_hr(db_session, [r for r, _ in records], statistics)
@@ -1166,39 +1158,7 @@ class EventRecordService(
         # Ensure total_count is always an int (not None)
         total_count = total_count if total_count is not None else 0
 
-        limit = params.limit or 20
-        has_more = len(records) > limit
-
-        # Check if this is backward pagination
-        is_backward = params.cursor and params.cursor.startswith("prev_")
-
-        # Trim to limit
-        if has_more:
-            records = records[-limit:] if is_backward else records[:limit]
-
-        # Generate cursors
-        next_cursor = None
-        previous_cursor = None
-
-        if records:
-            # Always generate next_cursor if has_more
-            if has_more:
-                last_record, _ = records[-1]
-                next_cursor = encode_cursor(last_record.start_datetime, last_record.id, "next")
-
-            # Generate previous_cursor only if:
-            # 1. We used a cursor to get here (not the first page)
-            # 2. There are more items before (for backward) OR we're doing forward navigation
-            if params.cursor:
-                # For backward navigation: only set previous_cursor if has_more
-                # For forward navigation: always set previous_cursor
-                if is_backward:
-                    if has_more:
-                        first_record, _ = records[0]
-                        previous_cursor = encode_cursor(first_record.start_datetime, first_record.id, "prev")
-                else:
-                    first_record, _ = records[0]
-                    previous_cursor = encode_cursor(first_record.start_datetime, first_record.id, "prev")
+        records, has_more, next_cursor, previous_cursor = self._page(records, params)
 
         final_ids = final_record_ids(db_session, user_id, records, datetime.now(timezone.utc))
         data = []
@@ -1259,28 +1219,7 @@ class EventRecordService(
         records, total_count = self._get_records_with_filters(db_session, params, str(user_id))
         total_count = total_count if total_count is not None else 0
 
-        limit = params.limit or 20
-        has_more = len(records) > limit
-        is_backward = params.cursor and params.cursor.startswith("prev_")
-
-        if has_more:
-            records = records[-limit:] if is_backward else records[:limit]
-
-        next_cursor = None
-        previous_cursor = None
-
-        if records:
-            if has_more:
-                last_record, _ = records[-1]
-                next_cursor = encode_cursor(last_record.start_datetime, last_record.id, "next")
-            if params.cursor:
-                if is_backward:
-                    if has_more:
-                        first_record, _ = records[0]
-                        previous_cursor = encode_cursor(first_record.start_datetime, first_record.id, "prev")
-                else:
-                    first_record, _ = records[0]
-                    previous_cursor = encode_cursor(first_record.start_datetime, first_record.id, "prev")
+        records, has_more, next_cursor, previous_cursor = self._page(records, params)
 
         data = []
         for record, data_source in records:
@@ -1334,28 +1273,7 @@ class EventRecordService(
         params.category = EventCategory.ACTIVITY
         records, total_count = self._get_records_with_filters(db_session, params, str(user_id))
 
-        limit = params.limit or 20
-        has_more = len(records) > limit
-        is_backward = params.cursor and params.cursor.startswith("prev_")
-
-        if has_more:
-            records = records[-limit:] if is_backward else records[:limit]
-
-        next_cursor = None
-        previous_cursor = None
-
-        if records:
-            if has_more:
-                last_record, _ = records[-1]
-                next_cursor = encode_cursor(last_record.start_datetime, last_record.id, "next")
-            if params.cursor:
-                if is_backward:
-                    if has_more:
-                        first_record, _ = records[0]
-                        previous_cursor = encode_cursor(first_record.start_datetime, first_record.id, "prev")
-                else:
-                    first_record, _ = records[0]
-                    previous_cursor = encode_cursor(first_record.start_datetime, first_record.id, "prev")
+        records, has_more, next_cursor, previous_cursor = self._page(records, params)
 
         data = [
             ActivityRecord(
@@ -1395,28 +1313,7 @@ class EventRecordService(
         params.category = EventCategory.MEAL
         records, total_count = self._get_records_with_filters(db_session, params, str(user_id))
 
-        limit = params.limit or 20
-        has_more = len(records) > limit
-        is_backward = params.cursor and params.cursor.startswith("prev_")
-
-        if has_more:
-            records = records[-limit:] if is_backward else records[:limit]
-
-        next_cursor = None
-        previous_cursor = None
-
-        if records:
-            if has_more:
-                last_record, _ = records[-1]
-                next_cursor = encode_cursor(last_record.start_datetime, last_record.id, "next")
-            if params.cursor:
-                if is_backward:
-                    if has_more:
-                        first_record, _ = records[0]
-                        previous_cursor = encode_cursor(first_record.start_datetime, first_record.id, "prev")
-                else:
-                    first_record, _ = records[0]
-                    previous_cursor = encode_cursor(first_record.start_datetime, first_record.id, "prev")
+        records, has_more, next_cursor, previous_cursor = self._page(records, params)
 
         data = []
         for record, data_source in records:

@@ -71,3 +71,40 @@ class TestListActivities:
 
         assert response.status_code == 200
         assert response.json()["data"] == []
+
+    def test_pages_forward_and_back_by_cursor(self, client: TestClient, db: Session) -> None:
+        user = UserFactory()
+        walks = [
+            {
+                "summaryId": f"miq-{hour}",
+                "startTimeInSeconds": 1705320000 + hour * 3600,
+                "durationInSeconds": 600,
+                "activityType": "Walking",
+            }
+            for hour in range(3)
+        ]
+        _garmin_247().process_items_batch(db, user.id, "moveIQActivities", walks)
+        db.commit()
+        headers = api_key_headers(ApiKeyFactory().plain_key)
+
+        def page(cursor: str | None = None) -> tuple[list[str], str | None, str | None]:
+            params = {"start_date": "2024-01-15T00:00:00Z", "end_date": "2024-01-16T00:00:00Z", "limit": 1}
+            response = client.get(
+                f"/api/v1/users/{user.id}/events/activities",
+                headers=headers,
+                params={**params, **({"cursor": cursor} if cursor else {})},
+            )
+            assert response.status_code == 200
+            body = response.json()
+            pagination = body["pagination"]
+            return [a["start_time"] for a in body["data"]], pagination["next_cursor"], pagination["previous_cursor"]
+
+        first, next_cursor, previous = page()
+        second, next_cursor, previous = page(next_cursor)
+        third, last_next, _ = page(next_cursor)
+        back, _, back_previous = page(previous)
+
+        assert len({*first, *second, *third}) == 3
+        assert last_next is None
+        assert back == first
+        assert back_previous is None
