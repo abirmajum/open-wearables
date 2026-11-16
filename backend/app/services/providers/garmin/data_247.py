@@ -2132,6 +2132,10 @@ class Garmin247Data(Base247DataTemplate):
             workout_details = [d for d in all_workout_details if d.record_id in inserted_set]
             if workout_details:
                 event_record_service.bulk_create_details(db, workout_details, detail_type=EventCategory.WORKOUT)
+            # A workout Garmin pushes again (activities, then activityDetails) keeps its record; the fields this push
+            # carries fill its stored detail, without a second created webhook
+            if refreshed := self._stored_workout_details(db, user_id, all_records, all_workout_details, inserted_set):
+                self.event_record_detail_repo.bulk_create(db, refreshed, detail_type=EventCategory.WORKOUT)
 
             # Bulk create MCT details for actually inserted records
             mct_details = [d for d in all_mct_details if d.record_id in inserted_set]
@@ -2154,6 +2158,32 @@ class Garmin247Data(Base247DataTemplate):
             db.commit()
 
         return count
+
+    def _stored_workout_details(
+        self,
+        db: DbSession,
+        user_id: UUID,
+        records: list[EventRecordCreate],
+        details: list[EventRecordDetailCreate],
+        inserted: set[UUID],
+    ) -> list[EventRecordDetailCreate]:
+        """The details of the workouts this push did not insert, each moved onto the user's stored workout of the
+        same Garmin activity id."""
+        resent = {r.id: r.external_id for r in records if r.category == EventCategory.WORKOUT and r.id not in inserted}
+        if not resent:
+            return []
+        stored = {
+            external_id: record.id
+            for external_id, record in self.event_record_repo.get_by_external_ids(
+                db, user_id, filter(None, resent.values()), self.provider_name
+            ).items()
+            if record.category == EventCategory.WORKOUT
+        }
+        return [
+            d.model_copy(update={"record_id": stored[external_id]})
+            for d in details
+            if (external_id := resent.get(d.record_id)) in stored
+        ]
 
     def _save_night_scores(
         self, db: DbSession, user_id: UUID, night_scores: list[tuple[EventRecordCreate | None, HealthScoreCreate]]
