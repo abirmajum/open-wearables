@@ -166,19 +166,21 @@ uv run pre-commit run --all-files
 `scripts/rumi_fixture_server.py` serves the real v1 API over synthetic Garmin, Ultrahuman and WHOOP data. It needs
 Docker and the dev dependencies (`uv sync --group dev`). It starts its own Postgres and Redis containers, runs the
 seeds in `scripts/rumi_fixture_seeds/` through the real webhook and pull code (for WHOOP also the periodic refresh of
-the cycle still running), and removes the containers when it stops. No request leaves the machine.
+the cycle still running), and removes the containers when it stops, on exit or SIGTERM. Each run has its own
+cleanup container, so several can run at once. No request leaves the machine.
 
 ```bash
 uv run python scripts/rumi_fixture_server.py --today 2026-11-15
 ```
 
-The last line on stdout is one JSON object: `base_url`, `port`, `api_key` and each user's `label`, `id` and
-`providers` (Garmin, Ultrahuman and WHOOP alone, and each pair of them worn by one person). The seeds cover the ten
-days ending on `--today`; pick a recent date, since score look-backs run from the real clock. The day before
+The last line on stdout is one JSON object: `base_url`, `port`, `api_key`, `today`, `now` and each user's `label`,
+`id` and `providers` (Garmin, Ultrahuman and WHOOP alone, and each pair of them worn by one person). The seeds cover
+the ten days ending on `--today`. The server's clock stands still at `now`, 23:59 (+03:00) on `--today`, and seeding
+runs five minutes before it, so two runs at the same commit and `--today` serve byte-identical bodies. The day before
 `--today` carries Garmin's real cadences (heart rate every 15 seconds, stress and Body Battery every 3 minutes,
-respiration and overnight SpO2 every minute, a 15-minute epoch each quarter hour); the other days stay sparse. `--dump-to DIR` writes
-every v1 GET response per user, `--no-serve` exits after that, and `--port` fixes the port. Edit
-`scripts/rumi_fixture_seeds/generate.py` and run it to change the seeds.
+respiration and overnight SpO2 every minute, a 15-minute epoch each quarter hour); the other days stay sparse.
+`--dump-to DIR` writes every v1 GET response per user, `--no-serve` exits after that, and `--port` fixes the port.
+Edit `scripts/rumi_fixture_seeds/generate.py` and run it to change the seeds.
 
 ## Project Structure
 

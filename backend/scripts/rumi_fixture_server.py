@@ -29,7 +29,8 @@ import struct
 import sys
 import time as time_module
 import uuid
-from collections.abc import Callable, Generator
+import warnings
+from collections.abc import Generator
 from contextlib import ExitStack, contextmanager, redirect_stdout
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -44,6 +45,10 @@ GARMIN_CLIENT_ID = "rumi-fixture-garmin-client"
 # Seed epochs fall in this range; durations, offsets and ids are far smaller or far larger.
 EPOCH_RANGE = range(1_500_000_000, 2_500_000_000)
 DUMP_DAYS_BEFORE = 13
+# The server's clock stands still at this time on --today, the moment Rumi's coverage eval freezes its own clock.
+FROZEN_CLOCK = time(23, 59, tzinfo=timezone(timedelta(hours=3)))
+# Seeding runs this long before it, so what a sync stamps with its own time is in the past when the API is read.
+SEEDED_BEFORE = timedelta(minutes=5)
 WHOOP_API = urlsplit("https://api.prod.whoop.com/developer")
 WHOOP_COLLECTIONS = {
     "/v2/activity/sleep": "sleeps",
@@ -226,9 +231,12 @@ def _fit_file(spec: dict[str, Any]) -> bytes:
 # ---------------------------------------------------------------------------
 
 
-def _seeded_uuid4(seed: int) -> Callable[[], uuid.UUID]:
-    rng = random.Random(seed)
-    return lambda: uuid.UUID(int=rng.getrandbits(128), version=4)
+_row_ids = random.Random()
+
+
+def _seed_row_ids(today: date, phase: str) -> None:
+    """Restart the uuid4 sequence for one phase of the run, so one user's seeds never shift another user's ids."""
+    _row_ids.seed(f"{today.isoformat()}:{phase}")
 
 
 def _free_port() -> int:
@@ -534,17 +542,21 @@ def seed(today: date, api_key: str) -> list[str]:
 
     with redirect_stdout(sys.stderr):
         _migrate_and_initialize()
+    _seed_row_ids(today, "users")
     _create_users_and_key(api_key)
     with _ingestion_patches(_offline_http(ultrahuman, whoop, fit_files)) as skipped, TestClient(api) as client:
         for user in users:
+            _seed_row_ids(today, user["label"])
             if user["id"] in garmin:
                 _ingest_garmin(client, garmin[user["id"]][0])
             if user.get("ultrahuman"):
                 _ingest_ultrahuman(user["id"], today, len(ultrahuman[_ultrahuman_token(user)]))
             if user.get("whoop"):
                 _ingest_whoop(user["id"], today, len(whoop[_whoop_token(user)]["recoveries"]))
+        _seed_row_ids(today, "whoop_refresh")
         _whoop_day_goes_on(whoop)
         _refresh_whoop_cycles()
+        _seed_row_ids(today, "post_process")
         _post_process()
     return skipped
 
@@ -668,15 +680,20 @@ def main() -> None:
     parser.add_argument("--no-serve", action="store_true", help="Exit after seeding (and the dump)")
     args = parser.parse_args()
 
+    from freezegun import freeze_time
+
     port = args.port or _free_port()
     signal.signal(signal.SIGTERM, _stop)
 
-    with _containers() as (db_url, redis_host, redis_port):
-        # Deterministic row ids, so a re-run of the same revision serves the same bodies. Seeded only once the
-        # containers run: testcontainers names this process's cleanup container after a uuid4 it draws on import.
-        setattr(uuid, "uuid4", _seeded_uuid4(int(args.today.strftime("%Y%m%d"))))
+    now = datetime.combine(args.today, FROZEN_CLOCK)
+    with ExitStack() as stack:
+        db_url, redis_host, redis_port = stack.enter_context(_containers())
+        # Deterministic row ids and a frozen clock, so a re-run of the same revision serves the same bodies. Ids are
+        # seeded only once the containers run: testcontainers names this process's cleanup container after a uuid4
+        # it draws on import.
+        _seed_row_ids(args.today, "setup")
+        setattr(uuid, "uuid4", lambda: uuid.UUID(int=_row_ids.getrandbits(128), version=4))
         _configure_environment(db_url, redis_host, redis_port, port)
-        skipped = seed(args.today, args.api_key)
 
         import threading
 
@@ -684,6 +701,14 @@ def main() -> None:
 
         from app.main import api
 
+        # Frozen only once the app is imported and its routes built: freezegun swaps each module's datetime, which
+        # pydantic can neither subclass at import nor validate in a lazily read route signature.
+        with warnings.catch_warnings(action="ignore"):
+            api.openapi()
+        clock = stack.enter_context(freeze_time(now - SEEDED_BEFORE, real_asyncio=True))
+        skipped = seed(args.today, args.api_key)
+        clock.move_to(now)
+        _seed_row_ids(args.today, "serve")
         server = uvicorn.Server(uvicorn.Config(api, host="127.0.0.1", port=port, log_level="warning"))
         thread = threading.Thread(target=server.run, daemon=True)
         thread.start()
@@ -702,6 +727,7 @@ def main() -> None:
                     "port": port,
                     "api_key": args.api_key,
                     "today": args.today.isoformat(),
+                    "now": now.isoformat(),
                     "users": users,
                     "skipped_celery_tasks": sorted(set(skipped)),
                 }
