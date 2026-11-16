@@ -7,8 +7,8 @@ and delete the user they created (its data sources, workouts and details cascade
 
 import threading
 import time
-from datetime import datetime, timezone
 from collections.abc import Callable, Generator
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -119,9 +119,11 @@ def _push(garmin: tuple[Garmin247Data, GarminWorkouts], summary_type: str, user_
     return run
 
 
-def _waiting_locks(engine: Engine) -> int:
+def _waiting_locks(engine: Engine, pid: int) -> int:
     with engine.connect() as connection:
-        return connection.execute(text("SELECT count(*) FROM pg_locks WHERE NOT granted")).scalar_one()
+        return connection.execute(
+            text("SELECT count(*) FROM pg_locks WHERE NOT granted AND pid = :pid"), {"pid": pid}
+        ).scalar_one()
 
 
 def _race(engine: Engine, first: Callable[[Session], None], second: Callable[[Session], None]) -> None:
@@ -129,6 +131,7 @@ def _race(engine: Engine, first: Callable[[Session], None], second: Callable[[Se
     finished or waits on a lock."""
     factory = sessionmaker(bind=engine, autoflush=False)
     first_session, second_session = factory(), factory()
+    second_pid = second_session.execute(text("SELECT pg_backend_pid()")).scalar_one()
     at_commit, release = threading.Event(), threading.Event()
     commit = first_session.commit
 
@@ -162,7 +165,7 @@ def _race(engine: Engine, first: Callable[[Session], None], second: Callable[[Se
         assert at_commit.wait(_WAIT_SECONDS), "first push never reached its commit"
         second_thread.start()
         deadline = time.monotonic() + _WAIT_SECONDS
-        while second_thread.is_alive() and not _waiting_locks(engine) and time.monotonic() < deadline:
+        while second_thread.is_alive() and not _waiting_locks(engine, second_pid) and time.monotonic() < deadline:
             time.sleep(0.02)
         release.set()
         first_thread.join(_WAIT_SECONDS)
