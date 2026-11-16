@@ -251,6 +251,16 @@ GARMIN_CLIENT_SECRET=your_client_secret_here
   </Step>
 </Steps>
 
+## How Garmin data is stored
+
+Garmin sends most records in several pushes, in no fixed order. These rules decide what you read back and which webhooks you receive.
+
+- **Workouts.** One Garmin activity is one workout, identified by its activity ID. Its `activities`, `activityDetails` and `activityFiles` (FIT) pushes each fill in some of its fields, and a field a later push leaves out keeps its stored value. The device, type and time span come from the activity summaries, so a workout created from its FIT file takes the summary's span once the summary arrives. Pushes of one activity processed at the same time wait for each other, so they store it once.
+- **`workout.created` for a FIT-first workout.** When the FIT file arrives before the summaries, the workout is created from the file, and its `workout.created` webhook carries only what the file holds: no device, name or summary metrics. No `workout.updated` event follows when the summaries fill it in. Read the workout through the API for its complete fields.
+- **Re-sent nights.** Garmin sends a night again under the same summary ID as it refines it. The re-sent night updates one stored record and its sleep score. If a night was ever stored more than once, the latest copy is updated and the older copies are kept.
+- **Sleep score qualifier.** A later push of a night's score without a qualifier (such as `GOOD`) keeps the stored qualifier.
+- **Intensity minutes.** In the daily activity summary, light intensity minutes are computed from heart rate samples. Moderate and vigorous intensity minutes are Garmin's own values from its daily summary.
+
 # Managin your team
 In the developer portal you can add team members who need access to specifications, internal tools, app credentials, source code, etc. You can manage your team at https://developerportal.garmin.com/teams, or use the Switch company menu (available on most developer portal pages) and select "Manage Company".
 
