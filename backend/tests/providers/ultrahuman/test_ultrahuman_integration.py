@@ -1088,6 +1088,39 @@ class TestUltrahumanScoresIntegration:
         assert {name: values[name] for name in ("sleep_efficiency", "temperature") if name in values} == contributors
 
     @pytest.mark.parametrize(
+        "fields",
+        [
+            {"sleep_cycles": [{"cycle": 1}]},
+            {"sleep_cycles": "4 cycles"},
+            {"quick_metrics": {"time_in_bed": 26400}},
+            {"sleep_stages": ["deep_sleep", None]},
+            {"sleep_graph": {"data": [None, {"start": "late", "end": 1705314000, "type": "deep_sleep"}]}},
+            {"sleep_graph": {"data": {"start": 1705287600}}},
+            {"sleep_efficiency": "high", "quick_metrics": [{"type": "time_in_bed", "value": "7h 20m"}]},
+        ],
+        ids=[
+            "cycles-a-list",
+            "cycles-a-string",
+            "quick-metrics-an-object",
+            "stages-not-objects",
+            "graph-interval-malformed",
+            "graph-data-an-object",
+            "values-not-numbers",
+        ],
+    )
+    def test_a_night_of_an_unexpected_shape_is_kept(
+        self, client: TestClient, db: Session, sample_ultrahuman_api_response: dict, fields: dict[str, Any]
+    ) -> None:
+        response = copy.deepcopy(sample_ultrahuman_api_response)
+        for item in response["data"]["metric_data"]:
+            if item["type"] == "Sleep":
+                item["object"].update(fields)
+
+        user_id = self._sync(db, response)
+
+        assert len(self._sleep_ids(client, user_id)) == 1
+
+    @pytest.mark.parametrize(
         "error",
         [ValueError("event_score_identity_conflict"), IntegrityError("INSERT INTO health_score", {}, Exception())],
         ids=["identity-conflict", "rejected-by-database"],

@@ -37,7 +37,7 @@ from app.services.providers.ultrahuman.coverage import (
 )
 from app.services.raw_payload_storage import store_raw_payload
 from app.services.timeseries_service import timeseries_service
-from app.utils.conversion import as_int, seconds_to_minutes
+from app.utils.conversion import as_float, as_int, seconds_to_minutes
 from app.utils.dates import offset_to_iso
 from app.utils.exceptions import ProviderConnectionError, ProviderError
 from app.utils.structured_logging import get_logger
@@ -247,16 +247,16 @@ class Ultrahuman247Data(Base247DataTemplate):
 
         Ultrahuman returns timestamped stage transitions as
         ``{"start": <unix>, "end": <unix>, "type": "deep_sleep", ...}``. Unknown stage
-        names fall back to ``SleepStageType.UNKNOWN``; intervals missing start/end are skipped.
+        names fall back to ``SleepStageType.UNKNOWN``; intervals without a numeric start and end are skipped.
         """
-        graph = raw_sleep.get("sleep_graph") or {}
-        intervals = graph.get("data", []) if isinstance(graph, dict) else []
+        graph = raw_sleep.get("sleep_graph")
+        intervals = _dicts(graph.get("data")) if isinstance(graph, dict) else []
 
         stages: list[SleepStage] = []
         for interval in intervals:
             start_ts = interval.get("start")
             end_ts = interval.get("end")
-            if start_ts is None or end_ts is None:
+            if not _is_number(start_ts) or not _is_number(end_ts):
                 continue
             stages.append(
                 SleepStage(
@@ -289,14 +289,14 @@ class Ultrahuman247Data(Base247DataTemplate):
 
         # Extract durations from quick_metrics
         # "quick_metrics": [{"type": "time_in_bed", "value": 27000}, ...]
-        quick_metrics = {m.get("type"): m.get("value", 0) for m in raw_sleep.get("quick_metrics", [])}
+        quick_metrics = {m.get("type"): m.get("value", 0) for m in _dicts(raw_sleep.get("quick_metrics"))}
 
         # Values are typically in seconds
-        time_in_bed_seconds = quick_metrics.get("time_in_bed", 0) or 0
+        time_in_bed_seconds = as_int(quick_metrics.get("time_in_bed")) or 0
 
         # Extract sleep stages from sleep_stages array
         # "sleep_stages": [{"type": "deep_sleep", "stage_time": 3240}, ...]
-        sleep_stages = {s.get("type"): s.get("stage_time") for s in raw_sleep.get("sleep_stages", [])}
+        sleep_stages = {s.get("type"): s.get("stage_time") for s in _dicts(raw_sleep.get("sleep_stages"))}
         deep_seconds = as_int(sleep_stages.get("deep_sleep"))
         rem_seconds = as_int(sleep_stages.get("rem_sleep"))
         light_seconds = as_int(sleep_stages.get("light_sleep"))
@@ -317,7 +317,7 @@ class Ultrahuman247Data(Base247DataTemplate):
             "start_time": start_dt,
             "end_time": end_dt,
             "duration_seconds": time_in_bed_seconds,
-            "efficiency_percent": float(efficiency) if efficiency is not None else None,
+            "efficiency_percent": as_float(efficiency),
             "is_nap": False,  # Ultrahuman doesn't explicitly mark naps in this structure
             "stages": {
                 "deep_seconds": deep_seconds,
@@ -413,7 +413,8 @@ class Ultrahuman247Data(Base247DataTemplate):
         Ultrahuman publishes no schema for these lists, so an item of an unexpected shape is skipped."""
         raw_sleep = items_by_type["Sleep"]
         quick_metrics = {m.get("type"): m.get("value") for m in _dicts(raw_sleep.get("quick_metrics"))}
-        cycles = (raw_sleep.get("sleep_cycles") or {}).get("cycles")
+        sleep_cycles = raw_sleep.get("sleep_cycles")
+        cycles = sleep_cycles.get("cycles") if isinstance(sleep_cycles, dict) else None
         readings = {
             "avg_heart_rate": quick_metrics.get("avg_hr"),
             "avg_hrv": quick_metrics.get("avg_hrv"),
