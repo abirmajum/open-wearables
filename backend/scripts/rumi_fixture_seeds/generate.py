@@ -1,9 +1,9 @@
-"""Write the synthetic Garmin and Ultrahuman seeds that ``scripts/rumi_fixture_server.py`` replays.
+"""Write the synthetic Garmin, Ultrahuman and WHOOP seeds that ``scripts/rumi_fixture_server.py`` replays.
 
 The seeds are dated around ``ANCHOR_DATE``; the server shifts every timestamp and date by whole days so the last
 seeded day lands on its ``--today``. All values are invented. Field names follow Garmin's Health and Activity API
-push payloads and Ultrahuman's ``/user_data/metrics`` response, including fields Open Wearables does not read, so a
-dump of the API shows what is dropped.
+push payloads, Ultrahuman's ``/user_data/metrics`` response and WHOOP's v2 collections, including fields Open
+Wearables does not read, so a dump of the API shows what is dropped.
 
 Usage (from ``backend/``)::
 
@@ -11,6 +11,7 @@ Usage (from ``backend/``)::
 """
 
 import json
+import uuid
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,9 @@ GARMIN_USER_ID = "GARMIN_USER_ID"  # replaced per fixture user by the server
 # UTC date.
 ULTRAHUMAN_ZONES = {"+04:00": 4 * 3600}
 FIT_CALLBACK_URL = "https://apis.garmin.com/wellness-api/rest/activityFile?id={activity_id}&token=fixture"
+WHOOP_USER_ID = "WHOOP_USER_ID"  # replaced per fixture user by the server, with an integer as WHOOP sends
+# A WHOOP account per zone, matching the device it is paired with: Garmin's +01:00, Ultrahuman's UTC, and +03:00 alone.
+WHOOP_ZONES = {"+03:00": 3 * 3600, "+01:00": GARMIN_OFFSET, "+00:00": 0}
 
 
 def _days() -> list[tuple[int, date]]:
@@ -828,8 +832,272 @@ def ultrahuman_seed() -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# WHOOP
+# ---------------------------------------------------------------------------
+
+
+def _whoop_time(day: date, hour: float, offset: int) -> str:
+    """A local wall-clock hour as WHOOP writes instants: UTC, milliseconds, ``Z``."""
+    instant = datetime.fromtimestamp(_epoch(day, hour, offset), tz=timezone.utc)
+    return instant.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def _whoop_id(zone: str, kind: str, n: int) -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"rumi-fixture:whoop:{zone}:{kind}:{n}"))
+
+
+def _whoop_night(i: int, day: date) -> tuple[float, float]:
+    """Sleep onset (hours from local midnight of the evening before ``day``) and wake (hours into ``day``)."""
+    return 22.75 + ((i * 7) % 5) * 0.1, 6.4 + ((i * 3) % 4) * 0.1
+
+
+def _whoop_sleep(i: int, day: date, zone: str, offset: int) -> dict[str, Any]:
+    onset, wake = _whoop_night(i, day)
+    in_bed = round((24 - onset + wake) * 3_600_000)
+    awake, deep, rem = 1_680_000 + i * 30_000, 5_700_000 + (i % 4) * 180_000, 6_000_000 - (i % 3) * 240_000
+    end = _whoop_time(day, wake, offset)
+    return {
+        "id": _whoop_id(zone, "sleep", i),
+        "cycle_id": _whoop_cycle_id(zone, i),
+        "user_id": WHOOP_USER_ID,
+        "created_at": end,
+        "updated_at": end,
+        "start": _whoop_time(day - timedelta(days=1), onset, offset),
+        "end": end,
+        "timezone_offset": zone,
+        "nap": False,
+        "score_state": "SCORED",
+        "score": {
+            "stage_summary": {
+                "total_in_bed_time_milli": in_bed,
+                "total_awake_time_milli": awake,
+                "total_no_data_time_milli": 0,
+                "total_light_sleep_time_milli": in_bed - awake - deep - rem,
+                "total_slow_wave_sleep_time_milli": deep,
+                "total_rem_sleep_time_milli": rem,
+                "sleep_cycle_count": 4 + i % 2,
+                "disturbance_count": 8 + (i * 5) % 7,
+            },
+            "sleep_needed": {
+                "baseline_milli": 27_900_000,
+                "need_from_sleep_debt_milli": 900_000 + (i % 3) * 600_000,
+                "need_from_recent_strain_milli": 420_000 + (i % 4) * 150_000,
+                # The night after the nap: WHOOP takes the nap off what the night needs
+                "need_from_recent_nap_milli": -1_920_000 if i == DAYS - 2 else 0,
+            },
+            "respiratory_rate": round(_wave(i, 14.6, 0.6), 1),
+            "sleep_performance_percentage": int(_wave(i, 84, 12)),
+            "sleep_consistency_percentage": int(_wave(i, 78, 8)),
+            "sleep_efficiency_percentage": round((in_bed - awake) * 100 / in_bed, 2),
+        },
+    }
+
+
+def _whoop_nap(i: int, day: date, zone: str, offset: int) -> dict[str, Any]:
+    in_bed, awake = 1_920_000, 240_000
+    end = _whoop_time(day, 14.7, offset)
+    return {
+        "id": _whoop_id(zone, "nap", i),
+        "cycle_id": _whoop_cycle_id(zone, i),
+        "user_id": WHOOP_USER_ID,
+        "created_at": end,
+        "updated_at": end,
+        "start": _whoop_time(day, 14.7 - in_bed / 3_600_000, offset),
+        "end": end,
+        "timezone_offset": zone,
+        "nap": True,
+        "score_state": "SCORED",
+        "score": {
+            "stage_summary": {
+                "total_in_bed_time_milli": in_bed,
+                "total_awake_time_milli": awake,
+                "total_no_data_time_milli": 0,
+                "total_light_sleep_time_milli": 1_260_000,
+                "total_slow_wave_sleep_time_milli": 420_000,
+                "total_rem_sleep_time_milli": 0,
+                "sleep_cycle_count": 0,
+                "disturbance_count": 1,
+            },
+            "sleep_needed": {
+                "baseline_milli": 0,
+                "need_from_sleep_debt_milli": 0,
+                "need_from_recent_strain_milli": 0,
+                "need_from_recent_nap_milli": 0,
+            },
+            "respiratory_rate": 14.9,
+            "sleep_performance_percentage": None,
+            "sleep_consistency_percentage": None,
+            "sleep_efficiency_percentage": round((in_bed - awake) * 100 / in_bed, 2),
+        },
+    }
+
+
+def _whoop_cycle_id(zone: str, i: int) -> int:
+    return 1_100_000 + list(WHOOP_ZONES).index(zone) * 100 + i
+
+
+def _whoop_cycle(i: int, day: date, zone: str, offset: int, revision: int = 0) -> dict[str, Any]:
+    """The cycle that opens with the night ending on ``day``; the last one is still running. ``revision`` 1 is
+    the running cycle WHOOP reports later in the day."""
+    onset, _ = _whoop_night(i, day)
+    running = i == DAYS - 1
+    if running:
+        updated_hour, strain, kilojoule, steps, avg_hr, max_hr = (
+            (20.5, 9.8, 7_900.4, 9_120, 69, 162) if revision else (10.0, 6.1, 4_102.7, 4_210, 71, 128)
+        )
+        updated_at, end = _whoop_time(day, updated_hour, offset), None
+    else:
+        next_onset, _ = _whoop_night(i + 1, day + timedelta(days=1))
+        end = _whoop_time(day, next_onset, offset)
+        updated_at = _whoop_time(day + timedelta(days=1), 7.0, offset)
+        strain, kilojoule = round(_wave(i, 11.8, 4.2), 1), round(_wave(i, 9_840.0, 1_400.0), 1)
+        steps, avg_hr, max_hr = int(_wave(i, 9_400, 2_600)), int(_wave(i, 68, 4)), int(_wave(i, 166, 10))
+    return {
+        "id": _whoop_cycle_id(zone, i),
+        "user_id": WHOOP_USER_ID,
+        "created_at": _whoop_time(day - timedelta(days=1), onset, offset),
+        "updated_at": updated_at,
+        "start": _whoop_time(day - timedelta(days=1), onset, offset),
+        "end": end,
+        "timezone_offset": zone,
+        "score_state": "SCORED",
+        "step_count": steps,
+        "score": {"strain": strain, "kilojoule": kilojoule, "average_heart_rate": avg_hr, "max_heart_rate": max_hr},
+    }
+
+
+def _whoop_recovery(i: int, day: date, zone: str, offset: int) -> dict[str, Any]:
+    _, wake = _whoop_night(i, day)
+    scored = _whoop_time(day, wake + 0.25, offset)
+    return {
+        "cycle_id": _whoop_cycle_id(zone, i),
+        "sleep_id": _whoop_id(zone, "sleep", i),
+        "user_id": WHOOP_USER_ID,
+        "created_at": scored,
+        "updated_at": scored,
+        "score_state": "SCORED",
+        "score": {
+            "user_calibrating": False,
+            "recovery_score": int(_wave(i, 61, 27)),
+            "resting_heart_rate": int(_wave(i, 54, 4)),
+            "hrv_rmssd_milli": round(_wave(i, 58.4, 12.0) + 0.137, 3),
+            "spo2_percentage": round(_wave(i, 95.8, 1.2) + 0.04, 2),
+            "skin_temp_celsius": round(_wave(i, 33.6, 0.5) + 0.03, 2),
+        },
+    }
+
+
+# (day index, local start hour, minutes, sport_name, sport_id, score); zone_durations are milliseconds from zone 0 up.
+_WHOOP_WORKOUTS: tuple[tuple[int, float, int, str, int, dict[str, Any]], ...] = (
+    # Garmin records the same run: its activity starts at 07:30 the same morning
+    (
+        DAYS - 2,
+        7.52,
+        48,
+        "running",
+        0,
+        {
+            "strain": 12.4,
+            "average_heart_rate": 151,
+            "max_heart_rate": 173,
+            "kilojoule": 2_590.2,
+            "percent_recorded": 100,
+            "distance_meter": None,
+            "altitude_gain_meter": None,
+            "altitude_change_meter": None,
+            "zones": (30_000, 120_000, 540_000, 1_260_000, 870_000, 60_000),
+        },
+    ),
+    (
+        DAYS - 4,
+        7.0,
+        55,
+        "cycling",
+        1,
+        {
+            "strain": 13.1,
+            "average_heart_rate": 142,
+            "max_heart_rate": 168,
+            "kilojoule": 3_020.6,
+            "percent_recorded": 100,
+            # Distance only arrives when the ride was recorded in the WHOOP app with location
+            "distance_meter": 24_150.0,
+            "altitude_gain_meter": 186.4,
+            "altitude_change_meter": 4.2,
+            "zones": (60_000, 300_000, 1_140_000, 1_380_000, 420_000, 0),
+        },
+    ),
+    (
+        DAYS - 7,
+        17.67,
+        65,
+        "weightlifting",
+        45,
+        {
+            "strain": 8.9,
+            "average_heart_rate": 118,
+            "max_heart_rate": 152,
+            "kilojoule": 1_460.3,
+            "percent_recorded": 98.5,
+            "distance_meter": None,
+            "altitude_gain_meter": None,
+            "altitude_change_meter": None,
+            "zones": (600_000, 1_500_000, 1_200_000, 480_000, 120_000, 0),
+        },
+    ),
+)
+_WHOOP_ZONE_KEYS = ("zero", "one", "two", "three", "four", "five")
+
+
+def _whoop_workout(n: int, zone: str, offset: int) -> dict[str, Any]:
+    i, hour, minutes, sport, sport_id, score = _WHOOP_WORKOUTS[n]
+    day = _days()[i][1]
+    end = _whoop_time(day, hour + minutes / 60, offset)
+    assert sum(score["zones"]) == minutes * 60_000
+    return {
+        "id": _whoop_id(zone, "workout", n),
+        "user_id": WHOOP_USER_ID,
+        "created_at": _whoop_time(day, hour + minutes / 60 + 0.1, offset),
+        "updated_at": _whoop_time(day, hour + minutes / 60 + 0.1, offset),
+        "start": _whoop_time(day, hour, offset),
+        "end": end,
+        "timezone_offset": zone,
+        "sport_name": sport,
+        "sport_id": sport_id,
+        "score_state": "SCORED",
+        "score": {
+            **{k: v for k, v in score.items() if k != "zones"},
+            "zone_durations": {f"zone_{k}_milli": v for k, v in zip(_WHOOP_ZONE_KEYS, score["zones"], strict=True)},
+        },
+    }
+
+
+def whoop_seed() -> dict[str, Any]:
+    """Each zone's WHOOP account: one zone per fixture user, so their nights line up with their other device."""
+
+    def account(zone: str, offset: int) -> dict[str, Any]:
+        days = _days()
+        nap_index = DAYS - 3
+        return {
+            "sleeps": [_whoop_sleep(i, d, zone, offset) for i, d in days]
+            + [_whoop_nap(nap_index, days[nap_index][1], zone, offset)],
+            "recoveries": [_whoop_recovery(i, d, zone, offset) for i, d in days],
+            "cycles": [_whoop_cycle(i, d, zone, offset) for i, d in days],
+            "cycles_refreshed": [_whoop_cycle(DAYS - 1, days[-1][1], zone, offset, revision=1)],
+            "workouts": [_whoop_workout(n, zone, offset) for n in range(len(_WHOOP_WORKOUTS))],
+            "body_measurement": {"height_meter": 1.78, "weight_kilogram": 76.2, "max_heart_rate": 191},
+        }
+
+    return {
+        "anchor_date": ANCHOR_DATE.isoformat(),
+        "user_id_placeholder": WHOOP_USER_ID,
+        "accounts": {zone: account(zone, offset) for zone, offset in WHOOP_ZONES.items()},
+    }
+
+
 def main() -> None:
-    for name, seed in (("garmin", garmin_seed()), ("ultrahuman", ultrahuman_seed())):
+    for name, seed in (("garmin", garmin_seed()), ("ultrahuman", ultrahuman_seed()), ("whoop", whoop_seed())):
         path = SEEDS_DIR / f"{name}.json"
         path.write_text(json.dumps(seed, indent=1, ensure_ascii=False) + "\n")
         print(f"wrote {path.relative_to(SEEDS_DIR.parent.parent)}")

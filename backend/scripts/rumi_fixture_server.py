@@ -1,4 +1,4 @@
-"""Serve Open Wearables' v1 API over synthetic Garmin and Ultrahuman data, for recording Rumi's coverage eval.
+"""Serve Open Wearables' v1 API over synthetic Garmin, Ultrahuman and WHOOP data, for recording Rumi's coverage eval.
 
 Starts a disposable Postgres and Redis (testcontainers), migrates the database like a deployment does, then runs
 the seeds in ``scripts/rumi_fixture_seeds/`` through the real ingestion code:
@@ -7,6 +7,8 @@ the seeds in ``scripts/rumi_fixture_seeds/`` through the real ingestion code:
   runs inline. The FIT file an ``activityFiles`` push points at is served at the HTTP boundary.
 - Ultrahuman: the ``sync_vendor_data`` task pulls every seeded day; the partner API is answered at the HTTP
   boundary from the seeds.
+- WHOOP: ``sync_vendor_data`` pulls the seeded days the same way, then the periodic ``refresh_recent_cycles`` task
+  picks up a later revision of the cycle still running today.
 
 It then runs the post-processing production runs on a schedule (sleep and resilience scores, the day rollup),
 prints one JSON line with the port, API key and users, and serves until killed. Nothing leaves this machine: any
@@ -32,6 +34,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
+from urllib.parse import urlsplit
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 SEEDS_DIR = BACKEND_DIR / "scripts" / "rumi_fixture_seeds"
@@ -40,6 +43,13 @@ GARMIN_CLIENT_ID = "rumi-fixture-garmin-client"
 # Seed epochs fall in this range; durations, offsets and ids are far smaller or far larger.
 EPOCH_RANGE = range(1_500_000_000, 2_500_000_000)
 DUMP_DAYS_BEFORE = 13
+WHOOP_API = urlsplit("https://api.prod.whoop.com/developer")
+WHOOP_COLLECTIONS = {
+    "/v2/activity/sleep": "sleeps",
+    "/v2/recovery": "recoveries",
+    "/v2/cycle": "cycles",
+    "/v2/activity/workout": "workouts",
+}
 
 
 def _users() -> list[dict[str, Any]]:
@@ -59,12 +69,35 @@ def _users() -> list[dict[str, Any]]:
             "ultrahuman": True,
             "ultrahuman_zone": "+04:00",
         },
+        {"label": "whoop", "id": "5eed0000-0000-4000-8000-000000000005", "whoop": 50000005, "whoop_zone": "+03:00"},
+        {
+            "label": "whoop_and_garmin",
+            "id": "5eed0000-0000-4000-8000-000000000006",
+            "garmin": "fixture-garmin-6",
+            "whoop": 50000006,
+            "whoop_zone": "+01:00",
+        },
+        {
+            "label": "whoop_and_ultrahuman",
+            "id": "5eed0000-0000-4000-8000-000000000007",
+            "ultrahuman": True,
+            "whoop": 50000007,
+            "whoop_zone": "+00:00",
+        },
     ]
+
+
+PROVIDERS = ("garmin", "ultrahuman", "whoop")
 
 
 def _ultrahuman_token(user: dict[str, Any]) -> str:
     """The user's Ultrahuman access token, which tells the offline API whose responses to answer with."""
     return f"rumi-fixture-ultrahuman-{user.get('ultrahuman_zone', '+00:00')}"
+
+
+def _whoop_token(user: dict[str, Any]) -> str:
+    """The user's WHOOP access token, which tells the offline API whose account to answer with."""
+    return f"rumi-fixture-whoop-{user['whoop']}"
 
 
 # ---------------------------------------------------------------------------
@@ -82,9 +115,15 @@ def _shift(value: Any, days: int) -> Any:
         return value
     if isinstance(value, int) and value in EPOCH_RANGE:
         return value + days * 86400
-    if isinstance(value, str) and len(value) == 10 and value[4] == "-" and value[7] == "-":
+    if (
+        isinstance(value, str)
+        and len(value) >= 10
+        and value[4] == "-"
+        and value[7] == "-"
+        and value[10:11] in ("", "T")
+    ):
         try:
-            return (date.fromisoformat(value) + timedelta(days=days)).isoformat()
+            return (date.fromisoformat(value[:10]) + timedelta(days=days)).isoformat() + value[10:]
         except ValueError:
             return value
     return value
@@ -112,6 +151,19 @@ def _ultrahuman_responses(today: date) -> dict[str, dict[str, dict[str, Any]]]:
         }
         for zone, responses in {"+00:00": seed["responses"], **seed["responses_by_zone"]}.items()
     }
+
+
+def _whoop_accounts(today: date) -> dict[str, dict[str, Any]]:
+    """Each WHOOP user's account by access token: the zone's seed under the user's own WHOOP id."""
+    seed, days = _load_seed("whoop", today)
+    accounts = {}
+    for user in _users():
+        if whoop_id := user.get("whoop"):
+            raw = json.dumps(seed["accounts"][user["whoop_zone"]]).replace(
+                f'"{seed["user_id_placeholder"]}"', str(whoop_id)
+            )
+            accounts[_whoop_token(user)] = _shift(json.loads(raw), days)
+    return accounts
 
 
 def _fit_file(spec: dict[str, Any]) -> bytes:
@@ -217,19 +269,55 @@ def _containers() -> Generator[tuple[Any, str, int]]:
         )
 
 
-def _offline_http(ultrahuman: dict[str, dict[str, dict[str, Any]]], fit_files: dict[str, bytes]) -> Any:
-    """An httpx transport that answers the seeded provider requests and fails every other one; an Ultrahuman
-    request gets the responses of its access token."""
+def _whoop_page(account: dict[str, Any], collection: str, params: Any) -> dict[str, Any]:
+    """One page of a WHOOP v2 collection: records overlapping ``start``..``end``, newest first. A recovery spans
+    its cycle."""
+    cycles = {cycle["id"]: cycle for cycle in account["cycles"]}
+
+    start, end = datetime.fromisoformat(params["start"]), datetime.fromisoformat(params["end"])
+
+    def begins(record: dict[str, Any]) -> datetime:
+        return datetime.fromisoformat((cycles[record["cycle_id"]] if collection == "recoveries" else record)["start"])
+
+    def overlaps(record: dict[str, Any]) -> bool:
+        ends = (cycles[record["cycle_id"]] if collection == "recoveries" else record)["end"]
+        return begins(record) < end and (ends is None or datetime.fromisoformat(ends) > start)
+
+    matching = sorted(filter(overlaps, account[collection]), key=begins, reverse=True)
+    offset, limit = int(params.get("nextToken", 0)), int(params["limit"])
+    more = offset + limit < len(matching)
+    return {"records": matching[offset : offset + limit], "next_token": str(offset + limit) if more else None}
+
+
+def _whoop_day_goes_on(accounts: dict[str, dict[str, Any]]) -> None:
+    """WHOOP's later revision of each account's running cycle replaces the one the pull saw."""
+    for account in accounts.values():
+        revised = {cycle["id"]: cycle for cycle in account["cycles_refreshed"]}
+        account["cycles"] = [revised.get(cycle["id"], cycle) for cycle in account["cycles"]]
+
+
+def _offline_http(
+    ultrahuman: dict[str, dict[str, dict[str, Any]]], whoop: dict[str, dict[str, Any]], fit_files: dict[str, bytes]
+) -> Any:
+    """An httpx transport that answers the seeded provider requests and fails every other one; an Ultrahuman or
+    WHOOP request gets the responses of its access token."""
     import httpx
 
     def handle(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
+        token = request.headers.get("Authorization", "").removeprefix("Bearer ")
         if url in fit_files:
             return httpx.Response(200, content=fit_files[url])
         if request.url.path.endswith("/user_data/metrics"):
             day = request.url.params.get("date", "")
-            responses = ultrahuman[request.headers.get("Authorization", "").removeprefix("Bearer ")]
+            responses = ultrahuman[token]
             return httpx.Response(200, json=responses.get(day, {"data": {"metric_data": []}, "status": 200}))
+        if request.url.host == WHOOP_API.hostname and token in whoop:
+            path = request.url.path.removeprefix(WHOOP_API.path)
+            if path == "/v2/user/measurement/body":
+                return httpx.Response(200, json=whoop[token]["body_measurement"])
+            if collection := WHOOP_COLLECTIONS.get(path):
+                return httpx.Response(200, json=_whoop_page(whoop[token], collection, request.url.params))
         raise httpx.ConnectError(f"rumi fixture server: no outbound requests ({request.method} {url})")
 
     return httpx.MockTransport(handle)
@@ -302,6 +390,7 @@ def _migrate_and_initialize() -> None:
 
 
 def _create_users_and_key(api_key: str) -> None:
+    from app.config import settings
     from app.database import SessionLocal
     from app.repositories.user_connection_repository import UserConnectionRepository
     from app.schemas.model_crud.credentials import ApiKeyCreate
@@ -343,6 +432,19 @@ def _create_users_and_key(api_key: str) -> None:
                         scope="ring_data cgm_data profile",
                     ),
                 )
+            if whoop_id := user.get("whoop"):
+                connections.create(
+                    db,
+                    UserConnectionCreate(
+                        user_id=uuid.UUID(user["id"]),
+                        provider="whoop",
+                        provider_user_id=str(whoop_id),
+                        access_token=_whoop_token(user),
+                        refresh_token="rumi-fixture-whoop-refresh",
+                        token_expires_at=datetime.now(timezone.utc) + timedelta(days=3650),
+                        scope=settings.whoop_default_scope,
+                    ),
+                )
         db.commit()
 
 
@@ -362,6 +464,23 @@ def _ingest_ultrahuman(user_id: str, today: date, days: int) -> None:
     start = datetime.combine(today - timedelta(days=days - 1), time(), tzinfo=timezone.utc)
     end = datetime.combine(today, time(23, 59), tzinfo=timezone.utc)
     sync_vendor_data(user_id, start.isoformat(), end.isoformat(), providers=["ultrahuman"])
+
+
+def _ingest_whoop(user_id: str, today: date, days: int) -> None:
+    """A pull from the UTC midnight before the first seeded night's onset up to now."""
+    from app.integrations.celery.tasks.sync_vendor_data_task import sync_vendor_data
+
+    start = datetime.combine(today - timedelta(days=days), time(), tzinfo=timezone.utc)
+    sync_vendor_data(user_id, start.isoformat(), providers=["whoop"])
+
+
+def _refresh_whoop_cycles() -> None:
+    """The periodic refresh of recent WHOOP cycles, with the pulls it queues run inline."""
+    from app.integrations.celery.tasks.periodic_sync_task import refresh_recent_cycles
+    from app.integrations.celery.tasks.sync_vendor_data_task import sync_vendor_data
+
+    with patch.object(sync_vendor_data, "delay", lambda **kwargs: sync_vendor_data(**kwargs)):
+        refresh_recent_cycles()
 
 
 def _post_process() -> None:
@@ -390,18 +509,23 @@ def seed(today: date, api_key: str) -> list[str]:
         _ultrahuman_token({"ultrahuman_zone": zone}): responses
         for zone, responses in _ultrahuman_responses(today).items()
     }
+    whoop = _whoop_accounts(today)
     garmin = {user["id"]: _garmin_pushes(today, user["garmin"]) for user in users if user.get("garmin")}
     fit_files = {url: _fit_file(spec) for _, specs in garmin.values() for url, spec in specs.items()}
 
     with redirect_stdout(sys.stderr):
         _migrate_and_initialize()
     _create_users_and_key(api_key)
-    with _ingestion_patches(_offline_http(ultrahuman, fit_files)) as skipped, TestClient(api) as client:
+    with _ingestion_patches(_offline_http(ultrahuman, whoop, fit_files)) as skipped, TestClient(api) as client:
         for user in users:
             if user["id"] in garmin:
                 _ingest_garmin(client, garmin[user["id"]][0])
             if user.get("ultrahuman"):
                 _ingest_ultrahuman(user["id"], today, len(ultrahuman[_ultrahuman_token(user)]))
+            if user.get("whoop"):
+                _ingest_whoop(user["id"], today, len(whoop[_whoop_token(user)]["recoveries"]))
+        _whoop_day_goes_on(whoop)
+        _refresh_whoop_cycles()
         _post_process()
     return skipped
 
@@ -474,7 +598,7 @@ def dump(base_url: str, api_key: str, today: date, out: Path) -> None:
                     {"start_date": start, "end_date": end, "limit": 100, "offset": 0},
                 ),
             }
-            for provider in ("garmin", "ultrahuman"):
+            for provider in PROVIDERS:
                 requests[f"summaries_recovery_{provider}"] = (
                     f"{base}/summaries/recovery",
                     {**span, "provider": provider},
@@ -550,8 +674,7 @@ def main() -> None:
         if args.dump_to:
             dump(base_url, args.api_key, args.today, args.dump_to.resolve())
         users = [
-            {"label": u["label"], "id": u["id"], "providers": [p for p in ("garmin", "ultrahuman") if u.get(p)]}
-            for u in _users()
+            {"label": u["label"], "id": u["id"], "providers": [p for p in PROVIDERS if u.get(p)]} for u in _users()
         ]
         print(
             json.dumps(
