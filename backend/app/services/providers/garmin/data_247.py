@@ -8,6 +8,7 @@ from uuid import UUID, uuid4
 
 from redis.exceptions import RedisError
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
 from app.config import settings
 from app.constants.sleep import SleepStageType
@@ -2086,11 +2087,27 @@ class Garmin247Data(Base247DataTemplate):
                     all_records.append(record)
                     all_sleep_details.append(detail)
                     continue
-                # Copies an earlier push left when it moved the night's span; one may hold the span sent now
-                for stale in versions[1:]:
-                    db.delete(stale)
-                db.flush()
-                event_record_service.refresh_sleep(db, user_id, versions[0], record, detail)
+                if len(versions) > 1:
+                    logger.warning(
+                        "Garmin night stored more than once, updating the latest",
+                        provider="garmin",
+                        user_id=str(user_id),
+                        summary_id=summary_id,
+                        record_ids=[str(version.id) for version in versions],
+                    )
+                try:
+                    with db.begin_nested():
+                        event_record_service.refresh_sleep(db, user_id, versions[0], record, detail)
+                except IntegrityError as e:
+                    logger.warning(
+                        "Re-sent Garmin night not updated, another record holds its span",
+                        provider="garmin",
+                        user_id=str(user_id),
+                        summary_id=summary_id,
+                        record_id=str(versions[0].id),
+                        error=str(e),
+                    )
+                    continue
                 count += WriteCounts(0, 1)
 
         # Single bulk insert for SeriesSample

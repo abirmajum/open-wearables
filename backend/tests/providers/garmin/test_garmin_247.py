@@ -1411,22 +1411,55 @@ class TestGarmin247Data:
             (night.id, Decimal("86"), night.end_datetime)
         ]
 
-    def test_a_re_sent_night_folds_the_copies_an_earlier_push_left(
+    def _store_a_second_copy(self, garmin_247: Garmin247Data, db: Session, user_id: UUID) -> None:
+        """What the time-keyed insert used to leave behind when Garmin moved the night's end."""
+        garmin_247.process_items_batch(db, user_id, "sleeps", [_SCORED_NIGHT])
+        with patch.object(garmin_247.event_record_repo, "get_main_sleeps_by_external_ids", return_value={}):
+            garmin_247.process_items_batch(db, user_id, "sleeps", [{**_SCORED_NIGHT, "durationInSeconds": 30600}])
+
+    @staticmethod
+    def _night_ends(db: Session) -> list[datetime]:
+        db.expire_all()
+        return sorted(r.end_datetime for r in db.query(EventRecord).filter(EventRecord.external_id == "sleep_scored"))
+
+    def test_a_night_stored_twice_updates_its_latest_copy_and_leaves_the_other(
         self, garmin_247: Garmin247Data, db: Session
     ) -> None:
         user = UserFactory()
-        garmin_247.process_items_batch(db, user.id, "sleeps", [_SCORED_NIGHT])
-        # What the time-keyed insert used to leave behind when Garmin moved the night's end
-        with patch.object(garmin_247.event_record_repo, "get_main_sleeps_by_external_ids", return_value={}):
-            garmin_247.process_items_batch(db, user.id, "sleeps", [{**_SCORED_NIGHT, "durationInSeconds": 30600}])
-        assert db.query(EventRecord).filter(EventRecord.external_id == "sleep_scored").count() == 2
+        self._store_a_second_copy(garmin_247, db, user.id)
 
-        garmin_247.process_items_batch(db, user.id, "sleeps", [_SCORED_NIGHT])
+        garmin_247.process_items_batch(db, user.id, "sleeps", [{**_SCORED_NIGHT, "durationInSeconds": 32400}])
 
-        db.expire_all()
-        night = db.query(EventRecord).filter(EventRecord.external_id == "sleep_scored").one()
-        assert night.end_datetime == datetime(2024, 1, 15, 6, tzinfo=timezone.utc)
-        assert [s.event_record_id for s in self._scores(db, user.id, HealthScoreCategory.SLEEP)] == [night.id]
+        assert self._night_ends(db) == [
+            datetime(2024, 1, 15, 6, tzinfo=timezone.utc),
+            datetime(2024, 1, 15, 7, tzinfo=timezone.utc),
+        ]
+
+    def test_a_re_sent_night_whose_span_another_copy_holds_does_not_stop_the_push(
+        self, garmin_247: Garmin247Data, db: Session
+    ) -> None:
+        user = UserFactory()
+        self._store_a_second_copy(garmin_247, db, user.id)
+        next_night = {**_SCORED_NIGHT, "summaryId": "sleep_next", "startTimeInSeconds": 1705356000}
+
+        garmin_247.process_items_batch(db, user.id, "sleeps", [_SCORED_NIGHT, next_night])
+
+        assert self._night_ends(db) == [
+            datetime(2024, 1, 15, 6, tzinfo=timezone.utc),
+            datetime(2024, 1, 15, 6, 30, tzinfo=timezone.utc),
+        ]
+        assert db.query(EventRecord).filter(EventRecord.external_id == "sleep_next").count() == 1
+
+    def test_a_re_sent_night_queues_the_days_it_left_and_joined(self, garmin_247: Garmin247Data, db: Session) -> None:
+        user = UserFactory()
+        garmin_247.process_items_batch(db, user.id, "sleeps", [_SCORED_NIGHT])
+        a_day_later = {**_SCORED_NIGHT, "startTimeInSeconds": _SCORED_NIGHT["startTimeInSeconds"] + 86400}
+
+        with patch("app.services.event_record_service.mark_dirty_days") as mark_dirty_days:
+            garmin_247.process_items_batch(db, user.id, "sleeps", [a_day_later])
+
+        queued = {day for call in mark_dirty_days.call_args_list for _, day in call.args[1]}
+        assert {date(2024, 1, 14), date(2024, 1, 15), date(2024, 1, 16)} <= queued
 
     def test_a_re_sent_night_keeps_its_nap_apart(self, garmin_247: Garmin247Data, db: Session) -> None:
         user = UserFactory()
