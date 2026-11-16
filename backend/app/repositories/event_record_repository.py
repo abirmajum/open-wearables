@@ -1,5 +1,5 @@
 import contextlib
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from uuid import UUID
@@ -60,6 +60,16 @@ from app.schemas.model_crud.activities import (
 from app.schemas.sync_status import DataTypeKind
 from app.utils.dates import local_date
 from app.utils.pagination import decode_cursor
+
+# PostgreSQL's limit on bind parameters in one statement
+_MAX_BIND_PARAMS = 65_535
+
+
+def _param_chunks[T](rows: list[T], columns: int) -> Iterator[list[T]]:
+    """``rows`` in slices whose ``columns`` bound parameters per row stay under PostgreSQL's limit."""
+    size = _MAX_BIND_PARAMS // columns
+    for i in range(0, len(rows), size):
+        yield rows[i : i + size]
 
 
 def _nap_condition(is_nap: bool) -> ColumnElement[bool]:
@@ -405,12 +415,8 @@ class EventRecordRepository(
         if not values_list:
             return []
 
-        # Batch insert with ON CONFLICT DO NOTHING
-        # Chunk to stay under PostgreSQL's 65535 parameter limit (11 params/row → max ~5957 rows)
-        chunk_size = 5_900
         inserted_ids: set[UUID] = set()
-        for i in range(0, len(values_list), chunk_size):
-            chunk = values_list[i : i + chunk_size]
+        for chunk in _param_chunks(values_list, len(values_list[0])):
             stmt = (
                 insert(self.model)
                 .values(chunk)
@@ -475,9 +481,7 @@ class EventRecordRepository(
 
         result: dict[UUID, tuple[UUID, bool]] = {}
         entries = list(values_by_key.values())
-        chunk_size = 6_500
-        for i in range(0, len(entries), chunk_size):
-            chunk = entries[i : i + chunk_size]
+        for chunk in _param_chunks(entries, len(entries[0][1])):
             stmt = insert(self.model).values([values for _, values in chunk])
             stmt = stmt.on_conflict_do_update(
                 index_elements=["data_source_id", "external_id"],

@@ -636,19 +636,15 @@ class SummariesService:
 
             # Intensity minutes from HR data, moderate and vigorous as the provider counts them where it reports them
             intensity_mins = None
-            reported_moderate = result.get("moderate_intensity_minutes")
-            reported_vigorous = result.get("vigorous_intensity_minutes")
-            if reported_moderate is not None or reported_vigorous is not None:
+            moderate = result.get("moderate_intensity_minutes")
+            vigorous = result.get("vigorous_intensity_minutes")
+            if intensity_data or moderate is not None or vigorous is not None:
+                from_hr = intensity_data or {}
+                missing = 0 if intensity_data else None
                 intensity_mins = IntensityMinutes(
-                    light=intensity_data.get("light_minutes") if intensity_data else None,
-                    moderate=reported_moderate,
-                    vigorous=reported_vigorous,
-                )
-            elif intensity_data:
-                intensity_mins = IntensityMinutes(
-                    light=intensity_data.get("light_minutes", 0),
-                    moderate=intensity_data.get("moderate_minutes", 0),
-                    vigorous=intensity_data.get("vigorous_minutes", 0),
+                    light=from_hr.get("light_minutes", missing),
+                    moderate=moderate if moderate is not None else from_hr.get("moderate_minutes", missing),
+                    vigorous=vigorous if vigorous is not None else from_hr.get("vigorous_minutes", missing),
                 )
 
             summary = ActivitySummary(

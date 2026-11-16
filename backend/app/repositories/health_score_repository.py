@@ -254,7 +254,7 @@ class HealthScoreRepository(CrudRepository[HealthScore, HealthScoreCreate, Healt
         """Bulk upsert health scores, a score sent again for the same time replacing the stored one.
 
         For a daily score the provider recomputes as the day goes on, e.g. Ultrahuman's movement index or Garmin's
-        stress. Within one batch the last score sent for a time wins.
+        stress. Within one batch the last score sent for a time wins; a score without a qualifier keeps the stored one.
         """
         # One row per key: ON CONFLICT DO UPDATE can't touch a row twice in one statement
         latest = {(c.user_id, c.provider, c.data_source_id, c.category, c.recorded_at): c for c in creators}
@@ -266,7 +266,8 @@ class HealthScoreRepository(CrudRepository[HealthScore, HealthScoreCreate, Healt
             constraint="uq_health_score_user_provider_source_category_time",
             set_={
                 "value": stmt.excluded.value,
-                "qualifier": stmt.excluded.qualifier,
+                # A push without a qualifier has not withdrawn the stored one
+                "qualifier": func.coalesce(stmt.excluded.qualifier, HealthScore.qualifier),
                 "zone_offset": stmt.excluded.zone_offset,
                 "components": stmt.excluded.components,
             },

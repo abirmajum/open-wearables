@@ -60,17 +60,6 @@ class Base247DataTemplate(ABC):
         """Normalize provider-specific sleep data to our schema."""
         pass
 
-    def process_sleep_data(
-        self,
-        db: DbSession,
-        user_id: UUID,
-        start_time: datetime,
-        end_time: datetime,
-    ) -> list[dict[str, Any]]:
-        """Fetch and normalize sleep data."""
-        raw_data = self.get_sleep_data(db, user_id, start_time, end_time)
-        return [self.normalize_sleep(item, user_id) for item in raw_data]
-
     # -------------------------------------------------------------------------
     # Recovery Data
     # -------------------------------------------------------------------------
@@ -94,17 +83,6 @@ class Base247DataTemplate(ABC):
     ) -> dict[str, Any]:
         """Normalize provider-specific recovery data to our schema."""
         pass
-
-    def process_recovery_data(
-        self,
-        db: DbSession,
-        user_id: UUID,
-        start_time: datetime,
-        end_time: datetime,
-    ) -> list[dict[str, Any]]:
-        """Fetch and normalize recovery data."""
-        raw_data = self.get_recovery_data(db, user_id, start_time, end_time)
-        return [self.normalize_recovery(item, user_id) for item in raw_data]
 
     # -------------------------------------------------------------------------
     # Activity Samples (HR, Steps, SpO2, etc.)
@@ -133,17 +111,6 @@ class Base247DataTemplate(ABC):
         """
         pass
 
-    def process_activity_samples(
-        self,
-        db: DbSession,
-        user_id: UUID,
-        start_time: datetime,
-        end_time: datetime,
-    ) -> dict[str, list[dict[str, Any]]]:
-        """Fetch and normalize activity samples."""
-        raw_data = self.get_activity_samples(db, user_id, start_time, end_time)
-        return self.normalize_activity_samples(raw_data, user_id)
-
     # -------------------------------------------------------------------------
     # Daily Activity Statistics
     # -------------------------------------------------------------------------
@@ -167,17 +134,6 @@ class Base247DataTemplate(ABC):
     ) -> dict[str, Any]:
         """Normalize daily activity statistics to our schema."""
         pass
-
-    def process_daily_activity(
-        self,
-        db: DbSession,
-        user_id: UUID,
-        start_date: datetime,
-        end_date: datetime,
-    ) -> list[dict[str, Any]]:
-        """Fetch and normalize daily activity statistics."""
-        raw_data = self.get_daily_activity_statistics(db, user_id, start_date, end_date)
-        return [self.normalize_daily_activity(item, user_id) for item in raw_data]
 
     # -------------------------------------------------------------------------
     # Combined Load
@@ -223,21 +179,6 @@ class Base247DataTemplate(ABC):
         if end_dt.tzinfo is None:
             end_dt = end_dt.replace(tzinfo=timezone.utc)
         return start_dt, end_dt
-
-    def load_all_247_data(
-        self,
-        db: DbSession,
-        user_id: UUID,
-        start_time: datetime,
-        end_time: datetime,
-    ) -> dict[str, Any]:
-        """Load all 247 data types in one call."""
-        return {
-            "sleep": self.process_sleep_data(db, user_id, start_time, end_time),
-            "recovery": self.process_recovery_data(db, user_id, start_time, end_time),
-            "activity_samples": self.process_activity_samples(db, user_id, start_time, end_time),
-            "daily_activity": self.process_daily_activity(db, user_id, start_time, end_time),
-        }
 
     # -------------------------------------------------------------------------
     # Raw API Access (for debugging)

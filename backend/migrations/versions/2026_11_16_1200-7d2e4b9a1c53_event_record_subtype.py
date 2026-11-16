@@ -18,8 +18,12 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
+    # ADD/DROP COLUMN takes an ACCESS EXCLUSIVE lock on event_record: behind a long transaction the migration fails
+    # fast and the next start retries, instead of queueing every query behind it. SET LOCAL lasts for its transaction.
+    op.execute("SET LOCAL lock_timeout = '5s'")
     op.add_column("event_record", sa.Column("subtype", sa.String(length=32), nullable=True))
 
 
 def downgrade() -> None:
+    op.execute("SET LOCAL lock_timeout = '5s'")
     op.drop_column("event_record", "subtype")

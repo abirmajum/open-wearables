@@ -8,6 +8,7 @@ from uuid import UUID, uuid4
 
 from redis.exceptions import RedisError
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
 from app.config import settings
 from app.constants.sleep import SleepStageType
@@ -105,13 +106,14 @@ DAILY_BODY_BATTERY_COMPONENTS: dict[str, tuple[str, ...]] = {
 
 
 def _score_components(raw: dict[str, Any], paths: dict[str, tuple[str, ...]]) -> dict[str, ScoreComponent]:
-    """The components whose numbers the summary carries."""
+    """The components whose numbers the summary carries; Garmin sends a negative number where it lacks the data
+    (e.g. maxStressLevel -1), so those are left out."""
     components: dict[str, ScoreComponent] = {}
     for name, path in paths.items():
         value: Any = raw
         for key in path:
             value = value.get(key) if isinstance(value, dict) else None
-        if isinstance(value, int | float):
+        if isinstance(value, int | float) and value >= 0:
             components[name] = ScoreComponent(value=value)
     return components
 
@@ -350,7 +352,8 @@ class Garmin247Data(Base247DataTemplate):
         overall_score = raw_sleep.get("overallSleepScore")
         if overall_score and isinstance(overall_score, dict):
             sleep_score = overall_score.get("value")
-            sleep_qualifier = overall_score.get("qualifierKey")
+            sleep_qualifier = overall_score.get("qualifierKey") or overall_score.get("qualifier")
+        sleep_qualifier = sleep_qualifier or raw_sleep.get("sleepScoreQualifier")
 
         sleep_scores = raw_sleep.get("sleepScores") or {}
         sleep_score_components = {
@@ -1882,7 +1885,7 @@ class Garmin247Data(Base247DataTemplate):
         all_sleep_details: list[EventRecordDetailCreate] = []
         all_mct_details: list[MenstrualCycleDetailCreate] = []
         all_health_scores: list[HealthScoreCreate] = []
-        night_scores: list[tuple[EventRecordCreate, HealthScoreCreate]] = []
+        night_scores: list[tuple[EventRecordCreate | None, HealthScoreCreate]] = []
         # A night is one sleep summary: re-sent under its summaryId, it updates the stored night whatever its span
         nights: dict[str, tuple[EventRecordCreate, EventRecordDetailCreate]] = {}
         epoch_items: list[dict[str, Any]] = []
@@ -1930,8 +1933,8 @@ class Garmin247Data(Base247DataTemplate):
                             else:
                                 all_records.append(record)
                                 all_sleep_details.append(detail)
-                            if health_score:
-                                night_scores.append((record, health_score))
+                        if health_score:
+                            night_scores.append((result[0] if result else None, health_score))
                         for raw_nap in normalized.get("naps", []):
                             nap_result = self._build_nap_record(
                                 raw_nap, user_id, normalized.get("garmin_summary_id"), normalized.get("validation")
@@ -2086,11 +2089,27 @@ class Garmin247Data(Base247DataTemplate):
                     all_records.append(record)
                     all_sleep_details.append(detail)
                     continue
-                # Copies an earlier push left when it moved the night's span; one may hold the span sent now
-                for stale in versions[1:]:
-                    db.delete(stale)
-                db.flush()
-                event_record_service.refresh_sleep(db, user_id, versions[0], record, detail)
+                if len(versions) > 1:
+                    logger.warning(
+                        "Garmin night stored more than once, updating the latest",
+                        provider="garmin",
+                        user_id=str(user_id),
+                        summary_id=summary_id,
+                        record_ids=[str(version.id) for version in versions],
+                    )
+                try:
+                    with db.begin_nested():
+                        event_record_service.refresh_sleep(db, user_id, versions[0], record, detail)
+                except IntegrityError as e:
+                    logger.warning(
+                        "Re-sent Garmin night not updated, another record holds its span",
+                        provider="garmin",
+                        user_id=str(user_id),
+                        summary_id=summary_id,
+                        record_id=str(versions[0].id),
+                        error=str(e),
+                    )
+                    continue
                 count += WriteCounts(0, 1)
 
         # Single bulk insert for SeriesSample
@@ -2113,6 +2132,11 @@ class Garmin247Data(Base247DataTemplate):
             workout_details = [d for d in all_workout_details if d.record_id in inserted_set]
             if workout_details:
                 event_record_service.bulk_create_details(db, workout_details, detail_type=EventCategory.WORKOUT)
+            # A workout Garmin pushes again (activities, then activityDetails) keeps its record; the fields this push
+            # carries fill its stored detail, without a second created webhook
+            if refreshed := self._stored_workout_details(db, user_id, all_records, all_workout_details, inserted_set):
+                self.event_record_detail_repo.bulk_create(db, refreshed, detail_type=EventCategory.WORKOUT)
+                count += WriteCounts(0, len(refreshed))
 
             # Bulk create MCT details for actually inserted records
             mct_details = [d for d in all_mct_details if d.record_id in inserted_set]
@@ -2136,27 +2160,59 @@ class Garmin247Data(Base247DataTemplate):
 
         return count
 
+    def _stored_workout_details(
+        self,
+        db: DbSession,
+        user_id: UUID,
+        records: list[EventRecordCreate],
+        details: list[EventRecordDetailCreate],
+        inserted: set[UUID],
+    ) -> list[EventRecordDetailCreate]:
+        """The details of the workouts this push did not insert, each moved onto the user's stored workout of the
+        same Garmin activity id."""
+        resent = {r.id: r.external_id for r in records if r.category == EventCategory.WORKOUT and r.id not in inserted}
+        if not resent:
+            return []
+        stored = {
+            external_id: record.id
+            for external_id, record in self.event_record_repo.get_by_external_ids(
+                db, user_id, filter(None, resent.values()), self.provider_name
+            ).items()
+            if record.category == EventCategory.WORKOUT
+        }
+        return [
+            d.model_copy(update={"record_id": stored[external_id]})
+            for d in details
+            if (external_id := resent.get(d.record_id)) in stored
+        ]
+
     def _save_night_scores(
-        self, db: DbSession, user_id: UUID, night_scores: list[tuple[EventRecordCreate, HealthScoreCreate]]
+        self, db: DbSession, user_id: UUID, night_scores: list[tuple[EventRecordCreate | None, HealthScoreCreate]]
     ) -> WriteCounts:
         """Each SLEEP score on its stored night: a re-sent night is not inserted again, so it is found by its
-        summary id and span, and its score is refreshed in place."""
+        summary id and span, and its score is refreshed in place. A score whose night is not found is stored
+        unlinked, as before scores were linked."""
         stored = self.event_record_repo.get_ids_by_external_span(
             db,
             user_id,
-            [(record.external_id, record.start_datetime, record.end_datetime) for record, _ in night_scores],
+            [(record.external_id, record.start_datetime, record.end_datetime) for record, _ in night_scores if record],
             self.provider_name,
         )
         count = WriteCounts(0, 0)
+        unlinked: list[HealthScoreCreate] = []
         for record, score in night_scores:
-            record_id = stored.get((record.external_id, record.start_datetime, record.end_datetime))
-            if record_id is None:
+            if (
+                record is None
+                or (record_id := stored.get((record.external_id, record.start_datetime, record.end_datetime))) is None
+            ):
+                unlinked.append(score)
                 continue
             try:
-                saved = health_score_service.upsert_event_score(
-                    db, score.model_copy(update={"event_record_id": record_id})
-                )
-            except ValueError as e:
+                with db.begin_nested():
+                    saved = health_score_service.upsert_event_score(
+                        db, score.model_copy(update={"event_record_id": record_id})
+                    )
+            except (ValueError, IntegrityError) as e:
                 logger.warning(
                     "Sleep score not linked to its night",
                     provider="garmin",
@@ -2166,6 +2222,14 @@ class Garmin247Data(Base247DataTemplate):
                 )
                 continue
             count += WriteCounts(1, 0) if saved.id == score.id else WriteCounts(0, 1)
+        if unlinked:
+            logger.info(
+                "Sleep scores stored without their night",
+                provider="garmin",
+                user_id=str(user_id),
+                recorded_at=[score.recorded_at.isoformat() for score in unlinked],
+            )
+            count += health_score_service.bulk_create(db, unlinked)
         return count
 
     # -------------------------------------------------------------------------

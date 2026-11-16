@@ -2,8 +2,8 @@ from typing import Any, cast
 from uuid import UUID
 
 from psycopg.errors import UniqueViolation
-from sqlalchemy import Table, func, update
-from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy import Table, func, null, update
+from sqlalchemy.dialects.postgresql import JSONB, insert
 from sqlalchemy.exc import IntegrityError
 
 from app.constants.series_types.workout_detail_stats import WORKOUT_DETAIL_STATS
@@ -142,14 +142,20 @@ class EventRecordDetailRepository(
             raise ValueError(f"Unknown detail type: {detail_type}")
 
         child_table = cast(Table, model.__table__)
-        valid_columns = set(child_table.columns.keys())
+        columns = child_table.columns
+        valid_columns = set(columns.keys())
 
         child_values = []
         for creator in creators:
             data = creator.model_dump()
             if detail_type == EventCategory.SLEEP and data.get("sleep_stages"):
                 data["sleep_stages"] = [s.model_dump(mode="json") for s in creator.sleep_stages]  # ty:ignore[not-iterable]
-            filtered_data = {k: v for k, v in data.items() if k in valid_columns}
+            # A JSONB None binds as JSON null, which the COALESCE below would keep over the stored value
+            filtered_data = {
+                k: null() if v is None and isinstance(columns[k].type, JSONB) else v
+                for k, v in data.items()
+                if k in valid_columns
+            }
             child_values.append(filtered_data)
 
         if not child_values:

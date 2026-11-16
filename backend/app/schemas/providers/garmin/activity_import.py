@@ -33,6 +33,7 @@ class ActivityJSON(BaseModel):
     averageSpeedInMetersPerSecond: float | None = None
     maxSpeedInMetersPerSecond: float | None = None
     totalElevationGainInMeters: float | None = None
+    elevationGainInMeters: float | None = None
     averageRunCadenceInStepsPerMinute: float | None = None
     averageBikingCadenceInRevPerMinute: float | None = None
     averageSwimCadenceInStrokesPerMinute: float | None = None
