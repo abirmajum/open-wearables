@@ -1883,7 +1883,7 @@ class Garmin247Data(Base247DataTemplate):
         all_sleep_details: list[EventRecordDetailCreate] = []
         all_mct_details: list[MenstrualCycleDetailCreate] = []
         all_health_scores: list[HealthScoreCreate] = []
-        night_scores: list[tuple[EventRecordCreate, HealthScoreCreate]] = []
+        night_scores: list[tuple[EventRecordCreate | None, HealthScoreCreate]] = []
         # A night is one sleep summary: re-sent under its summaryId, it updates the stored night whatever its span
         nights: dict[str, tuple[EventRecordCreate, EventRecordDetailCreate]] = {}
         epoch_items: list[dict[str, Any]] = []
@@ -1931,8 +1931,8 @@ class Garmin247Data(Base247DataTemplate):
                             else:
                                 all_records.append(record)
                                 all_sleep_details.append(detail)
-                            if health_score:
-                                night_scores.append((record, health_score))
+                        if health_score:
+                            night_scores.append((result[0] if result else None, health_score))
                         for raw_nap in normalized.get("naps", []):
                             nap_result = self._build_nap_record(
                                 raw_nap, user_id, normalized.get("garmin_summary_id"), normalized.get("validation")
@@ -2154,26 +2154,32 @@ class Garmin247Data(Base247DataTemplate):
         return count
 
     def _save_night_scores(
-        self, db: DbSession, user_id: UUID, night_scores: list[tuple[EventRecordCreate, HealthScoreCreate]]
+        self, db: DbSession, user_id: UUID, night_scores: list[tuple[EventRecordCreate | None, HealthScoreCreate]]
     ) -> WriteCounts:
         """Each SLEEP score on its stored night: a re-sent night is not inserted again, so it is found by its
-        summary id and span, and its score is refreshed in place."""
+        summary id and span, and its score is refreshed in place. A score whose night is not found is stored
+        unlinked, as before scores were linked."""
         stored = self.event_record_repo.get_ids_by_external_span(
             db,
             user_id,
-            [(record.external_id, record.start_datetime, record.end_datetime) for record, _ in night_scores],
+            [(record.external_id, record.start_datetime, record.end_datetime) for record, _ in night_scores if record],
             self.provider_name,
         )
         count = WriteCounts(0, 0)
+        unlinked: list[HealthScoreCreate] = []
         for record, score in night_scores:
-            record_id = stored.get((record.external_id, record.start_datetime, record.end_datetime))
-            if record_id is None:
+            if (
+                record is None
+                or (record_id := stored.get((record.external_id, record.start_datetime, record.end_datetime))) is None
+            ):
+                unlinked.append(score)
                 continue
             try:
-                saved = health_score_service.upsert_event_score(
-                    db, score.model_copy(update={"event_record_id": record_id})
-                )
-            except ValueError as e:
+                with db.begin_nested():
+                    saved = health_score_service.upsert_event_score(
+                        db, score.model_copy(update={"event_record_id": record_id})
+                    )
+            except (ValueError, IntegrityError) as e:
                 logger.warning(
                     "Sleep score not linked to its night",
                     provider="garmin",
@@ -2183,6 +2189,14 @@ class Garmin247Data(Base247DataTemplate):
                 )
                 continue
             count += WriteCounts(1, 0) if saved.id == score.id else WriteCounts(0, 1)
+        if unlinked:
+            logger.info(
+                "Sleep scores stored without their night",
+                provider="garmin",
+                user_id=str(user_id),
+                recorded_at=[score.recorded_at.isoformat() for score in unlinked],
+            )
+            count += health_score_service.bulk_create(db, unlinked)
         return count
 
     # -------------------------------------------------------------------------

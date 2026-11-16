@@ -24,8 +24,9 @@ from app.repositories.event_record_detail_repository import EventRecordDetailRep
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.schemas.enums import ComputedBy, HealthScoreCategory, ProviderName
 from app.schemas.enums.series_types import SeriesType, get_series_type_id
-from app.schemas.model_crud.activities import CalendarPeriod
+from app.schemas.model_crud.activities import CalendarPeriod, HealthScoreCreate
 from app.schemas.sync_status import SyncScope, SyncSource
+from app.services.health_score_service import health_score_service
 from app.services.providers.garmin.data_247 import Garmin247Data
 from app.services.providers.garmin.handlers.wellness import process_wellness_items
 from app.services.providers.garmin.oauth import GarminOAuth
@@ -1552,6 +1553,63 @@ class TestGarmin247Data:
         garmin_247.process_items_batch(db, user.id, "sleeps", [bare])
 
         assert self._scores(db, user.id, HealthScoreCategory.SLEEP) == []
+
+    def test_a_night_without_a_summary_id_keeps_its_score_unlinked(
+        self, garmin_247: Garmin247Data, db: Session
+    ) -> None:
+        user = UserFactory()
+        without_id = {key: value for key, value in _SCORED_NIGHT.items() if key != "summaryId"}
+
+        garmin_247.process_items_batch(db, user.id, "sleeps", [without_id])
+
+        assert [(s.event_record_id, s.value) for s in self._scores(db, user.id, HealthScoreCategory.SLEEP)] == [
+            (None, Decimal("84"))
+        ]
+
+    def test_a_night_whose_span_another_record_holds_keeps_its_score_unlinked(
+        self, garmin_247: Garmin247Data, db: Session
+    ) -> None:
+        user = UserFactory()
+        bare = {key: _SCORED_NIGHT[key] for key in ("startTimeInSeconds", "durationInSeconds")}
+        garmin_247.process_items_batch(db, user.id, "sleeps", [{**bare, "summaryId": "sleep_other"}])
+
+        garmin_247.process_items_batch(db, user.id, "sleeps", [_SCORED_NIGHT])
+
+        assert [(s.event_record_id, s.value) for s in self._scores(db, user.id, HealthScoreCategory.SLEEP)] == [
+            (None, Decimal("84"))
+        ]
+
+    def test_a_night_that_builds_no_record_keeps_its_score_unlinked(
+        self, garmin_247: Garmin247Data, db: Session
+    ) -> None:
+        user = UserFactory()
+
+        with patch.object(garmin_247, "_build_sleep_record", return_value=None):
+            garmin_247.process_items_batch(db, user.id, "sleeps", [_SCORED_NIGHT])
+
+        assert [(s.event_record_id, s.value) for s in self._scores(db, user.id, HealthScoreCategory.SLEEP)] == [
+            (None, Decimal("84"))
+        ]
+
+    def test_a_score_the_database_rejects_does_not_stop_the_push(self, garmin_247: Garmin247Data, db: Session) -> None:
+        user = UserFactory()
+        next_night = {**_SCORED_NIGHT, "summaryId": "sleep_next", "startTimeInSeconds": 1705356000}
+        upsert = health_score_service.upsert_event_score
+
+        def reject_the_first_night(db_session: Session, score: HealthScoreCreate) -> HealthScore:
+            if score.recorded_at == datetime(2024, 1, 15, 6, tzinfo=timezone.utc):
+                # A night that is not stored: the flush violates the score's foreign key
+                score = score.model_copy(update={"event_record_id": uuid4()})
+            return upsert(db_session, score)
+
+        with patch.object(health_score_service, "upsert_event_score", side_effect=reject_the_first_night):
+            garmin_247.process_items_batch(db, user.id, "sleeps", [_SCORED_NIGHT, next_night])
+
+        nights = {r.external_id: r.id for r in db.query(EventRecord).filter(EventRecord.category == "sleep")}
+        assert set(nights) == {"sleep_scored", "sleep_next"}
+        assert [s.event_record_id for s in self._scores(db, user.id, HealthScoreCategory.SLEEP)] == [
+            nights["sleep_next"]
+        ]
 
     def test_a_nights_spo2_and_respiration_are_samples_at_their_offsets(
         self, garmin_247: Garmin247Data, db: Session
