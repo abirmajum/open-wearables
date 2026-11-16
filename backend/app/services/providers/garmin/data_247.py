@@ -2136,6 +2136,7 @@ class Garmin247Data(Base247DataTemplate):
             # carries fill its stored detail, without a second created webhook
             if refreshed := self._stored_workout_details(db, user_id, all_records, all_workout_details, inserted_set):
                 self.event_record_detail_repo.bulk_create(db, refreshed, detail_type=EventCategory.WORKOUT)
+                count += WriteCounts(0, len(refreshed))
 
             # Bulk create MCT details for actually inserted records
             mct_details = [d for d in all_mct_details if d.record_id in inserted_set]
