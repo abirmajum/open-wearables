@@ -926,6 +926,32 @@ class TestGarmin247Data:
             "high_stress_duration_seconds": 1800,
         }
 
+    def test_a_later_dailies_push_refreshes_the_days_stress_score(
+        self, db: Session, garmin_247: Garmin247Data, sample_daily: dict[str, Any]
+    ) -> None:
+        user = UserFactory()
+        morning = {**sample_daily, "stressQualifier": "calm", "maxStressLevel": 60}
+        evening = {**sample_daily, "averageStressLevel": 42, "stressQualifier": "stressful", "maxStressLevel": 93}
+
+        garmin_247.process_items_batch(db, user.id, "dailies", [morning])
+        garmin_247.process_items_batch(db, user.id, "dailies", [evening])
+
+        stress = self._scores(db, user.id, HealthScoreCategory.STRESS)
+        assert [(s.value, s.qualifier, s.components["max_stress_level"]["value"]) for s in stress] == [
+            (Decimal("42"), "Stressful", 93)
+        ]
+
+    def test_one_push_with_a_day_twice_keeps_its_last_stress_score(
+        self, db: Session, garmin_247: Garmin247Data, sample_daily: dict[str, Any]
+    ) -> None:
+        user = UserFactory()
+
+        garmin_247.process_items_batch(
+            db, user.id, "dailies", [sample_daily, {**sample_daily, "averageStressLevel": 42}]
+        )
+
+        assert [s.value for s in self._scores(db, user.id, HealthScoreCategory.STRESS)] == [Decimal("42")]
+
     def test_build_body_comp_samples(self, garmin_247: Garmin247Data, sample_body_comp: dict[str, Any]) -> None:
         """Test _build_body_comp_samples returns samples without DB call."""
         user_id = uuid4()

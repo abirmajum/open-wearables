@@ -2119,10 +2119,11 @@ class Garmin247Data(Base247DataTemplate):
         if night_scores:
             count += self._save_night_scores(db, user_id, night_scores)
 
-        # Body Battery is the day's peak, which a later push raises; the dailies only add its components
+        # Garmin re-sends a day as it goes on: its stress is replaced, while Body Battery is the day's peak, which
+        # a later push raises and the dailies only add components to
         peaks = [s for s in all_health_scores if s.category == HealthScoreCategory.BODY_BATTERY]
         if scores := [s for s in all_health_scores if s.category != HealthScoreCategory.BODY_BATTERY]:
-            count += health_score_service.bulk_create(db, scores)
+            count += health_score_service.bulk_upsert(db, scores)
             db.commit()
         if peaks:
             count += health_score_service.bulk_create_keeping_highest(db, peaks)

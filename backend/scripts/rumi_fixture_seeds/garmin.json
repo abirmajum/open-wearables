@@ -7044,6 +7044,64 @@
      "manual": false
     }
    ]
+  },
+  {
+   "dailies": [
+    {
+     "userId": "GARMIN_USER_ID",
+     "summaryId": "x3f1-dly-2026-01-15",
+     "calendarDate": "2026-01-15",
+     "activityType": "WALKING",
+     "activeKilocalories": 520,
+     "bmrKilocalories": 1680,
+     "consumedCalories": 0,
+     "steps": 9000,
+     "pushes": 0,
+     "distanceInMeters": 7020.0,
+     "pushDistanceInMeters": 0.0,
+     "durationInSeconds": 72000,
+     "activeTimeInSeconds": 5400,
+     "startTimeInSeconds": 1768431600,
+     "startTimeOffsetInSeconds": 3600,
+     "moderateIntensityDurationInSeconds": 1800,
+     "vigorousIntensityDurationInSeconds": 900,
+     "floorsClimbed": 9,
+     "floorsDescended": 8,
+     "minHeartRateInBeatsPerMinute": 47,
+     "averageHeartRateInBeatsPerMinute": 66,
+     "maxHeartRateInBeatsPerMinute": 158,
+     "restingHeartRateInBeatsPerMinute": 52,
+     "timeOffsetHeartRateSamples": {
+      "0": 64,
+      "3600": 71,
+      "7200": 78,
+      "10800": 85,
+      "14400": 92,
+      "18000": 59,
+      "21600": 66,
+      "25200": 73,
+      "28800": 80,
+      "32400": 87,
+      "36000": 94,
+      "39600": 61,
+      "43200": 68
+     },
+     "averageStressLevel": 40,
+     "maxStressLevel": 97,
+     "stressDurationInSeconds": 19800,
+     "restStressDurationInSeconds": 28800,
+     "activityStressDurationInSeconds": 7200,
+     "lowStressDurationInSeconds": 9000,
+     "mediumStressDurationInSeconds": 3600,
+     "highStressDurationInSeconds": 4500,
+     "stressQualifier": "stressful",
+     "stepsGoal": 10000,
+     "intensityDurationGoalInSeconds": 9000,
+     "floorsClimbedGoal": 10,
+     "bodyBatteryChargedValue": 62,
+     "bodyBatteryDrainedValue": 78
+    }
+   ]
   }
  ],
  "fit_files": {

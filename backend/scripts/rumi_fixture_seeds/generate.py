@@ -506,6 +506,24 @@ def garmin_seed() -> dict[str, Any]:
             ]
         },
     ]
+    today_daily = _garmin_daily(today_index, days[today_index][1], True)
+    # Garmin re-sends today's summary as the day goes on; the later push carries the evening's stress
+    pushes.append(
+        {
+            "dailies": [
+                {
+                    **today_daily,
+                    "durationInSeconds": 20 * 3600,
+                    "averageStressLevel": today_daily["averageStressLevel"] + 9,
+                    "maxStressLevel": 97,
+                    "stressDurationInSeconds": today_daily["stressDurationInSeconds"] + 5400,
+                    "highStressDurationInSeconds": today_daily["highStressDurationInSeconds"] + 2700,
+                    "stressQualifier": "stressful",
+                    "bodyBatteryDrainedValue": today_daily["bodyBatteryDrainedValue"] + 20,
+                }
+            ]
+        }
+    )
     return {
         "anchor_date": ANCHOR_DATE.isoformat(),
         "user_id_placeholder": GARMIN_USER_ID,

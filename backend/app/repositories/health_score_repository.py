@@ -253,12 +253,15 @@ class HealthScoreRepository(CrudRepository[HealthScore, HealthScoreCreate, Healt
     def bulk_upsert(self, db_session: DbSession, creators: list[HealthScoreCreate]) -> WriteCounts:
         """Bulk upsert health scores, a score sent again for the same time replacing the stored one.
 
-        For a daily score the provider recomputes as the day goes on, e.g. Ultrahuman's movement index.
+        For a daily score the provider recomputes as the day goes on, e.g. Ultrahuman's movement index or Garmin's
+        stress. Within one batch the last score sent for a time wins.
         """
-        if not creators:
+        # One row per key: ON CONFLICT DO UPDATE can't touch a row twice in one statement
+        latest = {(c.user_id, c.provider, c.data_source_id, c.category, c.recorded_at): c for c in creators}
+        if not latest:
             return WriteCounts(0, 0)
 
-        stmt = insert(HealthScore).values([c.model_dump() for c in creators])
+        stmt = insert(HealthScore).values([c.model_dump() for c in latest.values()])
         stmt = stmt.on_conflict_do_update(
             constraint="uq_health_score_user_provider_source_category_time",
             set_={
