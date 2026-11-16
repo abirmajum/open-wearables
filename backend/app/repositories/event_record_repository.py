@@ -194,6 +194,29 @@ class EventRecordRepository(
             query = query.filter(DataSource.provider == provider)
         return {record.external_id: record for record in query if record.external_id}
 
+    def get_ids_by_external_span(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        spans: Iterable[tuple[str | None, datetime, datetime]],
+        provider: str,
+    ) -> dict[tuple[str | None, datetime, datetime], UUID]:
+        """The user's records of this provider by (external id, start, end): a night and the naps sent under its id
+        stay apart."""
+        keys = list({span for span in spans if span[0]})
+        if not keys:
+            return {}
+        rows = (
+            db_session.query(self.model.id, self.model.external_id, self.model.start_datetime, self.model.end_datetime)
+            .join(DataSource, self.model.data_source_id == DataSource.id)
+            .filter(
+                DataSource.user_id == user_id,
+                DataSource.provider == provider,
+                tuple_(self.model.external_id, self.model.start_datetime, self.model.end_datetime).in_(keys),
+            )
+        )
+        return {(external_id, start, end): record_id for record_id, external_id, start, end in rows}
+
     def main_sleep_ended_before(
         self, db_session: DbSession, user_id: UUID, at: datetime, within: timedelta, provider: str
     ) -> EventRecord | None:

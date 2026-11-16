@@ -1,5 +1,6 @@
 from app.schemas.enums import SeriesType
 from app.schemas.enums.health_score_category import HealthScoreCategory
+from app.schemas.model_crud.activities import StatColumn
 
 # Timeseries mappings (handler key → SeriesType) consumed directly by data_247.py.
 
@@ -28,6 +29,19 @@ DAILIES_SERIES: list[tuple[str, SeriesType]] = [
     ("exercise_time", SeriesType.exercise_time),
 ]
 
+# Daily summary heart rate field → the statistic of Garmin's heart_rate day value it fills (/wellness-api/rest/dailies).
+DAILIES_HEART_RATE_STATS: dict[str, StatColumn] = {
+    "avg_heart_rate": "avg",
+    "min_heart_rate": "min",
+    "max_heart_rate": "max",
+}
+
+# Sleep summary map of offsets from the sleep's start → SeriesType (/wellness-api/rest/sleeps).
+SLEEP_SERIES: dict[str, SeriesType] = {
+    "timeOffsetSleepSpo2": SeriesType.oxygen_saturation,
+    "timeOffsetSleepRespiration": SeriesType.respiratory_rate,
+}
+
 # Epoch sample category → SeriesType (/wellness-api/rest/epochs).
 EPOCHS_SERIES: dict[str, SeriesType] = {
     "heart_rate": SeriesType.heart_rate,
@@ -40,6 +54,7 @@ TIMESERIES: frozenset[SeriesType] = frozenset(
         *(st for _, st in ACTIVITY_SAMPLE_SERIES),  # /wellness-api/rest/activities (activityDetails + FIT)
         *(st for _, st in DAILIES_SERIES),  # /wellness-api/rest/dailies
         *EPOCHS_SERIES.values(),  # /wellness-api/rest/epochs
+        *SLEEP_SERIES.values(),  # /wellness-api/rest/sleeps
         SeriesType.weight,  # /wellness-api/rest/bodyComps
         SeriesType.body_fat_percentage,  # /wellness-api/rest/bodyComps
         SeriesType.body_mass_index,  # /wellness-api/rest/bodyComps

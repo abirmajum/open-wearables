@@ -10,11 +10,11 @@ import pytest
 from sqlalchemy import event as sa_event
 from sqlalchemy.orm import Session
 
-from app.models import DataSource, HealthScore, SeriesAggregate, SeriesSample, SleepDetails
+from app.models import DataSource, EventRecord, HealthScore, SeriesAggregate, SeriesSample, SleepDetails
 from app.repositories.data_point_series_repository import WriteCounts
 from app.repositories.event_record_detail_repository import EventRecordDetailRepository
 from app.repositories.user_connection_repository import UserConnectionRepository
-from app.schemas.enums import HealthScoreCategory
+from app.schemas.enums import ComputedBy, HealthScoreCategory
 from app.schemas.enums.series_types import SeriesType, get_series_type_id
 from app.schemas.model_crud.activities import CalendarPeriod
 from app.schemas.sync_status import SyncScope, SyncSource
@@ -28,6 +28,33 @@ from tests.factories import UserConnectionFactory, UserFactory
 # One day's stressDetails as Garmin sends it after midnight, and again in the morning with more data
 _AFTER_MIDNIGHT = {"startTimeInSeconds": 1705276800, "timeOffsetBodyBatteryValues": {"0": 20, "3600": 46}}
 _MORNING = {"startTimeInSeconds": 1705276800, "timeOffsetBodyBatteryValues": {"0": 20, "3600": 46, "25200": 78}}
+# The same day's daily summary, which carries what the Body Battery charged and drained
+_DAILY_BODY_BATTERY = {
+    "summaryId": "daily_body_battery",
+    "calendarDate": "2024-01-15",
+    "startTimeInSeconds": 1705276800,
+    "bodyBatteryChargedValue": 61,
+    "bodyBatteryDrainedValue": 44,
+}
+# A scored night, 22:00 to 06:00 UTC, with the in-sleep vitals Garmin sends in its sleep summary
+_SCORED_NIGHT = {
+    "summaryId": "sleep_scored",
+    "startTimeInSeconds": 1705269600,
+    "startTimeOffsetInSeconds": 3600,
+    "durationInSeconds": 28800,
+    "deepSleepDurationInSeconds": 7200,
+    "lightSleepDurationInSeconds": 14400,
+    "remSleepInSeconds": 5400,
+    "awakeDurationInSeconds": 1800,
+    "overallSleepScore": {"value": 84, "qualifierKey": "GOOD"},
+    "timeOffsetSleepSpo2": {"0": 95, "3600": 93},
+    "timeOffsetSleepRespiration": {"0": 14.5, "1800": 13.0},
+    "averageHeartRate": 54,
+    "lowestHeartRate": 47,
+    "respirationAvg": 14.2,
+    "avgOxygenSaturation": 95.5,
+    "sleepHRV": {"value": 48},
+}
 
 
 class TestGarmin247Data:
@@ -756,8 +783,8 @@ class TestGarmin247Data:
         normalized, _ = garmin_247.normalize_dailies(sample_daily, user_id)
         samples = garmin_247._build_dailies_samples(user_id, normalized)
 
-        # 6 metrics (steps, active/basal calories, resting_hr, floors, distance) + 3 HR samples
-        assert len(samples) == 9
+        # 6 metrics (steps, active/basal calories, resting_hr, floors, distance), the day's average HR + 3 HR samples
+        assert len(samples) == 10
         assert len({s.series_type for s in samples}) > 1
 
     def test_build_dailies_samples_exercise_time(self, garmin_247: Garmin247Data) -> None:
@@ -826,7 +853,11 @@ class TestGarmin247Data:
 
         day = CalendarPeriod.local_day(datetime(2024, 1, 15, tzinfo=timezone.utc), 86400, "+01:00")
         assert {s.period for s in samples if s.series_type != SeriesType.heart_rate} == {day}
-        assert {s.period for s in samples if s.series_type == SeriesType.heart_rate} == {None}
+        # Garmin's own day average is a day value; the intraday readings stay samples
+        assert {s.period for s in samples if s.series_type == SeriesType.heart_rate} == {
+            day.model_copy(update={"stat": "avg"}),
+            None,
+        }
 
     def test_build_dailies_samples_without_start_time_keep_the_date(self, garmin_247: Garmin247Data) -> None:
         user_id = uuid4()
@@ -843,8 +874,57 @@ class TestGarmin247Data:
 
         garmin_247.process_items_batch(db, user.id, "dailies", [sample_daily])
 
-        # steps, active and basal energy, resting HR, floors, distance; intraday HR stays a sample only
-        assert db.query(SeriesAggregate).count() == 6
+        # steps, active and basal energy, resting HR, floors, distance, Garmin's day HR; intraday HR stays a sample
+        assert db.query(SeriesAggregate).count() == 7
+
+    def test_dailies_heart_rate_is_garmins_own_day_value(
+        self, db: Session, garmin_247: Garmin247Data, sample_daily: dict[str, Any]
+    ) -> None:
+        user = UserFactory()
+        daily = {**sample_daily, "minHeartRateInBeatsPerMinute": 48, "maxHeartRateInBeatsPerMinute": 161}
+
+        garmin_247.process_items_batch(db, user.id, "dailies", [daily])
+
+        day = (
+            db.query(SeriesAggregate)
+            .join(DataSource, DataSource.id == SeriesAggregate.data_source_id)
+            .filter(
+                DataSource.user_id == user.id,
+                SeriesAggregate.series_type_definition_id == get_series_type_id(SeriesType.heart_rate),
+            )
+            .one()
+        )
+        assert (day.computed_by, day.avg, day.min, day.max) == (ComputedBy.PROVIDER, 72, 48, 161)
+
+    def test_dailies_put_max_stress_and_stress_durations_on_the_stress_score(
+        self, db: Session, garmin_247: Garmin247Data, sample_daily: dict[str, Any]
+    ) -> None:
+        user = UserFactory()
+        daily = {
+            **sample_daily,
+            "startTimeOffsetInSeconds": 3600,
+            "maxStressLevel": 91,
+            "stressDurationInSeconds": 14400,
+            "restStressDurationInSeconds": 28800,
+            "activityStressDurationInSeconds": 7200,
+            "lowStressDurationInSeconds": 9000,
+            "mediumStressDurationInSeconds": 3600,
+            "highStressDurationInSeconds": 1800,
+        }
+
+        garmin_247.process_items_batch(db, user.id, "dailies", [daily])
+
+        stress = self._scores(db, user.id, HealthScoreCategory.STRESS)
+        assert [(s.value, s.zone_offset) for s in stress] == [(Decimal("35"), "+01:00")]
+        assert {name: c["value"] for name, c in stress[0].components.items()} == {
+            "max_stress_level": 91,
+            "stress_duration_seconds": 14400,
+            "rest_stress_duration_seconds": 28800,
+            "activity_stress_duration_seconds": 7200,
+            "low_stress_duration_seconds": 9000,
+            "medium_stress_duration_seconds": 3600,
+            "high_stress_duration_seconds": 1800,
+        }
 
     def test_build_body_comp_samples(self, garmin_247: Garmin247Data, sample_body_comp: dict[str, Any]) -> None:
         """Test _build_body_comp_samples returns samples without DB call."""
@@ -955,6 +1035,42 @@ class TestGarmin247Data:
         garmin_247.process_items_batch(db, user.id, "stressDetails", [_AFTER_MIDNIGHT])
 
         assert self._body_battery_peaks(db, user.id) == [Decimal("78")]
+
+    @pytest.mark.parametrize(
+        "pushes",
+        [
+            [("stressDetails", _MORNING), ("dailies", _DAILY_BODY_BATTERY)],
+            [("dailies", _DAILY_BODY_BATTERY), ("stressDetails", _MORNING)],
+        ],
+        ids=["peak-first", "dailies-first"],
+    )
+    def test_dailies_add_charged_and_drained_to_the_days_body_battery(
+        self, garmin_247: Garmin247Data, db: Session, pushes: list[tuple[str, dict[str, Any]]]
+    ) -> None:
+        user = UserFactory()
+
+        for summary_type, item in pushes:
+            garmin_247.process_items_batch(db, user.id, summary_type, [item])
+
+        body_battery = self._scores(db, user.id, HealthScoreCategory.BODY_BATTERY)
+        assert [(s.value, s.components) for s in body_battery] == [
+            (Decimal("78"), {"charged": {"value": 61, "qualifier": None}, "drained": {"value": 44, "qualifier": None}})
+        ]
+
+    def test_a_later_daily_keeps_the_body_battery_peak(self, garmin_247: Garmin247Data, db: Session) -> None:
+        user = UserFactory()
+
+        garmin_247.process_items_batch(db, user.id, "stressDetails", [_MORNING])
+        garmin_247.process_items_batch(db, user.id, "dailies", [_DAILY_BODY_BATTERY])
+        garmin_247.process_items_batch(db, user.id, "dailies", [{**_DAILY_BODY_BATTERY, "bodyBatteryChargedValue": 70}])
+
+        body_battery = self._scores(db, user.id, HealthScoreCategory.BODY_BATTERY)
+        assert [(s.value, s.components["charged"]["value"]) for s in body_battery] == [(Decimal("78"), 70)]
+
+    @staticmethod
+    def _scores(db: Session, user_id: UUID, category: HealthScoreCategory) -> list[HealthScore]:
+        db.expire_all()
+        return db.query(HealthScore).filter(HealthScore.user_id == user_id, HealthScore.category == category).all()
 
     @staticmethod
     def _body_battery_peaks(db: Session, user_id: UUID) -> list[Decimal]:
@@ -1136,6 +1252,98 @@ class TestGarmin247Data:
         # Should create sleep details for inserted records
         mock_bulk_details.assert_called_once()
         assert count == 2
+
+    def test_a_pushed_nights_score_is_linked_to_the_stored_night(self, garmin_247: Garmin247Data, db: Session) -> None:
+        user = UserFactory()
+
+        garmin_247.process_items_batch(db, user.id, "sleeps", [_SCORED_NIGHT])
+
+        night = db.query(EventRecord).filter(EventRecord.external_id == "sleep_scored").one()
+        scores = self._scores(db, user.id, HealthScoreCategory.SLEEP)
+        assert [(s.event_record_id, s.value, s.qualifier) for s in scores] == [(night.id, Decimal("84"), "GOOD")]
+
+    def test_a_re_sent_night_refreshes_its_one_score(self, garmin_247: Garmin247Data, db: Session) -> None:
+        user = UserFactory()
+        garmin_247.process_items_batch(db, user.id, "sleeps", [_SCORED_NIGHT])
+
+        rescored = {**_SCORED_NIGHT, "overallSleepScore": {"value": 88, "qualifierKey": "EXCELLENT"}}
+        garmin_247.process_items_batch(db, user.id, "sleeps", [rescored])
+
+        night = db.query(EventRecord).filter(EventRecord.external_id == "sleep_scored").one()
+        scores = self._scores(db, user.id, HealthScoreCategory.SLEEP)
+        assert [(s.event_record_id, s.value, s.qualifier) for s in scores] == [(night.id, Decimal("88"), "EXCELLENT")]
+
+    def test_a_score_stored_before_scores_were_linked_gets_linked(self, garmin_247: Garmin247Data, db: Session) -> None:
+        user = UserFactory()
+        _, unlinked = garmin_247.normalize_sleep(_SCORED_NIGHT, user.id)
+        assert unlinked is not None
+        db.add(HealthScore(**unlinked.model_dump()))
+        db.flush()
+
+        garmin_247.process_items_batch(db, user.id, "sleeps", [_SCORED_NIGHT])
+
+        night = db.query(EventRecord).filter(EventRecord.external_id == "sleep_scored").one()
+        assert [(s.id, s.event_record_id) for s in self._scores(db, user.id, HealthScoreCategory.SLEEP)] == [
+            (unlinked.id, night.id)
+        ]
+
+    def test_a_nights_score_is_linked_to_the_night_not_its_nap(self, garmin_247: Garmin247Data, db: Session) -> None:
+        user = UserFactory()
+        nap = {"napStartTimeInSeconds": 1705327200, "napDurationInSeconds": 1800, "napOffsetInSeconds": 3600}
+
+        garmin_247.process_items_batch(db, user.id, "sleeps", [{**_SCORED_NIGHT, "naps": [nap]}])
+
+        night = (
+            db.query(EventRecord)
+            .filter(
+                EventRecord.external_id == "sleep_scored",
+                EventRecord.start_datetime == datetime(2024, 1, 14, 22, tzinfo=timezone.utc),
+            )
+            .one()
+        )
+        assert [s.event_record_id for s in self._scores(db, user.id, HealthScoreCategory.SLEEP)] == [night.id]
+
+    def test_a_nights_in_sleep_aggregates_are_components_of_its_score(
+        self, garmin_247: Garmin247Data, db: Session
+    ) -> None:
+        user = UserFactory()
+
+        garmin_247.process_items_batch(db, user.id, "sleeps", [_SCORED_NIGHT])
+
+        (score,) = self._scores(db, user.id, HealthScoreCategory.SLEEP)
+        assert {name: c["value"] for name, c in score.components.items()} == {
+            "average_heart_rate": 54,
+            "lowest_heart_rate": 47,
+            "respiration_avg": 14.2,
+            "avg_oxygen_saturation": 95.5,
+            "sleep_hrv": 48,
+        }
+
+    def test_a_nights_spo2_and_respiration_are_samples_at_their_offsets(
+        self, garmin_247: Garmin247Data, db: Session
+    ) -> None:
+        user = UserFactory()
+
+        garmin_247.process_items_batch(db, user.id, "sleeps", [_SCORED_NIGHT])
+
+        stored = (
+            db.query(SeriesSample.series_type_definition_id, SeriesSample.recorded_at, SeriesSample.value)
+            .join(DataSource, DataSource.id == SeriesSample.data_source_id)
+            .filter(DataSource.user_id == user.id)
+            .all()
+        )
+        spo2, breaths = (
+            get_series_type_id(SeriesType.oxygen_saturation),
+            get_series_type_id(SeriesType.respiratory_rate),
+        )
+        assert sorted((t, at, float(v)) for t, at, v in stored) == sorted(
+            [
+                (spo2, datetime(2024, 1, 14, 22, tzinfo=timezone.utc), 95.0),
+                (spo2, datetime(2024, 1, 14, 23, tzinfo=timezone.utc), 93.0),
+                (breaths, datetime(2024, 1, 14, 22, tzinfo=timezone.utc), 14.5),
+                (breaths, datetime(2024, 1, 14, 22, 30, tzinfo=timezone.utc), 13.0),
+            ]
+        )
 
     def test_normalize_sleep_includes_naps(self, garmin_247: Garmin247Data) -> None:
         """normalize_sleep passes through the naps list and sets is_nap=False."""

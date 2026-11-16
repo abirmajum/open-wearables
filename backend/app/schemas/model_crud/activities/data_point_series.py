@@ -18,6 +18,9 @@ def _offset(zone_offset: object) -> object:
     return "+00:00" if zone_offset in (None, "Z") else zone_offset
 
 
+StatColumn = Literal["sum", "avg", "min", "max", "last"]
+
+
 class CalendarPeriod(BaseModel):
     """The calendar period a provider value stands for, with the offset that makes it local."""
 
@@ -28,6 +31,8 @@ class CalendarPeriod(BaseModel):
     end: datetime
     # A provider day with no offset stays its date, as readers treat a missing offset as UTC.
     zone_offset: str = Field("+00:00", pattern=r"^[+-]\d{2}:\d{2}$")
+    # None: the column the series type is read from. Set when the provider reports another statistic of the period.
+    stat: StatColumn | None = None
 
     _utc_forms = field_validator("zone_offset", mode="before")(_offset)
 
@@ -44,9 +49,6 @@ class CalendarPeriod(BaseModel):
             date.fromisoformat(day) if isinstance(day, str) else day, time(), iso_to_timezone(offset)
         )
         return cls(start=start, end=start + timedelta(days=1), zone_offset=offset)
-
-
-StatColumn = Literal["sum", "avg", "min", "max", "last"]
 
 
 class SessionValue(BaseModel):

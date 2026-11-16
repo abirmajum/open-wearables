@@ -38,8 +38,10 @@ from app.services.health_score_service import health_score_service
 from app.services.providers.api_client import download_binary_content, make_authenticated_request
 from app.services.providers.garmin.coverage import (
     ACTIVITY_SAMPLE_SERIES,
+    DAILIES_HEART_RATE_STATS,
     DAILIES_SERIES,
     EPOCHS_SERIES,
+    SLEEP_SERIES,
     WORKOUT_ENERGY_SERIES,
 )
 from app.services.providers.sync_247_result import Sync247Result
@@ -72,6 +74,46 @@ EPOCH_SLOT_SECONDS = 900
 # so it is summed over the slot's types and merged across pushes.
 EPOCH_SUMMED_FIELDS = {"steps": "steps", "energy": "activeKilocalories"}
 EPOCH_STORED_FIELDS = (*EPOCH_SUMMED_FIELDS.values(), "activeTimeInSeconds")
+
+# Score component → its path in a Garmin summary: the sleep summary's in-sleep aggregates on the night's SLEEP score,
+# the daily summary's stress and Body Battery fields on the day's STRESS and BODY_BATTERY scores.
+SLEEP_SCORE_COMPONENTS: dict[str, tuple[str, ...]] = {
+    "average_heart_rate": ("averageHeartRate",),
+    "lowest_heart_rate": ("lowestHeartRate",),
+    "highest_heart_rate": ("highestHeartRate",),
+    "respiration_avg": ("respirationAvg",),
+    "respiration_low": ("respirationLow",),
+    "respiration_high": ("respirationHigh",),
+    "avg_oxygen_saturation": ("avgOxygenSaturation",),
+    "low_oxygen_saturation_percentage": ("lowOxygenSaturationPercentage",),
+    "high_oxygen_saturation_percentage": ("highOxygenSaturationPercentage",),
+    "sleep_hrv": ("sleepHRV", "value"),
+}
+DAILY_STRESS_COMPONENTS: dict[str, tuple[str, ...]] = {
+    "max_stress_level": ("maxStressLevel",),
+    "stress_duration_seconds": ("stressDurationInSeconds",),
+    "rest_stress_duration_seconds": ("restStressDurationInSeconds",),
+    "activity_stress_duration_seconds": ("activityStressDurationInSeconds",),
+    "low_stress_duration_seconds": ("lowStressDurationInSeconds",),
+    "medium_stress_duration_seconds": ("mediumStressDurationInSeconds",),
+    "high_stress_duration_seconds": ("highStressDurationInSeconds",),
+}
+DAILY_BODY_BATTERY_COMPONENTS: dict[str, tuple[str, ...]] = {
+    "charged": ("bodyBatteryChargedValue",),
+    "drained": ("bodyBatteryDrainedValue",),
+}
+
+
+def _score_components(raw: dict[str, Any], paths: dict[str, tuple[str, ...]]) -> dict[str, ScoreComponent]:
+    """The components whose numbers the summary carries."""
+    components: dict[str, ScoreComponent] = {}
+    for name, path in paths.items():
+        value: Any = raw
+        for key in path:
+            value = value.get(key) if isinstance(value, dict) else None
+        if isinstance(value, int | float):
+            components[name] = ScoreComponent(value=value)
+    return components
 
 
 class Garmin247Data(Base247DataTemplate):
@@ -307,12 +349,12 @@ class Garmin247Data(Base247DataTemplate):
         overall_score = raw_sleep.get("overallSleepScore")
         if overall_score and isinstance(overall_score, dict):
             sleep_score = overall_score.get("value")
-            sleep_qualifier = overall_score.get("qualifier")
+            sleep_qualifier = overall_score.get("qualifierKey")
 
         sleep_scores = raw_sleep.get("sleepScores") or {}
         sleep_score_components = {
             key: ScoreComponent(qualifier=value.get("qualifierKey")) for key, value in sleep_scores.items()
-        }
+        } | _score_components(raw_sleep, SLEEP_SCORE_COMPONENTS)
 
         normalized = {
             "id": uuid4(),
@@ -339,6 +381,27 @@ class Garmin247Data(Base247DataTemplate):
             "raw": raw_sleep,
         }
         return normalized, self._normalize_sleep_health_score(normalized, user_id)
+
+    def _build_sleep_vitals_samples(self, user_id: UUID, raw_sleep: dict[str, Any]) -> list[TimeSeriesSampleCreate]:
+        """In-sleep SpO2 and respiration readings, each at its offset from the sleep's start (no DB interaction)."""
+        start_ts = raw_sleep.get("startTimeInSeconds")
+        if not start_ts:
+            return []
+        zone_offset = offset_to_iso(raw_sleep.get("startTimeOffsetInSeconds"))
+        return [
+            TimeSeriesSampleCreate(
+                id=uuid4(),
+                user_id=user_id,
+                source=self.provider_name,
+                recorded_at=self._from_epoch_seconds(start_ts + int(offset)),
+                zone_offset=zone_offset,
+                value=Decimal(str(value)),
+                series_type=series_type,
+            )
+            for field, series_type in SLEEP_SERIES.items()
+            for offset, value in (raw_sleep.get(field) or {}).items()
+            if value is not None and value > 0
+        ]
 
     def _build_nap_record(
         self,
@@ -505,6 +568,7 @@ class Garmin247Data(Base247DataTemplate):
         avg_stress = normalized_daily.get("avg_stress")
         raw_qualifier = normalized_daily.get("stress_qualifier")
         stress_qualifier = raw_qualifier.replace("_", " ").title() if raw_qualifier else None
+        zone_offset = normalized_daily.get("zone_offset")
         # averageStressLevel is -1 when there is not enough data to calculate
         if avg_stress is not None and avg_stress != -1:
             scores.append(
@@ -516,6 +580,21 @@ class Garmin247Data(Base247DataTemplate):
                     value=avg_stress,
                     qualifier=stress_qualifier,
                     recorded_at=recorded_at,
+                    zone_offset=zone_offset,
+                    components=normalized_daily.get("stress_components") or None,
+                )
+            )
+        # No value: the day's Body Battery is its peak from stressDetails, which these components join
+        if body_battery_components := normalized_daily.get("body_battery_components"):
+            scores.append(
+                HealthScoreCreate(
+                    id=uuid4(),
+                    user_id=user_id,
+                    provider=ProviderName.GARMIN,
+                    category=HealthScoreCategory.BODY_BATTERY,
+                    recorded_at=recorded_at,
+                    zone_offset=zone_offset,
+                    components=body_battery_components,
                 )
             )
 
@@ -542,8 +621,9 @@ class Garmin247Data(Base247DataTemplate):
             "avg_heart_rate": raw_daily.get("averageHeartRateInBeatsPerMinute"),
             "resting_heart_rate": raw_daily.get("restingHeartRateInBeatsPerMinute"),
             "avg_stress": raw_daily.get("averageStressLevel"),
-            "max_stress": raw_daily.get("maxStressLevel"),
             "stress_qualifier": raw_daily.get("stressQualifier"),
+            "stress_components": _score_components(raw_daily, DAILY_STRESS_COMPONENTS),
+            "body_battery_components": _score_components(raw_daily, DAILY_BODY_BATTERY_COMPONENTS),
             "exercise_time": seconds_to_minutes(
                 raw_daily.get("moderateIntensityDurationInSeconds"),
                 raw_daily.get("vigorousIntensityDurationInSeconds"),
@@ -584,7 +664,10 @@ class Garmin247Data(Base247DataTemplate):
             else CalendarPeriod.of_date(recorded_at.date(), zone_offset)
         )
 
-        for field, series_type in DAILIES_SERIES:
+        day_values = [(field, series_type, None) for field, series_type in DAILIES_SERIES] + [
+            (field, SeriesType.heart_rate, stat) for field, stat in DAILIES_HEART_RATE_STATS.items()
+        ]
+        for field, series_type, stat in day_values:
             value = normalized_daily.get(field)
             if value is not None:
                 samples.append(
@@ -598,7 +681,7 @@ class Garmin247Data(Base247DataTemplate):
                         series_type=series_type,
                         external_id=normalized_daily.get("garmin_summary_id"),
                         is_daily_total=daily_total_flag(series_type, is_daily=True),
-                        period=period,
+                        period=period.model_copy(update={"stat": stat}),
                     )
                 )
 
@@ -1816,7 +1899,7 @@ class Garmin247Data(Base247DataTemplate):
         all_sleep_details: list[EventRecordDetailCreate] = []
         all_mct_details: list[MenstrualCycleDetailCreate] = []
         all_health_scores: list[HealthScoreCreate] = []
-        body_battery_peaks: list[HealthScoreCreate] = []
+        night_scores: list[tuple[EventRecordCreate, HealthScoreCreate]] = []
         epoch_items: list[dict[str, Any]] = []
 
         for item in items:
@@ -1837,7 +1920,7 @@ class Garmin247Data(Base247DataTemplate):
                     case "stressDetails":
                         all_samples.extend(self._build_stress_samples(user_id, item))
                         if score := self._normalize_body_battery_health_score(user_id, item):
-                            body_battery_peaks.append(score)
+                            all_health_scores.append(score)
                     case "allDayRespiration":
                         all_samples.extend(self._build_respiration_samples(user_id, item))
                     case "pulseox":
@@ -1859,8 +1942,8 @@ class Garmin247Data(Base247DataTemplate):
                             record, detail = result
                             all_records.append(record)
                             all_sleep_details.append(detail)
-                        if health_score:
-                            all_health_scores.append(health_score)
+                            if health_score:
+                                night_scores.append((record, health_score))
                         for raw_nap in normalized.get("naps", []):
                             nap_result = self._build_nap_record(
                                 raw_nap, user_id, normalized.get("garmin_summary_id"), normalized.get("validation")
@@ -1869,6 +1952,7 @@ class Garmin247Data(Base247DataTemplate):
                                 nap_record, nap_detail = nap_result
                                 all_records.append(nap_record)
                                 all_sleep_details.append(nap_detail)
+                        all_samples.extend(self._build_sleep_vitals_samples(user_id, item))
                     case "activities":
                         result = self._build_activity_record(user_id, item)
                         if result:
@@ -2032,14 +2116,50 @@ class Garmin247Data(Base247DataTemplate):
 
             count += WriteCounts(len(inserted_ids), 0)
 
-        if all_health_scores:
-            count += health_score_service.bulk_create(db, all_health_scores)
+        if night_scores:
+            count += self._save_night_scores(db, user_id, night_scores)
+
+        # Body Battery is the day's peak, which a later push raises; the dailies only add its components
+        peaks = [s for s in all_health_scores if s.category == HealthScoreCategory.BODY_BATTERY]
+        if scores := [s for s in all_health_scores if s.category != HealthScoreCategory.BODY_BATTERY]:
+            count += health_score_service.bulk_create(db, scores)
             db.commit()
-        if body_battery_peaks:
-            # A day may already hold a lower peak from an earlier push
-            count += health_score_service.bulk_create_keeping_highest(db, body_battery_peaks)
+        if peaks:
+            count += health_score_service.bulk_create_keeping_highest(db, peaks)
             db.commit()
 
+        return count
+
+    def _save_night_scores(
+        self, db: DbSession, user_id: UUID, night_scores: list[tuple[EventRecordCreate, HealthScoreCreate]]
+    ) -> WriteCounts:
+        """Each SLEEP score on its stored night: a re-sent night is not inserted again, so it is found by its
+        summary id and span, and its score is refreshed in place."""
+        stored = self.event_record_repo.get_ids_by_external_span(
+            db,
+            user_id,
+            [(record.external_id, record.start_datetime, record.end_datetime) for record, _ in night_scores],
+            self.provider_name,
+        )
+        count = WriteCounts(0, 0)
+        for record, score in night_scores:
+            record_id = stored.get((record.external_id, record.start_datetime, record.end_datetime))
+            if record_id is None:
+                continue
+            try:
+                saved = health_score_service.upsert_event_score(
+                    db, score.model_copy(update={"event_record_id": record_id})
+                )
+            except ValueError as e:
+                logger.warning(
+                    "Sleep score not linked to its night",
+                    provider="garmin",
+                    user_id=str(user_id),
+                    summary_id=record.external_id,
+                    error=str(e),
+                )
+                continue
+            count += WriteCounts(1, 0) if saved.id == score.id else WriteCounts(0, 1)
         return count
 
     # -------------------------------------------------------------------------

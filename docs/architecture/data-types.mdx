@@ -341,6 +341,7 @@ Besides timeseries and workouts, the API returns these record types:
 | `/events/sleep` | Sleep sessions with stage totals and, with `?include=stages`, stage intervals |
 | `/events/meals` | Meals with calories, macros and per-nutrient values (the `dietary_*` types above) |
 | `/events/menstrual-cycles` | Menstrual cycle records (cycle day, phase, period and cycle length) |
+| `/events/activities` | Activities the device detected by itself outside a recorded workout, such as Garmin Move IQ walks (type, start, end, duration) |
 | `/summaries/activity`, `/summaries/sleep`, `/summaries/recovery` | Per-day rollups |
 | `/summaries/body` | Current snapshot: latest slow-changing values (weight, body fat, ...), vitals averaged over `average_period` days, and readings from the last `latest_window_hours` |
 | `/health-scores` | Provider and Open Wearables scores |

@@ -155,6 +155,18 @@ class SleepSession(BaseModel):
     )
 
 
+class ActivityRecord(BaseModel):
+    """An activity the device detected by itself, outside a recorded workout (e.g. Garmin Move IQ)."""
+
+    id: UUID
+    type: str | None = Field(None, example="moveiq_walking")
+    start_time: datetime
+    end_time: datetime
+    zone_offset: str | None = None
+    duration_seconds: int | None = None
+    source: SourceMetadata
+
+
 class MenstrualCycleRecord(BaseModel):
     id: UUID
     start_time: datetime

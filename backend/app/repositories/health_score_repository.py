@@ -3,7 +3,7 @@ from typing import Any
 from typing import cast as typing_cast
 from uuid import UUID
 
-from sqlalchemy import Date, and_, cast, delete, func, literal_column, or_, select, text, tuple_
+from sqlalchemy import Date, and_, case, cast, delete, func, literal_column, or_, select, text, tuple_
 from sqlalchemy.dialects.postgresql import insert
 
 from app.database import DbSession
@@ -275,20 +275,42 @@ class HealthScoreRepository(CrudRepository[HealthScore, HealthScoreCreate, Healt
     def bulk_create_keeping_highest(self, db_session: DbSession, creators: list[HealthScoreCreate]) -> WriteCounts:
         """Bulk upsert health scores, keeping the higher value when a score for the same time is sent again.
 
-        For a peak the provider resends with more data as the day goes on, e.g. Garmin body battery.
-        Scores without a value are skipped.
+        For a peak the provider resends with more data as the day goes on, e.g. Garmin body battery. Components are
+        added to the stored ones, and a score without a value adds only its components: another feed of the same day
+        (Garmin dailies) fills them in whether it arrives before the peak or after it. A score with neither is skipped.
         """
-        # The highest of each key: ON CONFLICT DO UPDATE can't touch a row twice in one statement
-        with_value = sorted((c for c in creators if c.value is not None), key=lambda c: c.value or 0)
-        highest = {(c.user_id, c.provider, c.data_source_id, c.category, c.recorded_at): c for c in with_value}
-        if not highest:
+        # One row per key: ON CONFLICT DO UPDATE can't touch a row twice in one statement
+        merged: dict[tuple, HealthScoreCreate] = {}
+        for creator in creators:
+            if creator.value is None and not creator.components:
+                continue
+            key = (creator.user_id, creator.provider, creator.data_source_id, creator.category, creator.recorded_at)
+            if known := merged.get(key):
+                creator = creator.model_copy(
+                    update={
+                        "value": max((v for v in (known.value, creator.value) if v is not None), default=None),
+                        "components": {**(known.components or {}), **(creator.components or {})} or None,
+                    }
+                )
+            merged[key] = creator
+        if not merged:
             return WriteCounts(0, 0)
 
-        stmt = insert(HealthScore).values([c.model_dump() for c in highest.values()])
+        stmt = insert(HealthScore).values([c.model_dump() for c in merged.values()])
+        # GREATEST skips NULL, so a score without a value never lowers or clears the stored one
+        value = func.greatest(HealthScore.value, stmt.excluded.value)
+        # A missing components value is written as JSON null, which || would turn into an array
+        stored, sent = (
+            func.nullif(c, literal_column("'null'::jsonb")) for c in (HealthScore.components, stmt.excluded.components)
+        )
+        components = case(
+            (sent.is_(None), HealthScore.components),
+            else_=func.coalesce(stored, literal_column("'{}'::jsonb")).op("||")(sent),
+        )
         stmt = stmt.on_conflict_do_update(
             index_elements=["user_id", "provider", "data_source_id", "category", "recorded_at"],
-            set_={"value": stmt.excluded.value},
-            where=or_(HealthScore.value.is_(None), stmt.excluded.value > HealthScore.value),
+            set_={"value": value, "components": components},
+            where=or_(HealthScore.value.is_distinct_from(value), HealthScore.components.is_distinct_from(components)),
         ).returning(literal_column("xmax = 0"))
         was_insert = db_session.execute(stmt).scalars().all()
         inserted = sum(was_insert)

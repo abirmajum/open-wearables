@@ -567,7 +567,7 @@ class TestHealthScoreRepositoryBulkCreateKeepingHighest:
         assert score.value == Decimal("78")
         assert (written.inserted, written.updated) == (0, 1)
 
-    def test_a_score_without_a_value_is_skipped(self, db: Session, repo: HealthScoreRepository) -> None:
+    def test_a_score_without_a_value_or_components_is_skipped(self, db: Session, repo: HealthScoreRepository) -> None:
         user = UserFactory()
 
         written = repo.bulk_create_keeping_highest(db, [_body_battery(user.id, datetime.now(timezone.utc), None)])

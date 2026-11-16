@@ -442,6 +442,7 @@ def dump(base_url: str, api_key: str, today: date, out: Path) -> None:
                 "events_workouts": (f"{base}/events/workouts", {**span, "include": ["zones", "segments"]}),
                 "events_sleep": (f"{base}/events/sleep", {**span, "filter_by_priority": "false", "include": "stages"}),
                 "events_menstrual_cycles": (f"{base}/events/menstrual-cycles", span),
+                "events_activities": (f"{base}/events/activities", span),
                 "health_scores": (
                     f"{base}/health-scores",
                     {"start_date": start, "end_date": end, "limit": 100, "offset": 0},

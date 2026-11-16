@@ -290,6 +290,7 @@
               "GET /api/v1/users/{user_id}/events/sleep",
               "GET /api/v1/users/{user_id}/events/sleep/totals",
               "DELETE /api/v1/users/{user_id}/events/sleep/{sleep_id}",
+              "GET /api/v1/users/{user_id}/events/activities",
               "GET /api/v1/users/{user_id}/events/meals",
               "DELETE /api/v1/users/{user_id}/events/meals/{meal_id}"
             ]

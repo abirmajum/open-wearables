@@ -49,6 +49,7 @@ from app.schemas.model_crud.activities import (
 from app.schemas.model_crud.activities.sleep import SleepStage
 from app.schemas.model_crud.activities.zones import HRZones, PowerZones
 from app.schemas.responses.activity import (
+    ActivityRecord,
     Macros,
     Meal,
     MenstrualCycleRecord,
@@ -1296,6 +1297,66 @@ class EventRecordService(
                     pregnancy_snapshot=details.pregnancy_snapshot if details else None,
                 )
             )
+
+        return PaginatedResponse(
+            data=data,
+            pagination=Pagination(
+                has_more=has_more,
+                next_cursor=next_cursor,
+                previous_cursor=previous_cursor,
+                total_count=total_count,
+            ),
+            metadata=TimeseriesMetadata(
+                sample_count=len(data),
+                start_time=params.start_datetime,
+                end_time=params.end_datetime,
+            ),
+        )
+
+    def get_activities(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        params: EventRecordQueryParams,
+    ) -> PaginatedResponse[ActivityRecord]:
+        params.category = EventCategory.ACTIVITY
+        records, total_count = self._get_records_with_filters(db_session, params, str(user_id))
+
+        limit = params.limit or 20
+        has_more = len(records) > limit
+        is_backward = params.cursor and params.cursor.startswith("prev_")
+
+        if has_more:
+            records = records[-limit:] if is_backward else records[:limit]
+
+        next_cursor = None
+        previous_cursor = None
+
+        if records:
+            if has_more:
+                last_record, _ = records[-1]
+                next_cursor = encode_cursor(last_record.start_datetime, last_record.id, "next")
+            if params.cursor:
+                if is_backward:
+                    if has_more:
+                        first_record, _ = records[0]
+                        previous_cursor = encode_cursor(first_record.start_datetime, first_record.id, "prev")
+                else:
+                    first_record, _ = records[0]
+                    previous_cursor = encode_cursor(first_record.start_datetime, first_record.id, "prev")
+
+        data = [
+            ActivityRecord(
+                id=record.id,
+                type=record.type,
+                start_time=record.start_datetime,
+                end_time=record.end_datetime,
+                zone_offset=record.zone_offset,
+                duration_seconds=record.duration_seconds,
+                source=self._map_source(data_source),
+            )
+            for record, data_source in records
+        ]
 
         return PaginatedResponse(
             data=data,
