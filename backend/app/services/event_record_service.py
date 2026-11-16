@@ -552,7 +552,8 @@ class EventRecordService(
         self, db_session: DbSession, user_id: UUID, provider: str, copies: list[tuple[EventRecord, str | None]]
     ) -> EventRecord:
         """The one workout these copies of an id are: each copy under no device is merged into the one copy under a
-        device, a value either holds kept and the device's kept where both do, and then deleted.
+        device, a value either holds kept and the device's kept where both do, and then deleted. A statistic both hold
+        keeps the larger count.
 
         Copies under two devices, or under none, are no copy of a FIT file and its summary, so all are kept and the
         first stands for the workout. Coverage is not recounted, as when a push shortens a stored workout. The recount
@@ -600,7 +601,10 @@ class EventRecordService(
             db_session.execute(
                 stats.update()
                 .where(stats.c.record_id == target.id, other_stats.c.record_id == copy.id, same_series)
-                .values({c: func.coalesce(stats.c[c], other_stats.c[c]) for c in ("sum", "avg", "min", "max", "last")})
+                .values(
+                    {c: func.coalesce(stats.c[c], other_stats.c[c]) for c in ("sum", "avg", "min", "max", "last")}
+                    | {"count": func.greatest(stats.c.count, other_stats.c.count)}
+                )
             )
             db_session.execute(
                 stats.update()

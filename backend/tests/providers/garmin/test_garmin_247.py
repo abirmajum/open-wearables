@@ -1121,6 +1121,38 @@ class TestGarmin247Data:
             (other_provider, "321", "polar"),
         }
 
+    def test_merging_a_workout_stored_twice_keeps_the_larger_count_of_a_statistic(
+        self, garmin_247: Garmin247Data, db: Session
+    ) -> None:
+        user = UserFactory()
+        device_copy, fit_copy = self._stored_twice(garmin_247, db, user)
+        heart_rate = get_series_type_id(SeriesType.heart_rate)
+        for record_id, values in ((device_copy, {"avg": 150, "count": 5}), (fit_copy, {"max": 175, "count": 1200})):
+            db.add(
+                EventRecordAggregate(
+                    id=uuid4(),
+                    record_id=record_id,
+                    series_type_definition_id=heart_rate,
+                    computed_by=ComputedBy.OPEN_WEARABLES,
+                    **values,
+                )
+            )
+        db.flush()
+
+        garmin_247.process_items_batch(db, user.id, "activityDetails", [self._WORKOUT_PUSHES["activityDetails"]])
+
+        db.expire_all()
+        [stat] = (
+            db.query(EventRecordAggregate)
+            .filter(
+                EventRecordAggregate.record_id == device_copy,
+                EventRecordAggregate.series_type_definition_id == heart_rate,
+                EventRecordAggregate.computed_by == ComputedBy.OPEN_WEARABLES,
+            )
+            .all()
+        )
+        assert (stat.avg, stat.max, stat.count) == (Decimal("150"), Decimal("175"), 1200)
+
     def test_merging_a_workout_stored_twice_leaves_its_coverage(self, garmin_247: Garmin247Data, db: Session) -> None:
         """Coverage is not narrowed when the kept copy is shorter, as when a push shortens a stored workout."""
         user = UserFactory()
