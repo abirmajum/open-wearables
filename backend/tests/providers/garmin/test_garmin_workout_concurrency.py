@@ -23,8 +23,9 @@ from app.repositories.user_connection_repository import UserConnectionRepository
 from app.schemas.providers.garmin import ActivityJSON as GarminActivityJSON
 from app.services.providers.garmin.data_247 import Garmin247Data
 from app.services.providers.garmin.oauth import GarminOAuth
+from app.services.providers.garmin.webhook_handler import GarminWebhookHandler
 from app.services.providers.garmin.workouts import GarminWorkouts
-from tests.factories import UserFactory
+from tests.factories import UserConnectionFactory, UserFactory
 from tests.fixtures.fit_builder import make_running_fit
 
 _RUN = {
@@ -70,21 +71,35 @@ def garmin() -> tuple[Garmin247Data, GarminWorkouts]:
 
 
 @pytest.fixture
-def committed_user(engine: Engine) -> Generator[UUID, None, None]:
-    """A committed user, deleted afterwards with the provider priority its first data source seeds."""
+def committed_users(engine: Engine) -> Generator[Callable[[str | None], UUID], None, None]:
+    """Commits a user, connected to Garmin under the given Garmin user id when one is given. Each is deleted
+    afterwards with the provider priorities their first data sources seed."""
     with Session(bind=engine) as session:
-        user = UserFactory.build()
-        session.add(user)
-        session.commit()
-        user_id = user.id
         priorities = list(session.execute(text("SELECT id FROM provider_priority")).scalars())
+    user_ids: list[UUID] = []
+
+    def create(garmin_user_id: str | None = None) -> UUID:
+        with Session(bind=engine) as session:
+            user = UserFactory.build()
+            session.add(user)
+            if garmin_user_id:
+                session.add(UserConnectionFactory.build(user_id=user.id, provider_user_id=garmin_user_id))
+            session.commit()
+            user_ids.append(user.id)
+            return user.id
+
     try:
-        yield user_id
+        yield create
     finally:
         with Session(bind=engine) as session:
-            session.execute(text('DELETE FROM "user" WHERE id = :id'), {"id": user_id})
+            session.execute(text('DELETE FROM "user" WHERE id = ANY(:ids)'), {"ids": user_ids})
             session.execute(text("DELETE FROM provider_priority WHERE NOT (id = ANY(:kept))"), {"kept": priorities})
             session.commit()
+
+
+@pytest.fixture
+def committed_user(committed_users: Callable[[str | None], UUID]) -> UUID:
+    return committed_users(None)
 
 
 def _push(garmin: tuple[Garmin247Data, GarminWorkouts], summary_type: str, user_id: UUID) -> Callable[[Session], None]:
@@ -192,3 +207,66 @@ def test_an_activity_and_its_details_pushed_together_leave_one_workout(
     assert detail is not None
     assert (detail.label, detail.entry_source, detail.max_speed) == ("Morning Run", "automatic", Decimal("4.1"))
     assert (detail.steps_count, detail.total_elevation_gain) == (8240, Decimal("84"))
+
+
+def test_two_pushes_each_carrying_one_users_details_and_the_others_fit_file_store_both(
+    engine: Engine, committed_users: Callable[[str | None], UUID], garmin: tuple[Garmin247Data, GarminWorkouts]
+) -> None:
+    """Garmin can deliver one user's activityDetails with another user's FIT file, and a second push the other
+    way round. Each push locks its details' workout, then waits on the other push's lock for its FIT file."""
+    data_247, workouts = garmin
+    users = {"garmin_user_a": committed_users("garmin_user_a"), "garmin_user_b": committed_users("garmin_user_b")}
+
+    def details(garmin_user_id: str, activity_id: int, start: int = _RUN["startTimeInSeconds"]) -> dict[str, Any]:
+        summary = {**_RUN, "activityId": activity_id, "startTimeInSeconds": start, "steps": 8240}
+        return {"userId": garmin_user_id, "activityId": activity_id, "summary": summary}
+
+    def fit_file(garmin_user_id: str, activity_id: int) -> dict[str, Any]:
+        return {**_PUSHES["activityFiles"], "userId": garmin_user_id, "activityId": activity_id}
+
+    payloads = [
+        {"activityDetails": [details("garmin_user_a", 321)], "activityFiles": [fit_file("garmin_user_b", 654)]},
+        {"activityDetails": [details("garmin_user_b", 654)], "activityFiles": [fit_file("garmin_user_a", 321)]},
+    ]
+    both_downloading = threading.Barrier(2, timeout=_WAIT_SECONDS)
+
+    def download(**_kwargs: Any) -> bytes:
+        both_downloading.wait()
+        return make_running_fit()
+
+    handler = GarminWebhookHandler(workouts, data_247, data_247.oauth)
+    factory = sessionmaker(bind=engine, autoflush=False)
+    # An earlier workout of each user, so the race does not first create their device and its provider priority
+    for garmin_user_id in users:
+        with factory() as session:
+            day_before = _RUN["startTimeInSeconds"] - 86400
+            handler.process_payload(session, {"activityDetails": [details(garmin_user_id, 1, day_before)]}, "trace")
+    results: list[dict[str, Any]] = []
+    errors: list[BaseException] = []
+
+    def deliver(payload: dict[str, Any]) -> None:
+        with factory() as session:
+            try:
+                results.append(handler.process_payload(session, payload, "trace"))
+            except BaseException as e:
+                errors.append(e)
+
+    with (
+        patch("app.services.providers.garmin.data_247.download_binary_content", side_effect=download),
+        patch("app.services.providers.garmin.data_247.store_fit_file"),
+    ):
+        threads = [threading.Thread(target=deliver, args=(payload,)) for payload in payloads]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(_WAIT_SECONDS * 2)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert not errors, errors
+    assert [result["errors"] for result in results] == [[], []]
+    for garmin_user_id, activity_id in (("garmin_user_a", "321"), ("garmin_user_b", "654")):
+        [(record, detail, source)] = [w for w in _workouts(engine, users[garmin_user_id]) if w[0].external_id != "1"]
+        assert (record.external_id, source.device_model) == (activity_id, "forerunner965")
+        assert detail is not None
+        assert (detail.steps_count, detail.aerobic_training_effect) == (8240, Decimal("3.4"))
+        assert detail.segments
