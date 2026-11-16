@@ -50,6 +50,42 @@ def _wave(i: int, base: float, swing: float, period: int = 5) -> float:
 # Garmin
 # ---------------------------------------------------------------------------
 
+# The last complete day carries Garmin's real cadences; the other days stay sparse so dumps stay small.
+DENSE_DAY = DAYS - 2
+# That day's run (activity 21000101), as seconds from local midnight.
+DENSE_RUN = (int(7.5 * 3600), int(7.5 * 3600) + 2940)
+DENSE_WAKE = int(6.4 * 3600)
+
+
+def _dense_heart_rate(t: int) -> int:
+    """Beats per minute ``t`` seconds after local midnight on the dense day: asleep, the run, awake, winding down."""
+    k = t // 15
+    if t < DENSE_WAKE:
+        return 50 + (k * 7) % 6
+    if DENSE_RUN[0] <= t < DENSE_RUN[1]:
+        return 140 + ((t - DENSE_RUN[0]) // 60) % 25
+    if t >= 22 * 3600:
+        return 56 + (k * 5) % 10
+    return 60 + (k * 13) % 31
+
+
+def _dense_stress(t: int) -> int:
+    """Garmin's stress level every 3 minutes; -2 is too much motion to measure, -1 off the wrist."""
+    if DENSE_RUN[0] <= t < DENSE_RUN[1]:
+        return -2
+    if 19 * 3600 <= t < 19 * 3600 + 900:
+        return -1
+    k = t // 180
+    return 8 + k % 12 if t < DENSE_WAKE else 22 + (k * 17) % 48
+
+
+def _dense_body_battery(t: int) -> int:
+    """Charges overnight from 31 to 92, drains through the day, faster on the run."""
+    if t < DENSE_WAKE:
+        return 31 + round(61 * t / DENSE_WAKE)
+    drained = (t - DENSE_WAKE) * 58 // (86400 - DENSE_WAKE) + (12 if t >= DENSE_RUN[1] else 0)
+    return max(5, 92 - drained)
+
 
 def _garmin_daily(i: int, day: date, is_today: bool) -> dict[str, Any]:
     start = _epoch(day, 0, GARMIN_OFFSET)
@@ -79,7 +115,11 @@ def _garmin_daily(i: int, day: date, is_today: bool) -> dict[str, Any]:
         "averageHeartRateInBeatsPerMinute": int(_wave(i, 66, 4)),
         "maxHeartRateInBeatsPerMinute": int(_wave(i, 158, 12)),
         "restingHeartRateInBeatsPerMinute": int(_wave(i, 52, 3)),
-        "timeOffsetHeartRateSamples": {str(h * 3600): 55 + (h * 7 + i) % 40 for h in range(hours)},
+        "timeOffsetHeartRateSamples": (
+            {str(t): _dense_heart_rate(t) for t in range(0, 86400, 15)}
+            if i == DENSE_DAY
+            else {str(h * 3600): 55 + (h * 7 + i) % 40 for h in range(hours)}
+        ),
         "averageStressLevel": int(_wave(i, 31, 8)),
         "maxStressLevel": int(_wave(i, 88, 7)),
         "stressDurationInSeconds": int(_wave(i, 14400, 3600)),
@@ -97,7 +137,45 @@ def _garmin_daily(i: int, day: date, is_today: bool) -> dict[str, Any]:
     }
 
 
+def _garmin_dense_epochs(day: date) -> list[dict[str, Any]]:
+    """One 15-minute epoch for every quarter hour of the dense day."""
+    epochs = []
+    for t in range(0, 86400, 900):
+        start = _epoch(day, 0, GARMIN_OFFSET) + t
+        running = DENSE_RUN[0] <= t < DENSE_RUN[1]
+        steps = 2400 if running else 0 if t < DENSE_WAKE or t >= 22 * 3600 else (t // 900 * 137) % 900
+        activity_type, code, intensity = (
+            ("RUNNING", "1", "HIGHLY_ACTIVE")
+            if running
+            else ("WALKING", "8", "ACTIVE")
+            if steps
+            else ("SEDENTARY", "0", "SEDENTARY")
+        )
+        epochs.append(
+            {
+                "userId": GARMIN_USER_ID,
+                "summaryId": f"x3f1-{start:x}-{code}",
+                "activityType": activity_type,
+                "activeKilocalories": 190 if running else steps // 25 + 2,
+                "steps": steps,
+                "distanceInMeters": round(steps * (1.12 if running else 0.78), 1),
+                "durationInSeconds": 900,
+                "activeTimeInSeconds": 900 if running else min(900, steps * 6 // 10),
+                "startTimeInSeconds": start,
+                "startTimeOffsetInSeconds": GARMIN_OFFSET,
+                "met": 9.8 if running else 3.1 if steps else 1.0,
+                "intensity": intensity,
+                "meanMotionIntensity": 6.5 if running else 2.4 if steps else 0.0,
+                "maxMotionIntensity": 7.0 if running else 5.0 if steps else 0.0,
+                "meanHeartRateInBeatsPerMinute": round(sum(_dense_heart_rate(t + s) for s in range(0, 900, 15)) / 60),
+            }
+        )
+    return epochs
+
+
 def _garmin_epochs(i: int, day: date, is_today: bool) -> list[dict[str, Any]]:
+    if i == DENSE_DAY:
+        return _garmin_dense_epochs(day)
     epochs = []
     for hour in range(8, 13 if is_today else 22, 2):
         start = _epoch(day, hour, GARMIN_OFFSET)
@@ -219,6 +297,17 @@ def _garmin_stress(i: int, day: date, is_today: bool) -> dict[str, Any]:
     start = _epoch(day, 0, GARMIN_OFFSET)
     slots = (13 if is_today else 24) * 2
     battery = [min(100, max(5, 35 + (s if s < 14 else 14) * 4 - max(0, s - 14) * 2 - i)) for s in range(slots)]
+    if i == DENSE_DAY:
+        return {
+            "userId": GARMIN_USER_ID,
+            "summaryId": f"x3f1-str-{day.isoformat()}",
+            "calendarDate": day.isoformat(),
+            "startTimeInSeconds": start,
+            "startTimeOffsetInSeconds": GARMIN_OFFSET,
+            "durationInSeconds": 86400,
+            "timeOffsetStressLevelValues": {str(t): _dense_stress(t) for t in range(0, 86400, 180)},
+            "timeOffsetBodyBatteryValues": {str(t): _dense_body_battery(t) for t in range(0, 86400, 180)},
+        }
     return {
         "userId": GARMIN_USER_ID,
         "summaryId": f"x3f1-str-{day.isoformat()}",
@@ -242,7 +331,11 @@ def _garmin_respiration(i: int, day: date, is_today: bool) -> dict[str, Any]:
         "startTimeInSeconds": start,
         "durationInSeconds": hours * 3600,
         "startTimeOffsetInSeconds": GARMIN_OFFSET,
-        "timeOffsetEpochToBreaths": {str(h * 3600): round(13.0 + ((h + i) % 6) * 0.5, 1) for h in range(hours)},
+        "timeOffsetEpochToBreaths": (
+            {str(t): round((12.4 if t < DENSE_WAKE else 14.8) + ((t // 60) % 7) * 0.3, 1) for t in range(0, 86400, 60)}
+            if i == DENSE_DAY
+            else {str(h * 3600): round(13.0 + ((h + i) % 6) * 0.5, 1) for h in range(hours)}
+        ),
     }
 
 
@@ -255,7 +348,12 @@ def _garmin_pulse_ox(i: int, day: date) -> dict[str, Any]:
         "startTimeInSeconds": start,
         "durationInSeconds": 25200,
         "startTimeOffsetInSeconds": GARMIN_OFFSET,
-        "timeOffsetSpo2Values": {str(h * 3600): 94 + (h + i) % 5 for h in range(7)},
+        # The pulse oximeter reads every minute through the night on the dense day
+        "timeOffsetSpo2Values": (
+            {str(t): 93 + (t // 60 * 3) % 6 for t in range(0, 25200, 60)}
+            if i == DENSE_DAY
+            else {str(h * 3600): 94 + (h + i) % 5 for h in range(7)}
+        ),
         "onDemand": False,
     }
 

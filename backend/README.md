@@ -174,7 +174,9 @@ uv run python scripts/rumi_fixture_server.py --today 2026-11-15
 
 The last line on stdout is one JSON object: `base_url`, `port`, `api_key` and each user's `label`, `id` and
 `providers` (Garmin, Ultrahuman and WHOOP alone, and each pair of them worn by one person). The seeds cover the ten
-days ending on `--today`; pick a recent date, since score look-backs run from the real clock. `--dump-to DIR` writes
+days ending on `--today`; pick a recent date, since score look-backs run from the real clock. The day before
+`--today` carries Garmin's real cadences (heart rate every 15 seconds, stress and Body Battery every 3 minutes,
+respiration and overnight SpO2 every minute, a 15-minute epoch each quarter hour); the other days stay sparse. `--dump-to DIR` writes
 every v1 GET response per user, `--no-serve` exits after that, and `--port` fixes the port. Edit
 `scripts/rumi_fixture_seeds/generate.py` and run it to change the seeds.
 
