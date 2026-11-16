@@ -75,6 +75,8 @@ HISTORY_RULES: tuple[HistoryRule, ...] = (
             SeriesType.distance_walking_running,
             SeriesType.active_time,
             SeriesType.exercise_time,
+            SeriesType.moderate_intensity_time,
+            SeriesType.vigorous_intensity_time,
         ),
         where=_DAILY_TOTAL,
         day=DayAnchor.LOCAL,

@@ -877,6 +877,24 @@ class TestGarmin247Data:
         # steps, active and basal energy, resting HR, floors, distance, Garmin's day HR; intraday HR stays a sample
         assert db.query(SeriesAggregate).count() == 7
 
+    def test_dailies_intensity_minutes_are_day_values_of_their_own(
+        self, db: Session, garmin_247: Garmin247Data, sample_daily: dict[str, Any]
+    ) -> None:
+        user = UserFactory()
+        daily = {**sample_daily, "moderateIntensityDurationInSeconds": 1800, "vigorousIntensityDurationInSeconds": 930}
+
+        garmin_247.process_items_batch(db, user.id, "dailies", [daily])
+
+        days = {row.series_type_definition_id: row.sum for row in db.query(SeriesAggregate)}
+        assert [
+            days[get_series_type_id(series_type)]
+            for series_type in (
+                SeriesType.moderate_intensity_time,
+                SeriesType.vigorous_intensity_time,
+                SeriesType.exercise_time,
+            )
+        ] == [30, 15, 45]
+
     def test_dailies_heart_rate_is_garmins_own_day_value(
         self, db: Session, garmin_247: Garmin247Data, sample_daily: dict[str, Any]
     ) -> None:

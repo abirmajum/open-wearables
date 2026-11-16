@@ -629,6 +629,8 @@ class Garmin247Data(Base247DataTemplate):
                 raw_daily.get("moderateIntensityDurationInSeconds"),
                 raw_daily.get("vigorousIntensityDurationInSeconds"),
             ),
+            "moderate_intensity_time": seconds_to_minutes(raw_daily.get("moderateIntensityDurationInSeconds")),
+            "vigorous_intensity_time": seconds_to_minutes(raw_daily.get("vigorousIntensityDurationInSeconds")),
             "active_time": seconds_to_minutes(raw_daily.get("activeTimeInSeconds")),
             "heart_rate_samples": raw_daily.get("timeOffsetHeartRateSamples"),
             "garmin_summary_id": raw_daily.get("summaryId"),

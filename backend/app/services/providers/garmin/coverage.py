@@ -27,6 +27,8 @@ DAILIES_SERIES: list[tuple[str, SeriesType]] = [
     ("distance_meters", SeriesType.distance_walking_running),
     ("active_time", SeriesType.active_time),
     ("exercise_time", SeriesType.exercise_time),
+    ("moderate_intensity_time", SeriesType.moderate_intensity_time),
+    ("vigorous_intensity_time", SeriesType.vigorous_intensity_time),
 ]
 
 # Daily summary heart rate field → the statistic of Garmin's heart_rate day value it fills (/wellness-api/rest/dailies).

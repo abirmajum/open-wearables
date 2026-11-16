@@ -483,7 +483,8 @@ class SummariesService:
         - Heart rate stats (avg, max, min)
         - Active/sedentary minutes (based on step threshold)
         - Intensity minutes (HR zones using max HR = 220 - age):
-          light 50-63%, moderate 64-76%, vigorous 77-93%
+          light 50-63%, moderate 64-76%, vigorous 77-93%; the provider's own moderate and vigorous
+          minutes (Garmin's intensity minutes) where it reports them
         """
         logger.debug(
             "Fetching activity summaries",
@@ -633,16 +634,21 @@ class SummariesService:
                 active_mins = activity_data.get("active_minutes")
             sedentary_mins = activity_data.get("sedentary_minutes")
 
-            # Get intensity minutes from HR data
+            # Intensity minutes from HR data, moderate and vigorous as the provider counts them where it reports them
             intensity_mins = None
-            if intensity_data:
-                light = intensity_data.get("light_minutes", 0)
-                moderate = intensity_data.get("moderate_minutes", 0)
-                vigorous = intensity_data.get("vigorous_minutes", 0)
+            reported_moderate = result.get("moderate_intensity_minutes")
+            reported_vigorous = result.get("vigorous_intensity_minutes")
+            if reported_moderate is not None or reported_vigorous is not None:
                 intensity_mins = IntensityMinutes(
-                    light=light,
-                    moderate=moderate,
-                    vigorous=vigorous,
+                    light=intensity_data.get("light_minutes") if intensity_data else None,
+                    moderate=reported_moderate,
+                    vigorous=reported_vigorous,
+                )
+            elif intensity_data:
+                intensity_mins = IntensityMinutes(
+                    light=intensity_data.get("light_minutes", 0),
+                    moderate=intensity_data.get("moderate_minutes", 0),
+                    vigorous=intensity_data.get("vigorous_minutes", 0),
                 )
 
             summary = ActivitySummary(

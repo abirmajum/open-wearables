@@ -20368,6 +20368,8 @@
           "active_time",
           "total_energy",
           "sedentary_time",
+          "moderate_intensity_time",
+          "vigorous_intensity_time",
           "distance_walking_running",
           "distance_cycling",
           "distance_swimming",

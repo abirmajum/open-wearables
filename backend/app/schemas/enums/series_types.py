@@ -93,6 +93,8 @@ class SeriesType(str, Enum):
     active_time = "active_time"  # Provider-reported daily active time (non-sedentary)
     total_energy = "total_energy"  # Provider-reported total energy (active + basal), no split available
     sedentary_time = "sedentary_time"
+    moderate_intensity_time = "moderate_intensity_time"  # Provider-reported daily intensity minutes
+    vigorous_intensity_time = "vigorous_intensity_time"
 
     # =========================================================================
     # ACTIVITY - Distance (IDs 100-119)
@@ -310,6 +312,8 @@ SERIES_TYPE_DEFINITIONS: list[tuple[int, SeriesType, str]] = [
     (88, SeriesType.active_time, "minutes"),
     (89, SeriesType.total_energy, "kcal"),
     (90, SeriesType.sedentary_time, "minutes"),
+    (91, SeriesType.moderate_intensity_time, "minutes"),
+    (92, SeriesType.vigorous_intensity_time, "minutes"),
     # -------------------------------------------------------------------------
     # ACTIVITY - Distance (IDs 100-119)
     # -------------------------------------------------------------------------
