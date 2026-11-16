@@ -49,6 +49,12 @@ DUMP_DAYS_BEFORE = 13
 FROZEN_CLOCK = time(23, 59, tzinfo=timezone(timedelta(hours=3)))
 # Seeding runs this long before it, so what a sync stamps with its own time is in the past when the API is read.
 SEEDED_BEFORE = timedelta(minutes=5)
+# What the server keeps from the shell: the process basics, and how to reach Docker for its own containers.
+INHERITED_ENV = frozenset({"PATH", "HOME", "TMPDIR", "USER", "LOGNAME", "LANG", "TERM"})
+INHERITED_ENV_PREFIXES = ("DOCKER_", "TESTCONTAINERS_", "LC_")
+# Celery tasks production would queue during seeding that the fixture may leave out, each with why. Any other one
+# fails the run: a task this server does not run could change what the API serves.
+EXPECTED_SKIPPED_TASKS: dict[str, str] = {}
 WHOOP_API = urlsplit("https://api.prod.whoop.com/developer")
 WHOOP_COLLECTIONS = {
     "/v2/activity/sleep": "sleeps",
@@ -246,7 +252,14 @@ def _free_port() -> int:
 
 
 def _configure_environment(db_url: Any, redis_host: str, redis_port: int, port: int) -> None:
-    """Point the settings at the containers; must run before anything under ``app`` is imported."""
+    """Point the settings at the containers; must run before anything under ``app`` is imported.
+
+    Every other variable from the shell is dropped first, so an inherited setting such as ``AWS_*`` or ``SVIX_*``
+    can neither reach a real service (boto3 and Svix are outside the offline transport) nor change the output.
+    """
+    for key in list(os.environ):
+        if key not in INHERITED_ENV and not key.startswith(INHERITED_ENV_PREFIXES):
+            del os.environ[key]
     os.environ.update(
         {
             "OW_IGNORE_ENV_FILE": "1",
@@ -270,6 +283,11 @@ def _configure_environment(db_url: Any, redis_host: str, redis_port: int, port: 
             "LOG_LEVEL": "ERROR",
             # Deployed containers run on UTC; some ingestion code reads naive local time.
             "TZ": "UTC",
+            "RAW_PAYLOAD_STORAGE": "disabled",
+            "SDK_PAYLOAD_S3_OFFLOAD": "false",
+            "STORE_FIT_FILES": "false",
+            "INGEST_WORKOUT_SAMPLES": "false",
+            "OUTGOING_WEBHOOKS_ENABLED": "false",
         }
     )
     time_module.tzset()
@@ -707,6 +725,12 @@ def main() -> None:
             api.openapi()
         clock = stack.enter_context(freeze_time(now - SEEDED_BEFORE, real_asyncio=True))
         skipped = seed(args.today, args.api_key)
+        if unexpected := sorted(set(skipped) - EXPECTED_SKIPPED_TASKS.keys()):
+            raise SystemExit(
+                f"rumi fixture server: production would run {', '.join(unexpected)}, which seeding skipped. Run it "
+                "inline in _ingestion_patches, or add it to EXPECTED_SKIPPED_TASKS with the reason it cannot change "
+                "the API's output."
+            )
         clock.move_to(now)
         _seed_row_ids(args.today, "serve")
         server = uvicorn.Server(uvicorn.Config(api, host="127.0.0.1", port=port, log_level="warning"))
