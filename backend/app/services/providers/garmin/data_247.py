@@ -2006,7 +2006,7 @@ class Garmin247Data(Base247DataTemplate):
                     error=str(e),
                 )
 
-        # In activity id order, as each one locks its workout until the push commits
+        # In activity id order, as each one locks its workout until the batch commits
         for activity_id, fit_result in sorted(fit_workouts, key=itemgetter(0)):
             try:
                 with db.begin_nested():
