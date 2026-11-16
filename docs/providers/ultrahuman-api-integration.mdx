@@ -24,13 +24,13 @@ Ultrahuman provides access to sleep, recovery, and continuous activity data thro
 | Data Type | Support |
 |-----------|---------|
 | Sleep (with stages) | Yes |
-| Sleep score | Yes - `sleep` health score at the night's end, linked to the sleep session; components: the sleep contributors (score and rating), toss & turn, sleep cycles, SpO2, average heart rate and HRV, morning alertness |
+| Sleep score | Yes - `sleep` health score at the night's end, linked to the sleep session, read from the sleep quick metric `sleep_score`, then `Sleep.sleep_score.score`, then the `sleep_index` metric (Ultrahuman's name for the score); components: the sleep contributors (score and rating), toss & turn, sleep cycles, SpO2, average heart rate and HRV, morning alertness |
 | Heart rate (24/7) | Yes |
 | HRV - RMSSD (24/7) | Yes |
 | Skin temperature (24/7) | Yes |
 | Skin temperature deviation | Yes - `temperature_deviation`, the night's deviation from baseline |
 | Steps (24/7) | Yes |
-| Glucose (CGM) | Yes - `glucose` readings as `blood_glucose` (mg/dL) |
+| Glucose (CGM) | Yes - `glucose` readings as `blood_glucose` (mg/dL); see the unit note below |
 | VO2 max | Yes |
 | Resting heart rate | Yes - `sleep_rhr`, the ring's overnight average, one value per day |
 | Active minutes | Yes - `active_minutes` as `exercise_time`, one value per day |
@@ -43,6 +43,13 @@ Ultrahuman provides access to sleep, recovery, and continuous activity data thro
 | Workouts / Activities | No (not available via Partnership API) |
 
 Daily scores sit at the start of the day Ultrahuman reports them for, like the daily values above, and a later sync of the same day replaces them. Every value carries the user's UTC offset that day, taken from the day's `day_start_timestamp` (the user's local midnight), so it falls on the user's own date east or west of UTC; a later sync of a stored day refreshes the offset too. Naps are inferred from the sleep session, since Ultrahuman returns one sleep per day without a nap flag.
+
+<Warning>
+Ultrahuman publishes no schema for the metrics response, and no real response has been checked against these mappings. Two of them rest on assumptions:
+
+- **Glucose unit.** No glucose sample seen so far names its unit. Readings and the average glucose are stored as mg/dL as received, unless their metric object carries a `unit` that names mmol/L, in which case they are converted to mg/dL. A ring that reports mmol/L without saying so would be stored about 18 times too low.
+- **Sleep contributor names.** A sleep contributor carries no identifier besides its display title, so its component key is the title lowercased with each run of other characters turned into `_` (`Sleep Efficiency` becomes `sleep_efficiency`). If Ultrahuman localises the titles, the same contributor gets a different key per language.
+</Warning>
 
 ### Data delivery
 

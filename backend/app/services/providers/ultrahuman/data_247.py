@@ -29,6 +29,7 @@ from app.services.providers.ultrahuman.coverage import (
     ACTIVITY_SAMPLE_SERIES,
     DAILY_SCALAR_SERIES,
     DAILY_SCORES,
+    GLUCOSE_METRICS,
     SCORE_COMPONENTS,
     SLEEP_SCORE_LOCATIONS,
 )
@@ -38,6 +39,7 @@ from app.utils.conversion import as_int, seconds_to_minutes
 from app.utils.dates import offset_to_iso
 from app.utils.exceptions import ProviderConnectionError, ProviderError
 from app.utils.structured_logging import get_logger
+from app.utils.units import BloodGlucoseUnit, UnitConverter, parse_unit
 
 logger = get_logger(__name__)
 
@@ -94,12 +96,23 @@ def _zone_offset(day: date, metrics: list[dict[str, Any]]) -> str | None:
     return None
 
 
+def _in_mg_dl(value: Any, unit: Any) -> Any:
+    """A glucose value in mg/dL: converted when its metric names mmol/L as its unit, as received otherwise. No
+    Ultrahuman payload seen so far names a glucose unit, so the mg/dL default is unverified."""
+    if _is_number(value) and isinstance(unit, str) and parse_unit(unit) is BloodGlucoseUnit.mmol_l:
+        return float(UnitConverter.blood_glucose(Decimal(str(value)), BloodGlucoseUnit.mmol_l, BloodGlucoseUnit.mg_dl))
+    return value
+
+
 def _components(category: HealthScoreCategory, items_by_type: dict[str, Any]) -> dict[str, ScoreComponent]:
-    return {
-        name: ScoreComponent(value=value)
-        for name, path in SCORE_COMPONENTS[category].items()
-        if (value := _value_at(items_by_type, path)) is not None
-    }
+    components: dict[str, ScoreComponent] = {}
+    for name, path in SCORE_COMPONENTS[category].items():
+        value = _value_at(items_by_type, path)
+        if path[0] in GLUCOSE_METRICS:
+            value = _in_mg_dl(value, _at(items_by_type, (*path, "unit")))
+        if value is not None:
+            components[name] = ScoreComponent(value=value)
+    return components
 
 
 class Ultrahuman247Data(Base247DataTemplate):
@@ -507,6 +520,8 @@ class Ultrahuman247Data(Base247DataTemplate):
             readings = result.setdefault(series_type.value, [])
             for val in sample.get("values", []):
                 ts, value = val.get("timestamp"), val.get("value")
+                if sample.get("type") in GLUCOSE_METRICS:
+                    value = _in_mg_dl(value, sample.get("unit"))
                 if not ts or (series_type is SeriesType.steps and not (value and value > 0)):
                     continue
                 readings.append(
@@ -653,6 +668,7 @@ class Ultrahuman247Data(Base247DataTemplate):
                 "type": t,
                 "values": items_by_type[t].get("values", []),
                 "zone_offset": items_by_type[t].get("ultrahuman_zone_offset"),
+                "unit": items_by_type[t].get("unit"),
             }
             for t in ACTIVITY_SAMPLE_SERIES
             if t in items_by_type

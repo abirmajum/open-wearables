@@ -987,7 +987,6 @@ class TestUltrahumanScoresIntegration:
     SLEEP_SCORE_PLACES: list[tuple[str, ...]] = [
         ("Sleep", "quick_metrics", "sleep_score", "value"),
         ("Sleep", "sleep_score", "score"),
-        ("Sleep", "score_trend", "day_avg"),
         ("sleep_index", "value"),
         ("sleep_index", "score"),
     ]
@@ -1034,6 +1033,15 @@ class TestUltrahumanScoresIntegration:
         not_numbers = [(places[0], "81"), (places[1], None), (places[2], True)]
         response = self._with_sleep_score_at(sample_ultrahuman_api_response, [*not_numbers, (places[3], 66)])
         assert self._scores(client, self._sync(db, response))["sleep"]["value"] == 66
+
+    def test_a_trends_day_average_is_not_the_nights_score(
+        self, client: TestClient, db: Session, sample_ultrahuman_api_response: dict
+    ) -> None:
+        response = self._with_sleep_score_at(
+            sample_ultrahuman_api_response, [(("Sleep", "score_trend", "day_avg"), 64)]
+        )
+
+        assert self._scores(client, self._sync(db, response))["sleep"]["value"] is None
 
     @staticmethod
     def _sleep_ids(client: TestClient, user_id: UUID) -> list[str]:
@@ -1158,6 +1166,30 @@ class TestUltrahumanScoresIntegration:
 
         assert read("blood_glucose", "raw") == [(92, "mg_dl"), (118, "mg_dl")]
         assert read("sedentary_time", "1day") == [(210, "minutes")]
+
+    def test_glucose_named_in_mmol_per_litre_is_stored_in_mg_per_decilitre(
+        self, client: TestClient, db: Session, sample_ultrahuman_api_response: dict
+    ) -> None:
+        response = copy.deepcopy(sample_ultrahuman_api_response)
+        for item in response["data"]["metric_data"]:
+            if item["type"] == "glucose":
+                item["object"] |= {"unit": "mmol/L", "values": [{"value": 5.1, "timestamp": 1705276815}]}
+            if item["type"] == "average_glucose":
+                item["object"] |= {"unit": "mmol/L", "value": 5.6}
+            if item["type"] == "hba1c":
+                item["object"] |= {"unit": "mmol/mol", "value": 34}
+        user_id = self._sync(db, response)
+
+        glucose = client.get(
+            f"/api/v1/users/{user_id}/timeseries",
+            params={"start_time": "2024-01-15T00:00:00Z", "end_time": "2024-01-16T00:00:00Z", "types": "blood_glucose"},
+            headers=api_key_headers(ApiKeyFactory().plain_key),
+        ).json()["data"]
+        metabolic = TestUltrahumanScoresIntegration._scores(client, user_id)["metabolic"]["components"]
+
+        assert [round(s["value"], 1) for s in glucose] == [91.9]
+        assert round(metabolic["average_glucose_mg_dl"]["value"], 1) == 100.9
+        assert metabolic["hba1c_percent"]["value"] == 34
 
 
 class TestUltrahumanLocalDays:

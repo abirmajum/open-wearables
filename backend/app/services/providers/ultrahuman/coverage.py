@@ -10,6 +10,9 @@ ACTIVITY_SAMPLE_SERIES: dict[str, SeriesType] = {
     "glucose": SeriesType.blood_glucose,
 }
 
+# Metric types whose values are glucose concentrations, stored in mg/dL.
+GLUCOSE_METRICS: frozenset[str] = frozenset({"glucose", "average_glucose"})
+
 # Single daily values (Ultrahuman type → SeriesType), each carrying its own day_start_timestamp.
 DAILY_SCALAR_SERIES: dict[str, SeriesType] = {
     "vo2_max": SeriesType.vo2_max,
@@ -56,7 +59,6 @@ SCORE_COMPONENTS: dict[HealthScoreCategory, dict[str, tuple[str, ...]]] = {
 SLEEP_SCORE_LOCATIONS: tuple[tuple[str, ...], ...] = (
     ("Sleep", "quick_metrics", "sleep_score", "value"),
     ("Sleep", "sleep_score", "score"),
-    ("Sleep", "score_trend", "day_avg"),
     ("sleep_index", "value"),
     ("sleep_index", "score"),
 )
