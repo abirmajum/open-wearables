@@ -874,6 +874,18 @@ class TestGarmin247Data:
         assert (usual["aerobic_training_effect"], usual["training_load"]) == (Decimal("3.4"), Decimal("142"))
         assert usual["segments"]
 
+    def test_an_activity_details_push_is_identified_by_its_own_activity_id(
+        self, garmin_247: Garmin247Data, db: Session
+    ) -> None:
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="garmin")
+        summary = {k: v for k, v in self._WORKOUT_PUSHES["activityDetails"]["summary"].items() if k != "activityId"}
+
+        garmin_247.process_items_batch(db, user.id, "activityDetails", [{"activityId": 321, "summary": summary}])
+
+        [(record, detail, _)] = self._user_workouts(db, user.id)
+        assert (record.external_id, detail.steps_count) == ("321", 8240)
+
     def test_a_fit_file_without_a_session_pushed_first_is_not_kept(
         self, garmin_247: Garmin247Data, db: Session
     ) -> None:

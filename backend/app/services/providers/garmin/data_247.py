@@ -1894,7 +1894,9 @@ class Garmin247Data(Base247DataTemplate):
                                 all_sleep_details.append(nap_detail)
                         all_samples.extend(self._build_sleep_vitals_samples(user_id, item))
                     case "activityDetails":
-                        if result := activity_workout(item.get("summary", {}), user_id):
+                        summary = item.get("summary") or {}
+                        identified = {**summary, "activityId": summary.get("activityId") or item.get("activityId")}
+                        if result := activity_workout(identified, user_id):
                             record, detail = result
                             all_records.append(record)
                             all_workout_details.append(detail)
