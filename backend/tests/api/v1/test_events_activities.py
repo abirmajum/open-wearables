@@ -45,9 +45,11 @@ class TestListActivities:
         assert response.status_code == 200
         [activity] = response.json()["data"]
         assert {
-            key: activity[key] for key in ("type", "start_time", "end_time", "zone_offset", "duration_seconds")
+            key: activity[key]
+            for key in ("type", "subtype", "start_time", "end_time", "zone_offset", "duration_seconds")
         } == {
             "type": "moveiq_walking",
+            "subtype": "hurried",
             "start_time": "2024-01-15T12:00:00Z",
             "end_time": "2024-01-15T12:28:00Z",
             "zone_offset": "+01:00",

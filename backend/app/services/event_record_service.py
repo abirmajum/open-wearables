@@ -1358,6 +1358,7 @@ class EventRecordService(
             ActivityRecord(
                 id=record.id,
                 type=record.type,
+                subtype=record.subtype,
                 start_time=record.start_datetime,
                 end_time=record.end_datetime,
                 zone_offset=record.zone_offset,

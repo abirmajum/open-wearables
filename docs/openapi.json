@@ -14920,6 +14920,19 @@
             "title": "Type",
             "example": "moveiq_walking"
           },
+          "subtype": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Subtype",
+            "description": "The device's finer kind of the type",
+            "example": "hurried"
+          },
           "start_time": {
             "type": "string",
             "format": "date-time",

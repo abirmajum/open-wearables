@@ -160,6 +160,7 @@ class ActivityRecord(BaseModel):
 
     id: UUID
     type: str | None = Field(None, example="moveiq_walking")
+    subtype: str | None = Field(None, description="The device's finer kind of the type", example="hurried")
     start_time: datetime
     end_time: datetime
     zone_offset: str | None = None

@@ -382,6 +382,7 @@ class EventRecordRepository(
                     "data_source_id": source_id,
                     "category": creator.category,
                     "type": creator.type,
+                    "subtype": creator.subtype,
                     "source_name": creator.source_name,
                     "duration_seconds": creator.duration_seconds,
                     "start_datetime": creator.start_datetime,
@@ -405,8 +406,8 @@ class EventRecordRepository(
             return []
 
         # Batch insert with ON CONFLICT DO NOTHING
-        # Chunk to stay under PostgreSQL's 65535 parameter limit (10 params/row → max ~6553 rows)
-        chunk_size = 6_500
+        # Chunk to stay under PostgreSQL's 65535 parameter limit (11 params/row → max ~5957 rows)
+        chunk_size = 5_900
         inserted_ids: set[UUID] = set()
         for i in range(0, len(values_list), chunk_size):
             chunk = values_list[i : i + chunk_size]

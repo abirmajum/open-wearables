@@ -1760,11 +1760,13 @@ class Garmin247Data(Base247DataTemplate):
         zone_offset = offset_to_iso(raw_moveiq.get("startTimeOffsetInSeconds"))
 
         activity_type = raw_moveiq.get("activityType", "unknown")
+        subtype = raw_moveiq.get("activitySubType")
 
         return EventRecordCreate(
             id=uuid4(),
             category=EventCategory.ACTIVITY,
             type=f"moveiq_{activity_type.lower()}",
+            subtype=subtype.lower() if isinstance(subtype, str) and subtype else None,
             source_name="Garmin Move IQ",
             device_model=None,
             duration_seconds=duration,
