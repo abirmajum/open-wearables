@@ -55,6 +55,13 @@ class TestRunning:
         vals = [s.value for s in running.samples if s.series_type == SeriesType.heart_rate]
         assert all(Decimal(40) <= v <= Decimal(220) for v in vals)
 
+    def test_training_effect_and_load_come_from_the_session(self, running: FitParseResult) -> None:
+        assert running.session == {
+            "aerobic_training_effect": Decimal("3.4"),
+            "anaerobic_training_effect": Decimal("1.2"),
+            "training_load": Decimal("142"),
+        }
+
     def test_speed_non_negative(self, running: FitParseResult) -> None:
         vals = [s.value for s in running.samples if s.series_type == SeriesType.speed]
         assert all(v >= Decimal(0) for v in vals)
@@ -134,6 +141,9 @@ class TestSegments:
         laps = [s for s in running.segments if s["kind"] == "lap"]
         indices = [lap["index"] for lap in laps]
         assert indices == list(range(len(laps)))
+
+    def test_a_file_without_a_session_has_no_session_values(self, cycling: FitParseResult) -> None:
+        assert cycling.session == {}
 
     def test_cycling_no_segments(self, cycling: FitParseResult) -> None:
         assert cycling.segments == []

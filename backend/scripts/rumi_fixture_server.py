@@ -127,6 +127,7 @@ def _fit_file(spec: dict[str, Any]) -> bytes:
         _fit_file,
         _fit_ts,
         _lap_messages,
+        _session_message,
     )
 
     fields = [_Field(253, _UINT32, 4), _Field(3, _UINT8, 1), _Field(6, _UINT16, 2)]
@@ -141,6 +142,11 @@ def _fit_file(spec: dict[str, Any]) -> bytes:
         lap_end = _fit_ts(datetime.fromtimestamp(lap["end"], tz=timezone.utc))
         laps.append((lap_start, lap_end, lap_end - lap_start, lap["distance_meters"], lap["avg_hr"], lap["max_hr"]))
     messages += _lap_messages(laps)
+    if session := spec.get("session"):
+        end = _fit_ts(datetime.fromtimestamp(session["end"], tz=timezone.utc))
+        messages += _session_message(
+            end, session["aerobic_effect"], session["anaerobic_effect"], session["training_load"]
+        )
     return _fit_file(messages)
 
 

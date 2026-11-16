@@ -138,6 +138,28 @@ def _lap_messages(laps: list[tuple[int, int, int, int, int, int]]) -> bytes:
     return out
 
 
+# Session message (global_mesg_num=18) fields used here:
+#   253  timestamp                        uint32  (FIT epoch seconds — end of session)
+#    24  total_training_effect            uint8   (raw = effect * 10; fitdecode applies scale=10)
+#   137  total_anaerobic_training_effect  uint8   (raw = effect * 10)
+#   168  training_load_peak               sint32  (raw = load * 65536)
+_SESSION_FIELDS: list[_Field] = [
+    _Field(253, _UINT32, 4),
+    _Field(24, _UINT8, 1),
+    _Field(137, _UINT8, 1),
+    _Field(168, _SINT32, 4),
+]
+
+
+def _session_message(end_ts: int, aerobic_effect: float, anaerobic_effect: float, training_load: float) -> bytes:
+    """Definition + data message for one session (local_type=2, global=18) with its training effect and load."""
+    return _definition_msg(_SESSION_FIELDS, local_type=2, global_num=18) + _data_msg(
+        _SESSION_FIELDS,
+        [end_ts, round(aerobic_effect * 10), round(anaerobic_effect * 10), round(training_load * 65536)],
+        local_type=2,
+    )
+
+
 def _fit_file(messages: bytes) -> bytes:
     data_size = len(messages)
     header_no_crc = struct.pack("<BBHI4s", 14, 0x20, 2132, data_size, b".FIT")
@@ -202,6 +224,7 @@ def make_running_fit(n_records: int = 20) -> bytes:
             (start_ts + half, start_ts + n_records, half, half * 3, 156, 164),  # lap 1
         ]
     )
+    messages += _session_message(start_ts + n_records, aerobic_effect=3.4, anaerobic_effect=1.2, training_load=142.0)
     return _fit_file(messages)
 
 

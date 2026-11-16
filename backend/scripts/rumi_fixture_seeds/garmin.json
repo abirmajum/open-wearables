@@ -7490,7 +7490,13 @@
      "avg_hr": 156,
      "max_hr": 174
     }
-   ]
+   ],
+   "session": {
+    "end": 1768375140,
+    "aerobic_effect": 3.4,
+    "anaerobic_effect": 1.2,
+    "training_load": 142.0
+   }
   }
  }
 }

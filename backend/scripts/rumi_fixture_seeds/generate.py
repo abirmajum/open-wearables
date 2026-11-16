@@ -378,6 +378,7 @@ def _garmin_fit_spec(summary: dict[str, Any]) -> dict[str, Any]:
             {"start": start, "end": start + half, "distance_meters": 4480, "avg_hr": 148, "max_hr": 166},
             {"start": start + half, "end": start + duration, "distance_meters": 4487, "avg_hr": 156, "max_hr": 174},
         ],
+        "session": {"end": start + duration, "aerobic_effect": 3.4, "anaerobic_effect": 1.2, "training_load": 142.0},
     }
 
 

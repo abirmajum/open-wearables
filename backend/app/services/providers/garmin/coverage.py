@@ -95,6 +95,9 @@ WORKOUT_FIELDS: frozenset[str] = frozenset(
         "hr_zones",
         "power_zones",
         "segments",
+        "aerobic_training_effect",
+        "anaerobic_training_effect",
+        "training_load",
     }
 )
 

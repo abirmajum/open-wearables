@@ -73,6 +73,17 @@ class FitParseResult:
     developer_fields_found: list[str] = field(default_factory=list)
     hr_zones: HRZones | None = None
     power_zones: PowerZones | None = None
+    # Workout detail column → the session's value of it (SESSION_FIELDS)
+    session: dict[str, Decimal] = field(default_factory=dict)
+
+
+# FIT session field → the workout detail column it fills; the first session carrying it wins (multisport files
+# have one per leg). fitdecode applies the profile's scale, so these arrive as 0.0-5.0 and as load points.
+SESSION_FIELDS: dict[str, str] = {
+    "total_training_effect": "aerobic_training_effect",
+    "total_anaerobic_training_effect": "anaerobic_training_effect",
+    "training_load_peak": "training_load",
+}
 
 
 def parse_fit_file(
@@ -120,6 +131,11 @@ def parse_fit_file(
                 if ref == "session":
                     result.hr_zones = _parse_hr_zones(frame)
                     result.power_zones = _parse_power_zones(frame)
+
+            elif frame.name == "session":
+                for fit_name, column in SESSION_FIELDS.items():
+                    if column not in result.session and (value := _r2(_field_val(frame, fit_name))) is not None:
+                        result.session[column] = Decimal(str(value))
 
             elif frame.name in _SEGMENT_KINDS:
                 numeric, enums = _SEGMENT_KINDS[frame.name]

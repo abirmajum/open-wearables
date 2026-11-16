@@ -63,6 +63,15 @@ class Workout(BaseModel):
     moving_time_seconds: int | None = None
     elev_high: float | None = None
     elev_low: float | None = None
+    aerobic_training_effect: float | None = Field(
+        None, description="The workout's aerobic training effect, 0.0 to 5.0, from its FIT file", example=3.4
+    )
+    anaerobic_training_effect: float | None = Field(
+        None, description="The workout's anaerobic training effect, 0.0 to 5.0, from its FIT file", example=1.2
+    )
+    training_load: float | None = Field(
+        None, description="The workout's training load (EPOC-based), from its FIT file", example=142.0
+    )
     hr_zones: HRZones | None = None
     power_zones: PowerZones | None = None
     segments: list[dict] | None = None

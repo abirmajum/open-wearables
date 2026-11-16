@@ -10,7 +10,15 @@ import pytest
 from sqlalchemy import event as sa_event
 from sqlalchemy.orm import Session
 
-from app.models import DataSource, EventRecord, HealthScore, SeriesAggregate, SeriesSample, SleepDetails
+from app.models import (
+    DataSource,
+    EventRecord,
+    HealthScore,
+    SeriesAggregate,
+    SeriesSample,
+    SleepDetails,
+    WorkoutDetails,
+)
 from app.repositories.data_point_series_repository import WriteCounts
 from app.repositories.event_record_detail_repository import EventRecordDetailRepository
 from app.repositories.user_connection_repository import UserConnectionRepository
@@ -24,6 +32,7 @@ from app.services.providers.garmin.oauth import GarminOAuth
 from app.utils.context import sync_run_var
 from app.utils.conversion import to_decimal
 from tests.factories import UserConnectionFactory, UserFactory
+from tests.fixtures.fit_builder import make_running_fit
 
 # One day's stressDetails as Garmin sends it after midnight, and again in the morning with more data
 _AFTER_MIDNIGHT = {"startTimeInSeconds": 1705276800, "timeOffsetBodyBatteryValues": {"0": 20, "3600": 46}}
@@ -737,6 +746,34 @@ class TestGarmin247Data:
 
         assert count == 0
         mock_get.assert_not_called()
+
+    def test_a_workouts_fit_file_adds_its_training_effect_and_load(
+        self, garmin_247: Garmin247Data, db: Session
+    ) -> None:
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="garmin")
+        run = {"activityId": 123, "activityType": "RUNNING", "startTimeInSeconds": 1748764800, "durationInSeconds": 20}
+        garmin_247.process_items_batch(db, user.id, "activityDetails", [{"activityId": 123, "summary": run}])
+        item = {"activityId": 123, "fileType": "FIT", "callbackURL": "https://apis.garmin.com/file?id=123"}
+
+        with (
+            patch("app.services.providers.garmin.data_247.download_binary_content", return_value=make_running_fit()),
+            patch("app.services.providers.garmin.data_247.store_fit_file"),
+        ):
+            garmin_247.process_items_batch(db, user.id, "activityFiles", [item])
+
+        db.expire_all()
+        detail = (
+            db.query(WorkoutDetails)
+            .join(EventRecord, EventRecord.id == WorkoutDetails.record_id)
+            .filter(EventRecord.external_id == "123")
+            .one()
+        )
+        assert (detail.aerobic_training_effect, detail.anaerobic_training_effect, detail.training_load) == (
+            Decimal("3.4"),
+            Decimal("1.2"),
+            Decimal("142"),
+        )
 
     def test_process_items_batch_hrv_missing_start_time(self, garmin_247: Garmin247Data, db: Session) -> None:
         """Test saving HRV data with missing start time."""

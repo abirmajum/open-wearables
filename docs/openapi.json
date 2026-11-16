@@ -24096,6 +24096,45 @@
             ],
             "title": "Elev Low"
           },
+          "aerobic_training_effect": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Aerobic Training Effect",
+            "description": "The workout's aerobic training effect, 0.0 to 5.0, from its FIT file",
+            "example": 3.4
+          },
+          "anaerobic_training_effect": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Anaerobic Training Effect",
+            "description": "The workout's anaerobic training effect, 0.0 to 5.0, from its FIT file",
+            "example": 1.2
+          },
+          "training_load": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Training Load",
+            "description": "The workout's training load (EPOC-based), from its FIT file",
+            "example": 142.0
+          },
           "hr_zones": {
             "anyOf": [
               {
