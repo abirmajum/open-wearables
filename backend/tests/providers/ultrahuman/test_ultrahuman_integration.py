@@ -15,6 +15,7 @@ from uuid import UUID
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models import (
@@ -1086,16 +1087,31 @@ class TestUltrahumanScoresIntegration:
         values = self._values(sleep)
         assert {name: values[name] for name in ("sleep_efficiency", "temperature") if name in values} == contributors
 
+    @pytest.mark.parametrize(
+        "error",
+        [ValueError("event_score_identity_conflict"), IntegrityError("INSERT INTO health_score", {}, Exception())],
+        ids=["identity-conflict", "rejected-by-database"],
+    )
     def test_a_score_that_cannot_be_saved_keeps_the_night(
-        self, client: TestClient, db: Session, sample_ultrahuman_api_response: dict
+        self, client: TestClient, db: Session, sample_ultrahuman_api_response: dict, error: Exception
     ) -> None:
-        with patch.object(
-            health_score_service, "upsert_event_score", side_effect=ValueError("event_score_identity_conflict")
-        ):
+        with patch.object(health_score_service, "upsert_event_score", side_effect=error):
             user_id = self._sync(db, sample_ultrahuman_api_response)
 
         assert len(self._sleep_ids(client, user_id)) == 1
         assert "sleep" not in self._scores(client, user_id)
+
+    def test_a_fault_saving_the_score_fails_the_sync(self, db: Session, sample_ultrahuman_api_response: dict) -> None:
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="ultrahuman", status="active", access_token="test_token")
+        provider_impl = ProviderFactory().get_provider("ultrahuman").data_247
+        with (
+            patch.object(provider_impl, "_make_api_request", return_value=sample_ultrahuman_api_response),
+            patch.object(health_score_service, "upsert_event_score", side_effect=RuntimeError("a bug")),
+        ):
+            results = provider_impl.load_and_save_all(db, user.id, start_time=self.DAY, end_time=self.DAY)
+
+        assert results.failures
 
     def test_a_score_without_a_value_is_not_written(
         self, client: TestClient, db: Session, sample_ultrahuman_api_response: dict
