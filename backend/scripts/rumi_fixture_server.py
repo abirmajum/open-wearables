@@ -25,6 +25,7 @@ import os
 import random
 import signal
 import socket
+import struct
 import sys
 import time as time_module
 import uuid
@@ -167,7 +168,8 @@ def _whoop_accounts(today: date) -> dict[str, dict[str, Any]]:
 
 
 def _fit_file(spec: dict[str, Any]) -> bytes:
-    """A FIT file with the activity's records and laps, built like the test fixtures build theirs."""
+    """A FIT file with the activity's records, laps, session and heart-rate zones, built like the test fixtures
+    build theirs."""
     sys.path.insert(0, str(BACKEND_DIR))
     from tests.fixtures.fit_builder import (
         _UINT8,
@@ -199,6 +201,23 @@ def _fit_file(spec: dict[str, Any]) -> bytes:
         messages += _session_message(
             end, session["aerobic_effect"], session["anaerobic_effect"], session["training_load"]
         )
+        if zones := spec.get("time_in_zone"):
+            seconds, tops = zones["time_in_hr_zone"], zones["hr_zone_high_boundary"]
+            # time_in_zone (global 216) for session 0: times scaled by 1000, then each zone's top in bpm
+            zone_fields = [
+                _Field(253, _UINT32, 4),
+                _Field(0, _UINT16, 2),
+                _Field(1, _UINT16, 2),
+                _Field(2, _UINT32, 4 * len(seconds)),
+                _Field(6, _UINT8, len(tops)),
+                _Field(11, _UINT8, 1),
+                _Field(12, _UINT8, 1),
+                _Field(13, _UINT8, 1),
+            ]
+            values = (end, 18, 0, *(s * 1000 for s in seconds), *tops)
+            heart_rates = (zones["max_heart_rate"], zones["resting_heart_rate"], zones["threshold_heart_rate"])
+            messages += _definition_msg(zone_fields, local_type=3, global_num=216)
+            messages += bytes([3]) + struct.pack(f"<IHH{len(seconds)}I{len(tops)}B3B", *values, *heart_rates)
     return _fit_file(messages)
 
 

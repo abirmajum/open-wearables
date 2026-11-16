@@ -55,6 +55,8 @@ DENSE_DAY = DAYS - 2
 # That day's run (activity 21000101), as seconds from local midnight.
 DENSE_RUN = (int(7.5 * 3600), int(7.5 * 3600) + 2940)
 DENSE_WAKE = int(6.4 * 3600)
+# Garmin's default heart-rate zones: the top of zones 0 to 5 at 50 to 100 percent of a 190 bpm maximum.
+GARMIN_HR_ZONE_TOPS = (95, 114, 133, 152, 171, 190)
 
 
 def _dense_heart_rate(t: int) -> int:
@@ -472,15 +474,27 @@ def _garmin_fit_spec(summary: dict[str, Any]) -> dict[str, Any]:
     """What the server writes into the FIT file it serves for the activity's ``callbackURL``."""
     start, duration = summary["startTimeInSeconds"], summary["durationInSeconds"]
     half = duration // 2
+    records = [{"offset": s * 60, "heart_rate": 140 + s % 25, "speed": 3.05} for s in range(duration // 60)]
+    zone_seconds = [0] * len(GARMIN_HR_ZONE_TOPS)
+    for record in records:
+        zone_seconds[next(z for z, top in enumerate(GARMIN_HR_ZONE_TOPS) if record["heart_rate"] <= top)] += 60
     return {
         "activity_id": summary["activityId"],
         "start_time": start,
-        "records": [{"offset": s * 60, "heart_rate": 140 + s % 25, "speed": 3.05} for s in range(duration // 60)],
+        "records": records,
         "laps": [
             {"start": start, "end": start + half, "distance_meters": 4480, "avg_hr": 148, "max_hr": 166},
             {"start": start + half, "end": start + duration, "distance_meters": 4487, "avg_hr": 156, "max_hr": 174},
         ],
         "session": {"end": start + duration, "aerobic_effect": 3.4, "anaerobic_effect": 1.2, "training_load": 142.0},
+        # The session's time_in_zone message, as a Garmin watch writes it at the end of an activity
+        "time_in_zone": {
+            "time_in_hr_zone": zone_seconds,
+            "hr_zone_high_boundary": list(GARMIN_HR_ZONE_TOPS),
+            "max_heart_rate": GARMIN_HR_ZONE_TOPS[-1],
+            "resting_heart_rate": 50,
+            "threshold_heart_rate": 171,
+        },
     }
 
 
