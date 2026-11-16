@@ -194,7 +194,9 @@ def _fit_file(messages: bytes) -> bytes:
 # ---------------------------------------------------------------------------
 
 
-def make_running_fit(n_records: int = 20) -> bytes:
+def make_running_fit(
+    n_records: int = 20, start: datetime = datetime(2025, 6, 1, 8, 0, 0, tzinfo=timezone.utc)
+) -> bytes:
     """Synthetic running activity: full sensor set including GPS, running dynamics, and 2 laps."""
     lat = int(50.0 * _DEG_TO_SEMICIRCLES)  # 50°N
     lon = int(20.0 * _DEG_TO_SEMICIRCLES)  # 20°E
@@ -215,7 +217,7 @@ def make_running_fit(n_records: int = 20) -> bytes:
         _Field(83, _UINT16, 2),  # vertical_ratio (raw = % * 100)
         _Field(84, _UINT16, 2),  # stance_time_balance (raw = % * 100)
     ]
-    start_ts = _fit_ts(datetime(2025, 6, 1, 8, 0, 0, tzinfo=timezone.utc))
+    start_ts = _fit_ts(start)
     messages = _definition_msg(record_fields)
     for i in range(n_records):
         messages += _data_msg(

@@ -814,7 +814,9 @@ class TestGarmin247Data:
         "activityFiles": {"activityId": 321, "fileType": "FIT", "callbackURL": "https://apis.garmin.com/file?id=321"},
     }
 
-    def _stored_workout(self, garmin_247: Garmin247Data, db: Session, order: tuple[str, ...]) -> dict[str, Any]:
+    def _stored_workout(
+        self, garmin_247: Garmin247Data, db: Session, order: tuple[str, ...], fit: bytes | None = None
+    ) -> dict[str, Any]:
         """A new user's workout after its pushes arrive in this order, each by the path its webhook takes."""
         user = UserFactory()
         UserConnectionFactory(user=user, provider="garmin")
@@ -826,7 +828,10 @@ class TestGarmin247Data:
             oauth=garmin_247.oauth,
         )
         with (
-            patch("app.services.providers.garmin.data_247.download_binary_content", return_value=make_running_fit()),
+            patch(
+                "app.services.providers.garmin.data_247.download_binary_content",
+                return_value=fit or make_running_fit(),
+            ),
             patch("app.services.providers.garmin.data_247.store_fit_file"),
         ):
             for summary_type in order:
@@ -873,6 +878,25 @@ class TestGarmin247Data:
         assert (usual["steps_count"], usual["total_elevation_gain"]) == (8240, Decimal("84"))
         assert (usual["aerobic_training_effect"], usual["training_load"]) == (Decimal("3.4"), Decimal("142"))
         assert usual["segments"]
+
+    @pytest.mark.parametrize("order", list(permutations(_WORKOUT_PUSHES)), ids="-".join)
+    def test_a_workouts_summary_span_wins_over_its_fit_files(
+        self, garmin_247: Garmin247Data, db: Session, order: tuple[str, ...]
+    ) -> None:
+        early_and_longer = make_running_fit(n_records=26, start=datetime(2025, 6, 1, 7, 59, 57, tzinfo=timezone.utc))
+
+        workout = self._stored_workout(garmin_247, db, order, early_and_longer)
+
+        assert (workout["start_datetime"], workout["end_datetime"], workout["duration_seconds"]) == (
+            datetime(2025, 6, 1, 8, 0, 0, tzinfo=timezone.utc),
+            datetime(2025, 6, 1, 8, 0, 20, tzinfo=timezone.utc),
+            20,
+        )
+        assert (workout["device_model"], workout["label"], workout["training_load"]) == (
+            "forerunner965",
+            "Morning Run",
+            Decimal("142"),
+        )
 
     def test_an_activity_details_push_is_identified_by_its_own_activity_id(
         self, garmin_247: Garmin247Data, db: Session
