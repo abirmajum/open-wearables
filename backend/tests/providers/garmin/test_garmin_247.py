@@ -1176,6 +1176,37 @@ class TestGarmin247Data:
         assert record.type == "running"
         assert detail.distance == Decimal("5000")
 
+    def test_an_activity_details_summary_fills_the_workout_like_the_activities_push(
+        self, garmin_247: Garmin247Data
+    ) -> None:
+        summary = {
+            "activityId": 123456,
+            "activityName": "Morning Run",
+            "activityType": "RUNNING",
+            "startTimeInSeconds": 1705309200,
+            "durationInSeconds": 2940,
+            "steps": 8240,
+            "averageSpeedInMetersPerSecond": 3.05,
+            "maxSpeedInMetersPerSecond": 4.1,
+            "totalElevationGainInMeters": 84.0,
+            "averageRunCadenceInStepsPerMinute": 168.0,
+            "manual": False,
+        }
+
+        result = garmin_247._build_activity_record(uuid4(), summary)
+
+        assert result is not None
+        _, detail = result
+        assert (
+            detail.total_elevation_gain,
+            detail.average_speed,
+            detail.max_speed,
+            detail.steps_count,
+            detail.average_cadence,
+            detail.label,
+            detail.entry_source,
+        ) == (Decimal("84.0"), Decimal("3.05"), Decimal("4.1"), 8240, Decimal("168.0"), "Morning Run", "automatic")
+
     def test_build_activity_record_missing_id(self, garmin_247: Garmin247Data) -> None:
         """Test _build_activity_record returns None for missing activityId."""
         user_id = uuid4()

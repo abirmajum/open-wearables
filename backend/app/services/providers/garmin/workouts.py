@@ -1,5 +1,5 @@
+from collections.abc import Mapping
 from datetime import datetime, timedelta
-from decimal import Decimal
 from typing import Any, Iterable
 from uuid import UUID, uuid4
 
@@ -16,10 +16,45 @@ from app.schemas.providers.garmin import ActivityJSON as GarminActivityJSON
 from app.services.event_record_service import event_record_service
 from app.services.providers.garmin.coverage import WORKOUT_ENERGY_SERIES
 from app.services.providers.templates.base_workouts import BaseWorkoutsTemplate
+from app.utils.conversion import as_int, to_decimal
 from app.utils.dates import offset_to_iso
 from app.utils.structured_logging import get_logger
 
 logger = get_logger(__name__)
+
+_CADENCE_FIELDS = (
+    "averageRunCadenceInStepsPerMinute",
+    "averageBikingCadenceInRevPerMinute",
+    "averageSwimCadenceInStrokesPerMinute",
+)
+
+
+def activity_metrics(summary: Mapping[str, Any]) -> EventRecordMetrics:
+    """The workout detail of a Garmin activity summary, as the activities push sends it and the activityDetails push
+    nests it under ``summary``."""
+    metrics: EventRecordMetrics = {
+        # Garmin activity payloads carry only average and max heart rate
+        "heart_rate_min": None,
+        "heart_rate_max": as_int(summary.get("maxHeartRateInBeatsPerMinute")),
+        "heart_rate_avg": to_decimal(summary.get("averageHeartRateInBeatsPerMinute")),
+        "steps_count": as_int(summary.get("steps")),
+        "energy_burned": to_decimal(summary.get("activeKilocalories")),
+        "energy_series": WORKOUT_ENERGY_SERIES,
+        "distance": to_decimal(summary.get("distanceInMeters")),
+        "average_speed": to_decimal(summary.get("averageSpeedInMetersPerSecond")),
+        "max_speed": to_decimal(summary.get("maxSpeedInMetersPerSecond")),
+        "total_elevation_gain": to_decimal(summary.get("totalElevationGainInMeters")),
+        "average_cadence": to_decimal(next((c for f in _CADENCE_FIELDS if (c := summary.get(f))), None)),
+    }
+
+    entry_source = get_unified_garmin_entry_source(summary.get("manual"), summary.get("isWebUpload"))
+    if entry_source is not None:
+        metrics["entry_source"] = entry_source
+
+    if name := summary.get("activityName"):
+        metrics["label"] = name
+
+    return metrics
 
 
 class GarminWorkouts(BaseWorkoutsTemplate):
@@ -166,47 +201,7 @@ class GarminWorkouts(BaseWorkoutsTemplate):
         return start_date, end_date
 
     def _build_metrics(self, raw_workout: GarminActivityJSON) -> EventRecordMetrics:
-        heart_rate_avg = (
-            Decimal(str(raw_workout.averageHeartRateInBeatsPerMinute))
-            if raw_workout.averageHeartRateInBeatsPerMinute is not None
-            else None
-        )
-        heart_rate_max = (
-            Decimal(str(raw_workout.maxHeartRateInBeatsPerMinute))
-            if raw_workout.maxHeartRateInBeatsPerMinute is not None
-            else None
-        )
-
-        steps_count = int(raw_workout.steps) if raw_workout.steps is not None else None
-
-        energy_burned = (
-            Decimal(str(raw_workout.activeKilocalories)) if raw_workout.activeKilocalories is not None else None
-        )
-
-        distance = Decimal(str(raw_workout.distanceInMeters)) if raw_workout.distanceInMeters is not None else None
-
-        average_cadence = Decimal(str(raw_workout.averageCadence)) if raw_workout.averageCadence is not None else None
-
-        metrics: EventRecordMetrics = {
-            # Garmin activity payloads carry only average and max heart rate
-            "heart_rate_min": None,
-            "heart_rate_max": int(heart_rate_max) if heart_rate_max is not None else None,
-            "heart_rate_avg": heart_rate_avg,
-            "steps_count": steps_count,
-            "energy_burned": energy_burned,
-            "energy_series": WORKOUT_ENERGY_SERIES,
-            "distance": distance,
-            "average_cadence": average_cadence,
-        }
-
-        entry_source = get_unified_garmin_entry_source(raw_workout.manual, raw_workout.isWebUpload)
-        if entry_source is not None:
-            metrics["entry_source"] = entry_source
-
-        if raw_workout.activityName:
-            metrics["label"] = raw_workout.activityName
-
-        return metrics
+        return activity_metrics(raw_workout.model_dump())
 
     def _normalize_workout(
         self,

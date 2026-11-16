@@ -133,6 +133,24 @@ class TestGarminWorkouts:
         assert metrics["energy_series"] == SeriesType.total_energy
         assert metrics["distance"] == Decimal("10000")
 
+    def test_build_metrics_keep_elevation_gain_and_speeds(
+        self, garmin_workouts: GarminWorkouts, sample_activity: dict[str, Any]
+    ) -> None:
+        activity = GarminActivityJSON(
+            **sample_activity,
+            averageSpeedInMetersPerSecond=3.05,
+            maxSpeedInMetersPerSecond=4.1,
+            totalElevationGainInMeters=84.0,
+        )
+
+        metrics = garmin_workouts._build_metrics(activity)
+
+        assert (metrics["average_speed"], metrics["max_speed"], metrics["total_elevation_gain"]) == (
+            Decimal("3.05"),
+            Decimal("4.1"),
+            Decimal("84.0"),
+        )
+
     def test_build_metrics_with_missing_values(self, garmin_workouts: GarminWorkouts) -> None:
         """Test building metrics with missing values."""
         activity = GarminActivityJSON(

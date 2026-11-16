@@ -42,8 +42,8 @@ from app.services.providers.garmin.coverage import (
     DAILIES_SERIES,
     EPOCHS_SERIES,
     SLEEP_SERIES,
-    WORKOUT_ENERGY_SERIES,
 )
+from app.services.providers.garmin.workouts import activity_metrics
 from app.services.providers.sync_247_result import Sync247Result
 from app.services.providers.templates.base_247_data import Base247DataTemplate
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
@@ -1164,31 +1164,7 @@ class Garmin247Data(Base247DataTemplate):
             user_id=user_id,
         )
 
-        distance = raw_activity.get("distanceInMeters")
-        calories = raw_activity.get("activeKilocalories")
-        avg_hr = raw_activity.get("averageHeartRateInBeatsPerMinute")
-        max_hr = raw_activity.get("maxHeartRateInBeatsPerMinute")
-        elevation_gain = raw_activity.get("elevationGainInMeters")
-        avg_speed = raw_activity.get("averageSpeedInMetersPerSecond")
-        avg_cadence = (
-            raw_activity.get("averageRunCadenceInStepsPerMinute")
-            or raw_activity.get("averageBikingCadenceInRevPerMinute")
-            or raw_activity.get("averageSwimCadenceInStrokesPerMinute")
-        )
-
-        detail = EventRecordDetailCreate(
-            record_id=record_id,
-            distance=Decimal(str(distance)) if distance is not None else None,
-            energy_burned=Decimal(str(calories)) if calories is not None else None,
-            energy_series=WORKOUT_ENERGY_SERIES,
-            heart_rate_avg=Decimal(str(avg_hr)) if avg_hr is not None else None,
-            heart_rate_max=max_hr,
-            total_elevation_gain=Decimal(str(elevation_gain)) if elevation_gain is not None else None,
-            average_speed=Decimal(str(avg_speed)) if avg_speed is not None else None,
-            average_cadence=Decimal(str(avg_cadence)) if avg_cadence is not None else None,
-        )
-
-        return record, detail
+        return record, EventRecordDetailCreate(record_id=record_id, **activity_metrics(raw_activity))
 
     def _build_activity_samples(
         self,
