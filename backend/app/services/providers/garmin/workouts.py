@@ -288,14 +288,8 @@ class GarminWorkouts(BaseWorkoutsTemplate):
         Returns:
             Ids of the event records saved, created or updated
         """
-        new, saved_ids = event_record_service.update_stored_workouts(
+        created, updated = event_record_service.save_workouts(
             db, user_id, "garmin", list(self._build_bundles(activities, user_id))
         )
         db.commit()
-        for record, detail in new:
-            created_record = event_record_service.create(db, record)
-            detail_for_record = detail.model_copy(update={"record_id": created_record.id})
-            event_record_service.create_detail(db, detail_for_record)
-            saved_ids.append(created_record.id)
-
-        return saved_ids
+        return created + updated

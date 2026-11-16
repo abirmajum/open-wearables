@@ -524,11 +524,13 @@ class EventRecordService(
 
         A provider can send one workout in several pushes, in any order, each with some of its fields. The stored
         workout takes the device, type and span a push names, and its detail the values the push carries; what a
-        push leaves out keeps its stored value. Caller is responsible for commit.
+        push leaves out keeps its stored value. Caller is responsible for commit; the workouts' ids stay locked until
+        then, so a concurrent push of one of them waits and finds what this one stores.
 
         Returns:
             The workouts not stored yet, and the ids of the stored ones updated.
         """
+        self.crud.lock_workouts(db_session, user_id, provider, (record.external_id or "" for record, _ in workouts))
         stored = {
             external_id: record
             for external_id, record in self.crud.get_by_external_ids(
@@ -549,6 +551,37 @@ class EventRecordService(
             )
             updated.append(target.id)
         return new, updated
+
+    def save_workouts(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        provider: str,
+        workouts: Sequence[tuple[EventRecordCreate, EventRecordDetailCreate]],
+    ) -> tuple[list[UUID], list[UUID]]:
+        """Store these workouts of the user: one stored under its id takes what the push carries, the rest are
+        inserted. Caller is responsible for commit, which sends the new workouts' webhooks.
+
+        Returns:
+            The ids of the workouts inserted, and of the stored ones updated.
+        """
+        if not workouts:
+            return [], []
+        new, updated = self.update_stored_workouts(db_session, user_id, provider, workouts)
+        inserted = set(self.bulk_create(db_session, [record for record, _ in new]))
+        self.bulk_create_details(db_session, [detail for record, detail in new if record.id in inserted])
+        # The same workout twice in one push: the first copy inserted it
+        if repeated := [(record, detail) for record, detail in new if record.id not in inserted]:
+            dropped, again = self.update_stored_workouts(db_session, user_id, provider, repeated)
+            updated += again
+            if dropped:
+                logger.warning(
+                    "Workouts not stored, other records of their sources hold their spans",
+                    provider=provider,
+                    user_id=str(user_id),
+                    external_ids=[record.external_id for record, _ in dropped],
+                )
+        return [record.id for record, _ in new if record.id in inserted], updated
 
     def _refresh_workout(self, db_session: DbSession, stored: EventRecord, record: EventRecordCreate) -> None:
         """The stored workout takes the device, type and span the push names."""

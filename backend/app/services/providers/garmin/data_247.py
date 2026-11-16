@@ -3,6 +3,7 @@
 import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from operator import itemgetter
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -1770,6 +1771,7 @@ class Garmin247Data(Base247DataTemplate):
         if fit.power_zones is not None:
             fields["power_zones"] = fit.power_zones.model_dump()
         fields.update(fit.session)
+        self.event_record_repo.lock_workouts(db, user_id, self.provider_name, [activity_id])
         record = self.event_record_repo.get_by_external_id(db, user_id, activity_id, source=self.provider_name)
         if record is not None:
             self.event_record_detail_repo.update_workout_fields(db, record.id, fields)
@@ -1834,6 +1836,7 @@ class Garmin247Data(Base247DataTemplate):
         # A night is one sleep summary: re-sent under its summaryId, it updates the stored night whatever its span
         nights: dict[str, tuple[EventRecordCreate, EventRecordDetailCreate]] = {}
         epoch_items: list[dict[str, Any]] = []
+        fit_workouts: list[tuple[str, FitParseResult]] = []
 
         for item in items:
             try:
@@ -1962,19 +1965,7 @@ class Garmin247Data(Base247DataTemplate):
                             or fit_result.power_zones
                             or fit_result.session
                         ):
-                            try:
-                                if workout := self._save_fit_workout_fields(db, user_id, activity_id, fit_result):
-                                    all_records.append(workout[0])
-                                    all_workout_details.append(workout[1])
-                            except Exception as e:
-                                logger.warning(
-                                    "Failed to save FIT workout fields",
-                                    provider="garmin",
-                                    task="process_items_batch",
-                                    user_id=str(user_id),
-                                    activity_id=activity_id,
-                                    error=str(e),
-                                )
+                            fit_workouts.append((activity_id, fit_result))
                         fit_samples: list[TimeSeriesSampleCreate] = []
                         if settings.ingest_workout_samples:
                             fit_samples = [
@@ -2009,6 +2000,22 @@ class Garmin247Data(Base247DataTemplate):
                     task="process_items_batch",
                     user_id=str(user_id),
                     summary_type=summary_type,
+                    error=str(e),
+                )
+
+        # In activity id order, as each one locks its workout until the push commits
+        for activity_id, fit_result in sorted(fit_workouts, key=itemgetter(0)):
+            try:
+                if workout := self._save_fit_workout_fields(db, user_id, activity_id, fit_result):
+                    all_records.append(workout[0])
+                    all_workout_details.append(workout[1])
+            except Exception as e:
+                logger.warning(
+                    "Failed to save FIT workout fields",
+                    provider="garmin",
+                    task="process_items_batch",
+                    user_id=str(user_id),
+                    activity_id=activity_id,
                     error=str(e),
                 )
 
@@ -2058,13 +2065,11 @@ class Garmin247Data(Base247DataTemplate):
             # A workout is its Garmin activity id: one already stored takes what this push carries, whichever of
             # its pushes (activities, activityDetails, its FIT file) came first
             details = {d.record_id: d for d in all_workout_details}
-            workouts = [(r, details[r.id]) for r in all_records if r.id in details]
-            new_workouts, updated = event_record_service.update_stored_workouts(
-                db, user_id, self.provider_name, workouts
+            created, updated = event_record_service.save_workouts(
+                db, user_id, self.provider_name, [(r, details[r.id]) for r in all_records if r.id in details]
             )
-            count += WriteCounts(0, len(updated))
-            stored = {r.id for r, _ in workouts} - {r.id for r, _ in new_workouts}
-            inserted_ids = event_record_service.bulk_create(db, [r for r in all_records if r.id not in stored])
+            count += WriteCounts(len(created), len(updated))
+            inserted_ids = event_record_service.bulk_create(db, [r for r in all_records if r.id not in details])
             db.flush()
 
             inserted_set = set(inserted_ids)
@@ -2073,15 +2078,6 @@ class Garmin247Data(Base247DataTemplate):
             sleep_details = [d for d in all_sleep_details if d.record_id in inserted_set]
             if sleep_details:
                 event_record_service.bulk_create_details(db, sleep_details, detail_type=EventCategory.SLEEP)
-
-            # Bulk create workout details for actually inserted records
-            workout_details = [d for d in all_workout_details if d.record_id in inserted_set]
-            if workout_details:
-                event_record_service.bulk_create_details(db, workout_details, detail_type=EventCategory.WORKOUT)
-            # The same workout twice in this batch: the first one inserted it
-            if repeated := [(r, d) for r, d in new_workouts if r.id not in inserted_set]:
-                _, updated = event_record_service.update_stored_workouts(db, user_id, self.provider_name, repeated)
-                count += WriteCounts(0, len(updated))
 
             # Bulk create MCT details for actually inserted records
             mct_details = [d for d in all_mct_details if d.record_id in inserted_set]

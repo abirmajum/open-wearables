@@ -188,6 +188,20 @@ class EventRecordRepository(
             .one_or_none()
         )
 
+    @staticmethod
+    def lock_workouts(db_session: DbSession, user_id: UUID, provider: str, external_ids: Iterable[str]) -> None:
+        """Hold these workout ids of the user until the transaction ends.
+
+        The pushes of one workout file it under different data sources (its FIT file under no device, its summaries
+        under the device), so no unique index stops two of them inserting it at once. Ids are taken in one order, so
+        two pushes sharing several ids cannot deadlock.
+        """
+        for external_id in sorted({external_id for external_id in external_ids if external_id}):
+            db_session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+                {"key": f"{provider}-workout:{user_id}:{external_id}"},
+            )
+
     def get_by_external_ids(
         self, db_session: DbSession, user_id: UUID, external_ids: Iterable[str], provider: str | None = None
     ) -> dict[str, EventRecord]:
