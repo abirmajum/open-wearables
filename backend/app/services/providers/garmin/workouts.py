@@ -1,5 +1,5 @@
 from collections.abc import Mapping
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 from uuid import UUID, uuid4
 
@@ -59,6 +59,34 @@ def activity_metrics(summary: Mapping[str, Any]) -> EventRecordMetrics:
         metrics["label"] = name
 
     return metrics
+
+
+def activity_workout(
+    summary: Mapping[str, Any], user_id: UUID
+) -> tuple[EventRecordCreate, EventRecordDetailCreate] | None:
+    """The workout of a Garmin activity summary, as the activities push sends it and the activityDetails push nests
+    it under ``summary``; None without the activity id or start time that identify it."""
+    activity_id, start = summary.get("activityId"), summary.get("startTimeInSeconds")
+    if not activity_id or not start:
+        return None
+    duration = summary.get("durationInSeconds") or 0
+    device = summary.get("deviceName")
+    activity_type = summary.get("activityType")
+    record = EventRecordCreate(
+        id=uuid4(),
+        category=EventCategory.WORKOUT,
+        type=get_unified_workout_type(activity_type).value if activity_type else None,
+        source_name=device or "Garmin",
+        device_model=device,
+        duration_seconds=duration,
+        start_datetime=datetime.fromtimestamp(start, tz=timezone.utc),
+        end_datetime=datetime.fromtimestamp(start + duration, tz=timezone.utc),
+        zone_offset=offset_to_iso(summary.get("startTimeOffsetInSeconds")),
+        external_id=str(activity_id),
+        source="garmin",
+        user_id=user_id,
+    )
+    return record, EventRecordDetailCreate(record_id=record.id, **activity_metrics(summary))
 
 
 class GarminWorkouts(BaseWorkoutsTemplate):
@@ -198,12 +226,6 @@ class GarminWorkouts(BaseWorkoutsTemplate):
         except (ValueError, AttributeError):
             return None
 
-    def _extract_dates(self, start_timestamp: int, end_timestamp: int) -> tuple[datetime, datetime]:
-        """Extract start and end dates from timestamps."""
-        start_date = datetime.fromtimestamp(start_timestamp)
-        end_date = datetime.fromtimestamp(end_timestamp)
-        return start_date, end_date
-
     def _build_metrics(self, raw_workout: GarminActivityJSON) -> EventRecordMetrics:
         return activity_metrics(raw_workout.model_dump())
 
@@ -213,43 +235,10 @@ class GarminWorkouts(BaseWorkoutsTemplate):
         user_id: UUID,
     ) -> tuple[EventRecordCreate, EventRecordDetailCreate]:
         """Normalize Garmin activity to EventRecordCreate and EventRecordDetailCreate."""
-        workout_id = uuid4()
-
-        workout_type = get_unified_workout_type(raw_workout.activityType)
-
-        start_date, end_date = self._extract_dates(
-            raw_workout.startTimeInSeconds,
-            raw_workout.startTimeInSeconds + raw_workout.durationInSeconds,
-        )
-        duration_seconds = raw_workout.durationInSeconds
-
-        metrics = self._build_metrics(raw_workout)
-
-        device_name = raw_workout.deviceName or "Garmin"
-
-        zone_offset = offset_to_iso(raw_workout.startTimeOffsetInSeconds)
-
-        record = EventRecordCreate(
-            category=EventCategory.WORKOUT,
-            type=workout_type.value,
-            source_name=device_name,
-            device_model=raw_workout.deviceName,
-            duration_seconds=duration_seconds,
-            start_datetime=start_date,
-            end_datetime=end_date,
-            zone_offset=zone_offset,
-            id=workout_id,
-            external_id=str(raw_workout.activityId),  # Convert to str (push sends int)
-            source="garmin",
-            user_id=user_id,
-        )
-
-        detail = EventRecordDetailCreate(
-            record_id=workout_id,
-            **metrics,
-        )
-
-        return record, detail
+        workout = activity_workout(raw_workout.model_dump(), user_id)
+        if workout is None:
+            raise ValueError(f"Garmin activity {raw_workout.activityId} has no start time")
+        return workout
 
     def _build_bundles(
         self,
@@ -297,14 +286,16 @@ class GarminWorkouts(BaseWorkoutsTemplate):
             user_id: Internal user ID (already mapped from Garmin user ID)
 
         Returns:
-            List of created event record IDs
+            Ids of the event records saved, created or updated
         """
-        created_ids: list[UUID] = []
-
-        for record, detail in self._build_bundles(activities, user_id):
+        new, saved_ids = event_record_service.update_stored_workouts(
+            db, user_id, "garmin", list(self._build_bundles(activities, user_id))
+        )
+        db.commit()
+        for record, detail in new:
             created_record = event_record_service.create(db, record)
             detail_for_record = detail.model_copy(update={"record_id": created_record.id})
             event_record_service.create_detail(db, detail_for_record)
-            created_ids.append(created_record.id)
+            saved_ids.append(created_record.id)
 
-        return created_ids
+        return saved_ids

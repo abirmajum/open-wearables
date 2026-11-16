@@ -104,18 +104,6 @@ class TestGarminWorkouts:
         result = garmin_workouts._parse_timestamp(None)
         assert result is None
 
-    def test_extract_dates(self, garmin_workouts: GarminWorkouts) -> None:
-        """Test extracting dates from timestamps."""
-        start_ts = 1705309200  # 2024-01-15 08:00:00
-        end_ts = 1705312800  # 2024-01-15 09:00:00
-
-        start_date, end_date = garmin_workouts._extract_dates(start_ts, end_ts)
-
-        assert isinstance(start_date, datetime)
-        assert isinstance(end_date, datetime)
-        assert start_date.timestamp() == start_ts
-        assert end_date.timestamp() == end_ts
-
     def test_build_metrics_with_all_values(
         self,
         garmin_workouts: GarminWorkouts,

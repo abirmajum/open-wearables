@@ -4,6 +4,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from uuid import UUID, uuid4
 
 from sqlalchemy import event as sa_event
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Query
 
 from app.config import settings
@@ -31,6 +32,7 @@ from app.repositories import (
     HealthScoreRepository,
 )
 from app.repositories.data_point_series_repository import WorkoutWindow
+from app.repositories.data_source_repository import DataSourceIdentity
 from app.repositories.data_type_coverage_repository import data_type_coverage_repository
 from app.repositories.event_record_repository import local_days
 from app.schemas.data_type_coverage import CoverageSpan
@@ -230,8 +232,8 @@ class EventRecordService(
         """Return the local calendar date of a sleep session start."""
         return cls._to_local(start_datetime, zone_offset).date()
 
-    def _widen_sleep_coverage(self, db_session: DbSession, session: EventRecord) -> None:
-        """Widen the provider's sleep coverage to a session re-sent over a longer window.
+    def _widen_coverage(self, db_session: DbSession, session: EventRecord) -> None:
+        """Widen the provider's coverage of the session's category to a session re-sent over a longer window.
 
         A shorter one is not narrowed here: that recount takes the global coverage lock, too much for every webhook.
         """
@@ -241,7 +243,7 @@ class EventRecordService(
         span = CoverageSpan(
             data_source.user_id,
             data_source.provider,
-            EventCategory.SLEEP.value,
+            session.category,
             DataTypeKind.EVENT,
             session.start_datetime,
             session.end_datetime,
@@ -487,7 +489,7 @@ class EventRecordService(
             # Its provider score sits at the old end, which a shortened night leaves outside its window.
             self.health_score_repo.drop_provider_sleep_score(db_session, stored.data_source_id, old_end)
         db_session.flush()
-        self._widen_sleep_coverage(db_session, stored)
+        self._widen_coverage(db_session, stored)
         # Its session rows are rolled up over the window it has now, on the days it left and joined.
         mark_dirty_days(
             db_session,
@@ -509,6 +511,82 @@ class EventRecordService(
                 self._local_sleep_date(old_start, old_zone),
                 self._local_sleep_date(stored.start_datetime, stored.zone_offset),
             },
+        )
+
+    def update_stored_workouts(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        provider: str,
+        workouts: Sequence[tuple[EventRecordCreate, EventRecordDetailCreate]],
+    ) -> tuple[list[tuple[EventRecordCreate, EventRecordDetailCreate]], list[UUID]]:
+        """Update the user's stored workouts that these pushes send again under their id.
+
+        A provider can send one workout in several pushes, in any order, each with some of its fields. The stored
+        workout takes the device, type and span a push names, and its detail the values the push carries; what a
+        push leaves out keeps its stored value. Caller is responsible for commit.
+
+        Returns:
+            The workouts not stored yet, and the ids of the stored ones updated.
+        """
+        stored = {
+            external_id: record
+            for external_id, record in self.crud.get_by_external_ids(
+                db_session, user_id, (record.external_id for record, _ in workouts if record.external_id), provider
+            ).items()
+            if record.category == EventCategory.WORKOUT
+        }
+        new: list[tuple[EventRecordCreate, EventRecordDetailCreate]] = []
+        updated: list[UUID] = []
+        for record, detail in workouts:
+            if (target := stored.get(record.external_id or "")) is None:
+                new.append((record, detail))
+                continue
+            self._refresh_workout(db_session, target, record)
+            # One upsert per detail: a batch carrying the same workout twice would update one row twice
+            self.event_record_detail_repo.bulk_create(
+                db_session, [detail.model_copy(update={"record_id": target.id})], detail_type=EventCategory.WORKOUT
+            )
+            updated.append(target.id)
+        return new, updated
+
+    def _refresh_workout(self, db_session: DbSession, stored: EventRecord, record: EventRecordCreate) -> None:
+        """The stored workout takes the device, type and span the push names."""
+        old_source, old_start, old_end, old_zone = (
+            stored.data_source_id,
+            stored.start_datetime,
+            stored.end_datetime,
+            stored.zone_offset,
+        )
+        changes = {
+            field: value
+            for field in ("type", "duration_seconds", "start_datetime", "end_datetime", "zone_offset")
+            if (value := getattr(record, field)) is not None
+        }
+        if record.device_model is not None and (
+            source_id := self.data_source_repo.resolve_creators(db_session, [record]).get(DataSourceIdentity.of(record))
+        ):
+            changes |= {"data_source_id": source_id, "source_name": record.source_name}
+        try:
+            with db_session.begin_nested():
+                for field, value in changes.items():
+                    setattr(stored, field, value)
+                db_session.flush()
+        except IntegrityError as e:
+            logger.warning(
+                "Re-sent workout not moved, another record holds its source and span",
+                record_id=str(stored.id),
+                external_id=stored.external_id,
+                error=str(e),
+            )
+            return
+        self._widen_coverage(db_session, stored)
+        mark_dirty_days(
+            db_session,
+            [
+                *local_days(old_source, old_start, old_end, old_zone),
+                *local_days(stored.data_source_id, stored.start_datetime, stored.end_datetime, stored.zone_offset),
+            ],
         )
 
     def _create_or_merge_sleep_inner(

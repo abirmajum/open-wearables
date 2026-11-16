@@ -12,6 +12,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.config import settings
 from app.constants.sleep import SleepStageType
+from app.constants.workout_types.garmin import get_unified_workout_type
 from app.database import DbSession
 from app.integrations.redis_client import get_redis_client
 from app.models import EventRecord, EventRecordDetail, SeriesSample
@@ -34,7 +35,7 @@ from app.schemas.model_crud.activities import (
     TimeSeriesSampleCreate,
 )
 from app.services.event_record_service import event_record_service
-from app.services.fit_parser import parse_fit_file
+from app.services.fit_parser import FitParseResult, parse_fit_file
 from app.services.health_score_service import health_score_service
 from app.services.providers.api_client import download_binary_content, make_authenticated_request
 from app.services.providers.garmin.coverage import (
@@ -44,7 +45,7 @@ from app.services.providers.garmin.coverage import (
     EPOCHS_SERIES,
     SLEEP_SERIES,
 )
-from app.services.providers.garmin.workouts import activity_metrics
+from app.services.providers.garmin.workouts import activity_workout
 from app.services.providers.sync_247_result import Sync247Result
 from app.services.providers.templates.base_247_data import Base247DataTemplate
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
@@ -1131,46 +1132,6 @@ class Garmin247Data(Base247DataTemplate):
     # Activity Data - /wellness-api/rest/activities
     # -------------------------------------------------------------------------
 
-    def _build_activity_record(
-        self,
-        user_id: UUID,
-        raw_activity: dict[str, Any],
-    ) -> tuple[EventRecordCreate, EventRecordDetailCreate] | None:
-        """Build EventRecord + WorkoutDetail for an activity (no DB interaction)."""
-        activity_id = raw_activity.get("activityId")
-        if not activity_id:
-            return None
-
-        start_ts = raw_activity.get("startTimeInSeconds", 0)
-        duration = raw_activity.get("durationInSeconds", 0)
-
-        if not start_ts:
-            return None
-
-        start_dt = self._from_epoch_seconds(start_ts)
-        end_dt = self._from_epoch_seconds(start_ts + duration) if duration else start_dt
-        zone_offset = offset_to_iso(raw_activity.get("startTimeOffsetInSeconds"))
-
-        activity_type = raw_activity.get("activityType", "unknown")
-
-        record_id = uuid4()
-        record = EventRecordCreate(
-            id=record_id,
-            category=EventCategory.WORKOUT,
-            type=activity_type.lower(),
-            source_name="Garmin",
-            device_model=raw_activity.get("deviceName"),
-            duration_seconds=duration,
-            start_datetime=start_dt,
-            end_datetime=end_dt,
-            zone_offset=zone_offset,
-            external_id=str(activity_id),
-            source=self.provider_name,
-            user_id=user_id,
-        )
-
-        return record, EventRecordDetailCreate(record_id=record_id, **activity_metrics(raw_activity))
-
     def _build_activity_samples(
         self,
         user_id: UUID,
@@ -1210,27 +1171,6 @@ class Garmin247Data(Base247DataTemplate):
                     )
                 )
         return result
-
-    def save_activity_data(
-        self,
-        db: DbSession,
-        user_id: UUID,
-        raw_activity: dict[str, Any],
-    ) -> int:
-        """Save activity data as EventRecord with WorkoutDetails."""
-        result = self._build_activity_record(user_id, raw_activity)
-        if not result:
-            return 0
-
-        record, detail = result
-        try:
-            created_record = event_record_service.create(db, record)
-            detail.record_id = created_record.id
-            event_record_service.create_detail(db, detail, detail_type=EventCategory.WORKOUT)
-            return 1
-        except Exception as e:
-            logger.debug("Activity may already exist", provider="garmin", user_id=str(user_id), error=str(e))
-            return 0
 
     # -------------------------------------------------------------------------
     # Stress Data - /wellness-api/rest/stressDetails
@@ -1820,38 +1760,43 @@ class Garmin247Data(Base247DataTemplate):
         return record, detail
 
     def _save_fit_workout_fields(
-        self,
-        db: DbSession,
-        user_id: UUID,
-        activity_id: str,
-        segments: list[dict],
-        hr_zones: dict | None = None,
-        power_zones: dict | None = None,
-        session: dict[str, Decimal] | None = None,
-    ) -> None:
-        """Update workout_details fields derived from the FIT file.
-
-        No-op if the event_record doesn't exist yet (activityFiles arrived before
-        activityDetails). activityDetails is always processed first within the same
-        webhook because WELLNESS_TYPES orders it before activityFiles.
-        """
+        self, db: DbSession, user_id: UUID, activity_id: str, fit: FitParseResult
+    ) -> tuple[EventRecordCreate, EventRecordDetailCreate] | None:
+        """Fill the stored workout's fields from its FIT file, or, with none stored yet, return the workout the file's
+        sessions stand for, for the push to create; its activities and activityDetails pushes fill in the rest."""
+        fields: dict[str, Any] = {"segments": fit.segments}
+        if fit.hr_zones is not None:
+            fields["hr_zones"] = fit.hr_zones.model_dump()
+        if fit.power_zones is not None:
+            fields["power_zones"] = fit.power_zones.model_dump()
+        fields.update(fit.session)
         record = self.event_record_repo.get_by_external_id(db, user_id, activity_id, source=self.provider_name)
-        if record is None:
+        if record is not None:
+            self.event_record_detail_repo.update_workout_fields(db, record.id, fields)
+            return None
+        if fit.workout is None:
             logger.warning(
-                "No event_record found for activityFiles — FIT workout fields not saved",
+                "FIT file pushed before its workout has no session to stand for it, FIT workout fields not saved",
                 provider="garmin",
                 task="_save_fit_workout_fields",
                 user_id=str(user_id),
                 activity_id=activity_id,
             )
-            return
-        fields: dict = {"segments": segments}
-        if hr_zones is not None:
-            fields["hr_zones"] = hr_zones
-        if power_zones is not None:
-            fields["power_zones"] = power_zones
-        fields.update(session or {})
-        self.event_record_detail_repo.update_workout_fields(db, record.id, fields)
+            return None
+        workout = EventRecordCreate(
+            id=uuid4(),
+            category=EventCategory.WORKOUT,
+            type=get_unified_workout_type(fit.workout.sport).value if fit.workout.sport else None,
+            source_name="Garmin",
+            device_model=None,
+            duration_seconds=int((fit.workout.end - fit.workout.start).total_seconds()),
+            start_datetime=fit.workout.start,
+            end_datetime=fit.workout.end,
+            external_id=activity_id,
+            source=self.provider_name,
+            user_id=user_id,
+        )
+        return workout, EventRecordDetailCreate(record_id=workout.id, **fields)
 
     # -------------------------------------------------------------------------
     # Batch Processing (for webhook handlers)
@@ -1944,16 +1889,8 @@ class Garmin247Data(Base247DataTemplate):
                                 all_records.append(nap_record)
                                 all_sleep_details.append(nap_detail)
                         all_samples.extend(self._build_sleep_vitals_samples(user_id, item))
-                    case "activities":
-                        result = self._build_activity_record(user_id, item)
-                        if result:
-                            record, detail = result
-                            all_records.append(record)
-                            all_workout_details.append(detail)
                     case "activityDetails":
-                        # activityDetails items nest summary data one level deeper.
-                        result = self._build_activity_record(user_id, item.get("summary", {}))
-                        if result:
+                        if result := activity_workout(item.get("summary", {}), user_id):
                             record, detail = result
                             all_records.append(record)
                             all_workout_details.append(detail)
@@ -2018,17 +1955,17 @@ class Garmin247Data(Base247DataTemplate):
                                 error=str(e),
                             )
                             continue
-                        if fit_result.segments or fit_result.hr_zones or fit_result.power_zones or fit_result.session:
+                        if activity_id and (
+                            fit_result.workout
+                            or fit_result.segments
+                            or fit_result.hr_zones
+                            or fit_result.power_zones
+                            or fit_result.session
+                        ):
                             try:
-                                self._save_fit_workout_fields(
-                                    db,
-                                    user_id,
-                                    activity_id,
-                                    fit_result.segments,
-                                    hr_zones=fit_result.hr_zones.model_dump() if fit_result.hr_zones else None,
-                                    power_zones=fit_result.power_zones.model_dump() if fit_result.power_zones else None,
-                                    session=fit_result.session,
-                                )
+                                if workout := self._save_fit_workout_fields(db, user_id, activity_id, fit_result):
+                                    all_records.append(workout[0])
+                                    all_workout_details.append(workout[1])
                             except Exception as e:
                                 logger.warning(
                                     "Failed to save FIT workout fields",
@@ -2118,7 +2055,16 @@ class Garmin247Data(Base247DataTemplate):
 
         # Single bulk insert for EventRecords
         if all_records:
-            inserted_ids = event_record_service.bulk_create(db, all_records)
+            # A workout is its Garmin activity id: one already stored takes what this push carries, whichever of
+            # its pushes (activities, activityDetails, its FIT file) came first
+            details = {d.record_id: d for d in all_workout_details}
+            workouts = [(r, details[r.id]) for r in all_records if r.id in details]
+            new_workouts, updated = event_record_service.update_stored_workouts(
+                db, user_id, self.provider_name, workouts
+            )
+            count += WriteCounts(0, len(updated))
+            stored = {r.id for r, _ in workouts} - {r.id for r, _ in new_workouts}
+            inserted_ids = event_record_service.bulk_create(db, [r for r in all_records if r.id not in stored])
             db.flush()
 
             inserted_set = set(inserted_ids)
@@ -2132,11 +2078,10 @@ class Garmin247Data(Base247DataTemplate):
             workout_details = [d for d in all_workout_details if d.record_id in inserted_set]
             if workout_details:
                 event_record_service.bulk_create_details(db, workout_details, detail_type=EventCategory.WORKOUT)
-            # A workout Garmin pushes again (activities, then activityDetails) keeps its record; the fields this push
-            # carries fill its stored detail, without a second created webhook
-            if refreshed := self._stored_workout_details(db, user_id, all_records, all_workout_details, inserted_set):
-                self.event_record_detail_repo.bulk_create(db, refreshed, detail_type=EventCategory.WORKOUT)
-                count += WriteCounts(0, len(refreshed))
+            # The same workout twice in this batch: the first one inserted it
+            if repeated := [(r, d) for r, d in new_workouts if r.id not in inserted_set]:
+                _, updated = event_record_service.update_stored_workouts(db, user_id, self.provider_name, repeated)
+                count += WriteCounts(0, len(updated))
 
             # Bulk create MCT details for actually inserted records
             mct_details = [d for d in all_mct_details if d.record_id in inserted_set]
@@ -2159,32 +2104,6 @@ class Garmin247Data(Base247DataTemplate):
             db.commit()
 
         return count
-
-    def _stored_workout_details(
-        self,
-        db: DbSession,
-        user_id: UUID,
-        records: list[EventRecordCreate],
-        details: list[EventRecordDetailCreate],
-        inserted: set[UUID],
-    ) -> list[EventRecordDetailCreate]:
-        """The details of the workouts this push did not insert, each moved onto the user's stored workout of the
-        same Garmin activity id."""
-        resent = {r.id: r.external_id for r in records if r.category == EventCategory.WORKOUT and r.id not in inserted}
-        if not resent:
-            return []
-        stored = {
-            external_id: record.id
-            for external_id, record in self.event_record_repo.get_by_external_ids(
-                db, user_id, filter(None, resent.values()), self.provider_name
-            ).items()
-            if record.category == EventCategory.WORKOUT
-        }
-        return [
-            d.model_copy(update={"record_id": stored[external_id]})
-            for d in details
-            if (external_id := resent.get(d.record_id)) in stored
-        ]
 
     def _save_night_scores(
         self, db: DbSession, user_id: UUID, night_scores: list[tuple[EventRecordCreate | None, HealthScoreCreate]]
