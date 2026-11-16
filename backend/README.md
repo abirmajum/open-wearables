@@ -161,6 +161,23 @@ uv run pre-commit install
 uv run pre-commit run --all-files
 ```
 
+### Fixture Server (Garmin and Ultrahuman)
+
+`scripts/rumi_fixture_server.py` serves the real v1 API over synthetic Garmin and Ultrahuman data. It needs Docker
+and the dev dependencies (`uv sync --group dev`). It starts its own Postgres and Redis containers, runs the seeds in
+`scripts/rumi_fixture_seeds/` through the real webhook and pull code, and removes the containers when it stops.
+No request leaves the machine.
+
+```bash
+uv run python scripts/rumi_fixture_server.py --today 2026-11-15
+```
+
+The last line on stdout is one JSON object: `base_url`, `port`, `api_key` and each user's `id` and `providers`
+(one Garmin user, one Ultrahuman user, one with both). The seeds cover the ten days ending on `--today`; pick a
+recent date, since score look-backs run from the real clock. `--dump-to DIR` writes every v1 GET response per user,
+`--no-serve` exits after that, and `--port` fixes the port. Edit `scripts/rumi_fixture_seeds/generate.py` and run it
+to change the seeds.
+
 ## Project Structure
 
 ```
