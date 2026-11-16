@@ -1,5 +1,6 @@
 """Ultrahuman Ring Air 24/7 data implementation for sleep, recovery, and activity samples."""
 
+import math
 import re
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -29,6 +30,7 @@ from app.services.providers.ultrahuman.coverage import (
     DAILY_SCALAR_SERIES,
     DAILY_SCORES,
     SCORE_COMPONENTS,
+    SLEEP_SCORE_LOCATIONS,
 )
 from app.services.raw_payload_storage import store_raw_payload
 from app.services.timeseries_service import timeseries_service
@@ -47,12 +49,25 @@ SLEEP_GRAPH_STAGE_MAP: dict[str, SleepStageType] = {
 }
 
 
-def _value_at(items_by_type: dict[str, Any], path: tuple[str, ...]) -> Any:
-    """The ``value`` of the object a component path leads to; None where the day lacks it."""
+def _at(items_by_type: dict[str, Any], path: tuple[str, ...]) -> Any:
+    """What a path from the metric type leads to, a step into a list taking its item of that ``type``; None where
+    the day lacks it."""
     node: Any = items_by_type
     for key in path:
-        node = node.get(key) if isinstance(node, dict) else None
-    return node.get("value") if isinstance(node, dict) else None
+        if isinstance(node, list):
+            node = next((item for item in node if isinstance(item, dict) and item.get("type") == key), None)
+        else:
+            node = node.get(key) if isinstance(node, dict) else None
+    return node
+
+
+def _value_at(items_by_type: dict[str, Any], path: tuple[str, ...]) -> Any:
+    """The ``value`` of the object a component path leads to; None where the day lacks it."""
+    return _at(items_by_type, (*path, "value"))
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
 
 
 def _components(category: HealthScoreCategory, items_by_type: dict[str, Any]) -> dict[str, ScoreComponent]:
@@ -370,7 +385,7 @@ class Ultrahuman247Data(Base247DataTemplate):
             **_components(HealthScoreCategory.SLEEP, items_by_type),
             **{name: ScoreComponent(value=value) for name, value in readings.items() if value is not None},
         }
-        value = quick_metrics.get("sleep_score")
+        value = next((v for v in (_at(items_by_type, p) for p in SLEEP_SCORE_LOCATIONS) if _is_number(v)), None)
         if value is None and not components:
             return None
         return HealthScoreCreate(

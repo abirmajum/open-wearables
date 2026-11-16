@@ -51,6 +51,16 @@ SCORE_COMPONENTS: dict[HealthScoreCategory, dict[str, tuple[str, ...]]] = {
     },
 }
 
+# Where a day's metrics may carry the night's sleep score, first numeric one wins (path from the metric type; a
+# step into a list takes the item of that ``type``). Ultrahuman publishes no schema and clients read it differently.
+SLEEP_SCORE_LOCATIONS: tuple[tuple[str, ...], ...] = (
+    ("Sleep", "quick_metrics", "sleep_score", "value"),
+    ("Sleep", "sleep_score", "score"),
+    ("Sleep", "score_trend", "day_avg"),
+    ("sleep_index", "value"),
+    ("sleep_index", "score"),
+)
+
 TIMESERIES: frozenset[SeriesType] = frozenset(
     {
         *ACTIVITY_SAMPLE_SERIES.values(),  # /user_data/metrics timelines

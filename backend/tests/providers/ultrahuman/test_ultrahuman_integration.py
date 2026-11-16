@@ -12,6 +12,7 @@ from typing import Any
 from unittest.mock import patch
 from uuid import UUID
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -971,6 +972,58 @@ class TestUltrahumanScoresIntegration:
             "avg_hrv": (48, None),
             "sleep_cycles": (3, None),
         }
+
+    # Where clients read the night's score, in the order Open Wearables prefers them.
+    SLEEP_SCORE_PLACES: list[tuple[str, ...]] = [
+        ("Sleep", "quick_metrics", "sleep_score", "value"),
+        ("Sleep", "sleep_score", "score"),
+        ("Sleep", "score_trend", "day_avg"),
+        ("sleep_index", "value"),
+        ("sleep_index", "score"),
+    ]
+
+    @staticmethod
+    def _with_sleep_score_at(response: dict, places: list[tuple[tuple[str, ...], Any]]) -> dict:
+        """The response with its quick-metric sleep score removed and the given values put at the given places."""
+        response = copy.deepcopy(response)
+        metric_data = response["data"]["metric_data"]
+        objects = {item["type"]: item["object"] for item in metric_data}
+        sleep = objects["Sleep"]
+        sleep["quick_metrics"] = [m for m in sleep["quick_metrics"] if m["type"] != "sleep_score"]
+        for path, value in places:
+            if path[0] not in objects:
+                objects[path[0]] = {"title": path[0], "day_start_timestamp": 1705276800}
+                metric_data.append({"type": path[0], "object": objects[path[0]]})
+            node: Any = objects
+            for key in path[:-1]:
+                if isinstance(node, list):
+                    node.append({"type": key})
+                    node = node[-1]
+                else:
+                    node = node.setdefault(key, {})
+            node[path[-1]] = value
+        return response
+
+    @pytest.mark.parametrize("path", SLEEP_SCORE_PLACES)
+    def test_sleep_score_is_read_wherever_a_client_found_it(
+        self, client: TestClient, db: Session, sample_ultrahuman_api_response: dict, path: tuple[str, ...]
+    ) -> None:
+        response = self._with_sleep_score_at(sample_ultrahuman_api_response, [(path, 64)])
+
+        assert self._scores(client, self._sync(db, response))["sleep"]["value"] == 64
+
+    def test_sleep_score_places_are_read_in_order_and_skip_what_is_not_a_number(
+        self, client: TestClient, db: Session, sample_ultrahuman_api_response: dict
+    ) -> None:
+        places = self.SLEEP_SCORE_PLACES
+        for first in range(len(places)):
+            later = [(path, 70 + i) for i, path in enumerate(places) if i >= first]
+            response = self._with_sleep_score_at(sample_ultrahuman_api_response, later)
+            assert self._scores(client, self._sync(db, response))["sleep"]["value"] == 70 + first
+
+        not_numbers = [(places[0], "81"), (places[1], None), (places[2], True)]
+        response = self._with_sleep_score_at(sample_ultrahuman_api_response, [*not_numbers, (places[3], 66)])
+        assert self._scores(client, self._sync(db, response))["sleep"]["value"] == 66
 
     def test_a_score_without_a_value_is_not_written(
         self, client: TestClient, db: Session, sample_ultrahuman_api_response: dict
