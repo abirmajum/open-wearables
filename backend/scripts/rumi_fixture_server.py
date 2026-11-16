@@ -525,12 +525,13 @@ def main() -> None:
     parser.add_argument("--no-serve", action="store_true", help="Exit after seeding (and the dump)")
     args = parser.parse_args()
 
-    # Deterministic row ids, so a re-run of the same revision serves the same bodies.
-    setattr(uuid, "uuid4", _seeded_uuid4(int(args.today.strftime("%Y%m%d"))))
     port = args.port or _free_port()
     signal.signal(signal.SIGTERM, _stop)
 
     with _containers() as (db_url, redis_host, redis_port):
+        # Deterministic row ids, so a re-run of the same revision serves the same bodies. Seeded only once the
+        # containers run: testcontainers names this process's cleanup container after a uuid4 it draws on import.
+        setattr(uuid, "uuid4", _seeded_uuid4(int(args.today.strftime("%Y%m%d"))))
         _configure_environment(db_url, redis_host, redis_port, port)
         skipped = seed(args.today, args.api_key)
 
