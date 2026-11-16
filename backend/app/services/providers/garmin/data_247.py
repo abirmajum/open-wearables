@@ -1900,6 +1900,8 @@ class Garmin247Data(Base247DataTemplate):
         all_mct_details: list[MenstrualCycleDetailCreate] = []
         all_health_scores: list[HealthScoreCreate] = []
         night_scores: list[tuple[EventRecordCreate, HealthScoreCreate]] = []
+        # A night is one sleep summary: re-sent under its summaryId, it updates the stored night whatever its span
+        nights: dict[str, tuple[EventRecordCreate, EventRecordDetailCreate]] = {}
         epoch_items: list[dict[str, Any]] = []
 
         for item in items:
@@ -1940,8 +1942,11 @@ class Garmin247Data(Base247DataTemplate):
                         result = self._build_sleep_record(user_id, normalized)
                         if result:
                             record, detail = result
-                            all_records.append(record)
-                            all_sleep_details.append(detail)
+                            if record.external_id:
+                                nights[record.external_id] = (record, detail)
+                            else:
+                                all_records.append(record)
+                                all_sleep_details.append(detail)
                             if health_score:
                                 night_scores.append((record, health_score))
                         for raw_nap in normalized.get("naps", []):
@@ -2087,6 +2092,22 @@ class Garmin247Data(Base247DataTemplate):
             all_samples.extend(self._build_epochs_samples(user_id, self.normalize_epochs(epoch_items, user_id, db)))
 
         count = WriteCounts(0, 0)
+
+        if nights:
+            stored_nights = self.event_record_repo.get_main_sleeps_by_external_ids(
+                db, user_id, nights, self.provider_name
+            )
+            for summary_id, (record, detail) in nights.items():
+                if not (versions := stored_nights.get(summary_id)):
+                    all_records.append(record)
+                    all_sleep_details.append(detail)
+                    continue
+                # Copies an earlier push left when it moved the night's span; one may hold the span sent now
+                for stale in versions[1:]:
+                    db.delete(stale)
+                db.flush()
+                event_record_service.refresh_sleep(db, user_id, versions[0], record, detail)
+                count += WriteCounts(0, 1)
 
         # Single bulk insert for SeriesSample
         if all_samples:

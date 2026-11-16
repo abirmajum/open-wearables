@@ -194,6 +194,32 @@ class EventRecordRepository(
             query = query.filter(DataSource.provider == provider)
         return {record.external_id: record for record in query if record.external_id}
 
+    def get_main_sleeps_by_external_ids(
+        self, db_session: DbSession, user_id: UUID, external_ids: Iterable[str], provider: str
+    ) -> dict[str, list[EventRecord]]:
+        """The user's main sleeps of this provider under each id, latest end first; naps sent under a night's id
+        are left out."""
+        ids = list({external_id for external_id in external_ids if external_id})
+        if not ids:
+            return {}
+        rows = (
+            db_session.query(self.model)
+            .join(DataSource, self.model.data_source_id == DataSource.id)
+            .filter(
+                DataSource.user_id == user_id,
+                DataSource.provider == provider,
+                self.model.category == EventCategory.SLEEP,
+                self.model.external_id.in_(ids),
+                _nap_condition(False),
+            )
+            .order_by(self.model.end_datetime.desc(), self.model.id)
+        )
+        nights: dict[str, list[EventRecord]] = {}
+        for record in rows:
+            if record.external_id:
+                nights.setdefault(record.external_id, []).append(record)
+        return nights
+
     def get_ids_by_external_span(
         self,
         db_session: DbSession,

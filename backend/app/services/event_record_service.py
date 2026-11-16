@@ -465,6 +465,52 @@ class EventRecordService(
             )
         return result
 
+    def refresh_sleep(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        stored: EventRecord,
+        record: EventRecordCreate,
+        detail: EventRecordDetailCreate,
+    ) -> None:
+        """A session the provider sent again under its id: the stored one takes the new span and detail.
+
+        Caller is responsible for commit.
+        """
+        old_start, old_end, old_zone = stored.start_datetime, stored.end_datetime, stored.zone_offset
+        for field in ("start_datetime", "end_datetime", "zone_offset"):
+            new_val = getattr(record, field, None)
+            if new_val is not None:
+                setattr(stored, field, new_val)
+        stored.duration_seconds = int((stored.end_datetime - stored.start_datetime).total_seconds())
+        if stored.end_datetime != old_end:
+            # Its provider score sits at the old end, which a shortened night leaves outside its window.
+            self.health_score_repo.drop_provider_sleep_score(db_session, stored.data_source_id, old_end)
+        db_session.flush()
+        self._widen_sleep_coverage(db_session, stored)
+        # Its session rows are rolled up over the window it has now, on the days it left and joined.
+        mark_dirty_days(
+            db_session,
+            [
+                *local_days(stored.data_source_id, old_start, old_end, old_zone),
+                *local_days(stored.data_source_id, stored.start_datetime, stored.end_datetime, stored.zone_offset),
+            ],
+        )
+        self.event_record_detail_repo.delete_by_record_id(db_session, stored.id, EventCategory.SLEEP)
+        self.event_record_detail_repo.create_and_flush(
+            db_session,
+            detail.model_copy(update={"record_id": stored.id}),
+            detail_type=EventCategory.SLEEP,
+        )
+        self._recompute_sleep_scores(
+            db_session,
+            user_id,
+            {
+                self._local_sleep_date(old_start, old_zone),
+                self._local_sleep_date(stored.start_datetime, stored.zone_offset),
+            },
+        )
+
     def _create_or_merge_sleep_inner(
         self,
         db_session: DbSession,
@@ -504,44 +550,7 @@ class EventRecordService(
             # retry, score update).  Replace the detail with fresh values instead
             # of accumulating them on top of the existing ones.
             if record.external_id is not None and adjacent.external_id == record.external_id:
-                old_start, old_end, old_zone = adjacent.start_datetime, adjacent.end_datetime, adjacent.zone_offset
-                for field in ("start_datetime", "end_datetime", "zone_offset"):
-                    new_val = getattr(record, field, None)
-                    if new_val is not None:
-                        setattr(adjacent, field, new_val)
-                adjacent.duration_seconds = int((adjacent.end_datetime - adjacent.start_datetime).total_seconds())
-                if adjacent.end_datetime != old_end:
-                    # Its provider score sits at the old end, which a shortened night leaves outside its window.
-                    self.health_score_repo.drop_provider_sleep_score(db_session, adjacent.data_source_id, old_end)
-                db_session.flush()
-                self._widen_sleep_coverage(db_session, adjacent)
-                # Its session rows are rolled up over the window it has now, on the days it left and joined.
-                mark_dirty_days(
-                    db_session,
-                    [
-                        *local_days(adjacent.data_source_id, old_start, old_end, old_zone),
-                        *local_days(
-                            adjacent.data_source_id,
-                            adjacent.start_datetime,
-                            adjacent.end_datetime,
-                            adjacent.zone_offset,
-                        ),
-                    ],
-                )
-                self.event_record_detail_repo.delete_by_record_id(db_session, adjacent.id, EventCategory.SLEEP)
-                self.event_record_detail_repo.create_and_flush(
-                    db_session,
-                    detail.model_copy(update={"record_id": adjacent.id}),
-                    detail_type=EventCategory.SLEEP,
-                )
-                self._recompute_sleep_scores(
-                    db_session,
-                    user_id,
-                    {
-                        self._local_sleep_date(old_start, old_zone),
-                        self._local_sleep_date(adjacent.start_datetime, adjacent.zone_offset),
-                    },
-                )
+                self.refresh_sleep(db_session, user_id, adjacent, record, detail)
                 db_session.commit()
                 return adjacent, False, detail
 

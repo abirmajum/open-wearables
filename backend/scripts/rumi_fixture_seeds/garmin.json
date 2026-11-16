@@ -7102,6 +7102,130 @@
      "bodyBatteryDrainedValue": 78
     }
    ]
+  },
+  {
+   "sleeps": [
+    {
+     "userId": "GARMIN_USER_ID",
+     "summaryId": "x3f1-slp-2026-01-15",
+     "calendarDate": "2026-01-15",
+     "durationInSeconds": 27870,
+     "startTimeInSeconds": 1768428000,
+     "startTimeOffsetInSeconds": 3600,
+     "unmeasurableSleepInSeconds": 0,
+     "deepSleepDurationInSeconds": 5940,
+     "lightSleepDurationInSeconds": 15000,
+     "remSleepInSeconds": 5730,
+     "awakeDurationInSeconds": 1200,
+     "sleepLevelsMap": {
+      "deep": [
+       {
+        "startTimeInSeconds": 1768434900,
+        "endTimeInSeconds": 1768440840
+       }
+      ],
+      "light": [
+       {
+        "startTimeInSeconds": 1768428000,
+        "endTimeInSeconds": 1768434900
+       },
+       {
+        "startTimeInSeconds": 1768444905,
+        "endTimeInSeconds": 1768451805
+       }
+      ],
+      "rem": [
+       {
+        "startTimeInSeconds": 1768440840,
+        "endTimeInSeconds": 1768443705
+       },
+       {
+        "startTimeInSeconds": 1768451805,
+        "endTimeInSeconds": 1768454670
+       }
+      ],
+      "awake": [
+       {
+        "startTimeInSeconds": 1768443705,
+        "endTimeInSeconds": 1768444905
+       }
+      ]
+     },
+     "validation": "ENHANCED_FINAL",
+     "timeOffsetSleepSpo2": {
+      "0": 97,
+      "1800": 93,
+      "3600": 94,
+      "5400": 95,
+      "7200": 96,
+      "9000": 97,
+      "10800": 93,
+      "12600": 94,
+      "14400": 95,
+      "16200": 96,
+      "18000": 97,
+      "19800": 93,
+      "21600": 94,
+      "23400": 95
+     },
+     "timeOffsetSleepRespiration": {
+      "0": 13.9,
+      "1800": 14.3,
+      "3600": 14.7,
+      "5400": 13.5,
+      "7200": 13.9,
+      "9000": 14.3,
+      "10800": 14.7,
+      "12600": 13.5,
+      "14400": 13.9,
+      "16200": 14.3,
+      "18000": 14.7,
+      "19800": 13.5,
+      "21600": 13.9,
+      "23400": 14.3
+     },
+     "overallSleepScore": {
+      "value": 82,
+      "qualifierKey": "GOOD"
+     },
+     "sleepScores": {
+      "totalDuration": {
+       "qualifierKey": "GOOD"
+      },
+      "stress": {
+       "qualifierKey": "EXCELLENT"
+      },
+      "awakeCount": {
+       "qualifierKey": "GOOD"
+      },
+      "remPercentage": {
+       "qualifierKey": "GOOD"
+      },
+      "restlessness": {
+       "qualifierKey": "FAIR"
+      },
+      "lightPercentage": {
+       "qualifierKey": "EXCELLENT"
+      },
+      "deepPercentage": {
+       "qualifierKey": "EXCELLENT"
+      }
+     },
+     "averageHeartRate": 54,
+     "lowestHeartRate": 47,
+     "highestHeartRate": 72,
+     "respirationAvg": 14.2,
+     "respirationLow": 11.8,
+     "respirationHigh": 17.6,
+     "avgOxygenSaturation": 95.0,
+     "lowOxygenSaturationPercentage": 89.0,
+     "highOxygenSaturationPercentage": 99.0,
+     "sleepHRV": {
+      "value": 48
+     },
+     "naps": []
+    }
+   ]
   }
  ],
  "fit_files": {

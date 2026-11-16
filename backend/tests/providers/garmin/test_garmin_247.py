@@ -14,7 +14,7 @@ from app.models import DataSource, EventRecord, HealthScore, SeriesAggregate, Se
 from app.repositories.data_point_series_repository import WriteCounts
 from app.repositories.event_record_detail_repository import EventRecordDetailRepository
 from app.repositories.user_connection_repository import UserConnectionRepository
-from app.schemas.enums import ComputedBy, HealthScoreCategory
+from app.schemas.enums import ComputedBy, HealthScoreCategory, ProviderName
 from app.schemas.enums.series_types import SeriesType, get_series_type_id
 from app.schemas.model_crud.activities import CalendarPeriod
 from app.schemas.sync_status import SyncScope, SyncSource
@@ -1096,7 +1096,15 @@ class TestGarmin247Data:
     @staticmethod
     def _scores(db: Session, user_id: UUID, category: HealthScoreCategory) -> list[HealthScore]:
         db.expire_all()
-        return db.query(HealthScore).filter(HealthScore.user_id == user_id, HealthScore.category == category).all()
+        return (
+            db.query(HealthScore)
+            .filter(
+                HealthScore.user_id == user_id,
+                HealthScore.provider == ProviderName.GARMIN,
+                HealthScore.category == category,
+            )
+            .all()
+        )
 
     @staticmethod
     def _body_battery_peaks(db: Session, user_id: UUID) -> list[Decimal]:
@@ -1298,6 +1306,60 @@ class TestGarmin247Data:
         night = db.query(EventRecord).filter(EventRecord.external_id == "sleep_scored").one()
         scores = self._scores(db, user.id, HealthScoreCategory.SLEEP)
         assert [(s.event_record_id, s.value, s.qualifier) for s in scores] == [(night.id, Decimal("88"), "EXCELLENT")]
+
+    def test_a_re_sent_night_with_a_moved_end_stays_one_night_with_one_score(
+        self, garmin_247: Garmin247Data, db: Session
+    ) -> None:
+        user = UserFactory()
+        garmin_247.process_items_batch(db, user.id, "sleeps", [_SCORED_NIGHT])
+
+        longer = {**_SCORED_NIGHT, "durationInSeconds": 30600, "overallSleepScore": {"value": 86}}
+        garmin_247.process_items_batch(db, user.id, "sleeps", [longer])
+
+        db.expire_all()
+        night = db.query(EventRecord).filter(EventRecord.external_id == "sleep_scored").one()
+        assert night.end_datetime == datetime(2024, 1, 15, 6, 30, tzinfo=timezone.utc)
+        assert db.query(SleepDetails).filter(SleepDetails.record_id == night.id).one().sleep_time_in_bed_minutes == 510
+        scores = self._scores(db, user.id, HealthScoreCategory.SLEEP)
+        assert [(s.event_record_id, s.value, s.recorded_at) for s in scores] == [
+            (night.id, Decimal("86"), night.end_datetime)
+        ]
+
+    def test_a_re_sent_night_folds_the_copies_an_earlier_push_left(
+        self, garmin_247: Garmin247Data, db: Session
+    ) -> None:
+        user = UserFactory()
+        garmin_247.process_items_batch(db, user.id, "sleeps", [_SCORED_NIGHT])
+        # What the time-keyed insert used to leave behind when Garmin moved the night's end
+        with patch.object(garmin_247.event_record_repo, "get_main_sleeps_by_external_ids", return_value={}):
+            garmin_247.process_items_batch(db, user.id, "sleeps", [{**_SCORED_NIGHT, "durationInSeconds": 30600}])
+        assert db.query(EventRecord).filter(EventRecord.external_id == "sleep_scored").count() == 2
+
+        garmin_247.process_items_batch(db, user.id, "sleeps", [_SCORED_NIGHT])
+
+        db.expire_all()
+        night = db.query(EventRecord).filter(EventRecord.external_id == "sleep_scored").one()
+        assert night.end_datetime == datetime(2024, 1, 15, 6, tzinfo=timezone.utc)
+        assert [s.event_record_id for s in self._scores(db, user.id, HealthScoreCategory.SLEEP)] == [night.id]
+
+    def test_a_re_sent_night_keeps_its_nap_apart(self, garmin_247: Garmin247Data, db: Session) -> None:
+        user = UserFactory()
+        nap = {"napStartTimeInSeconds": 1705327200, "napDurationInSeconds": 1800, "napOffsetInSeconds": 3600}
+        garmin_247.process_items_batch(db, user.id, "sleeps", [{**_SCORED_NIGHT, "naps": [nap]}])
+
+        garmin_247.process_items_batch(
+            db, user.id, "sleeps", [{**_SCORED_NIGHT, "durationInSeconds": 30600, "naps": [nap]}]
+        )
+
+        db.expire_all()
+        spans = sorted(
+            (r.start_datetime, r.end_datetime)
+            for r in db.query(EventRecord).filter(EventRecord.external_id == "sleep_scored")
+        )
+        assert spans == [
+            (datetime(2024, 1, 14, 22, tzinfo=timezone.utc), datetime(2024, 1, 15, 6, 30, tzinfo=timezone.utc)),
+            (datetime(2024, 1, 15, 14, tzinfo=timezone.utc), datetime(2024, 1, 15, 14, 30, tzinfo=timezone.utc)),
+        ]
 
     def test_a_score_stored_before_scores_were_linked_gets_linked(self, garmin_247: Garmin247Data, db: Session) -> None:
         user = UserFactory()

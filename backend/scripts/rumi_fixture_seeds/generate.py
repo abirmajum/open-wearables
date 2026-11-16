@@ -524,6 +524,23 @@ def garmin_seed() -> dict[str, Any]:
             ]
         }
     )
+    last_night = _garmin_sleep(today_index, days[today_index][1])
+    # Garmin re-sends last night later with its end moved: the user dozed 20 more minutes
+    pushes.append(
+        {
+            "sleeps": [
+                {
+                    **last_night,
+                    "durationInSeconds": last_night["durationInSeconds"] + 1200,
+                    "lightSleepDurationInSeconds": last_night["lightSleepDurationInSeconds"] + 1200,
+                    "overallSleepScore": {
+                        "value": last_night["overallSleepScore"]["value"] + 2,
+                        "qualifierKey": "GOOD",
+                    },
+                }
+            ]
+        }
+    )
     return {
         "anchor_date": ANCHOR_DATE.isoformat(),
         "user_id_placeholder": GARMIN_USER_ID,
