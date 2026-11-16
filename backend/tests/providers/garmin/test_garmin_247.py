@@ -9,6 +9,8 @@ from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import event as sa_event
+from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from app.models import (
@@ -33,7 +35,9 @@ from app.schemas.sync_status import SyncScope, SyncSource
 from app.services.health_score_service import health_score_service
 from app.services.providers.garmin.data_247 import Garmin247Data
 from app.services.providers.garmin.handlers.wellness import process_wellness_items
+from app.services.fit_parser import FitParseResult, parse_fit_file
 from app.services.providers.garmin.oauth import GarminOAuth
+from app.services.providers.garmin.webhook_handler import GarminWebhookHandler
 from app.services.providers.garmin.workouts import GarminWorkouts, activity_workout
 from app.utils.context import sync_run_var
 from app.utils.conversion import to_decimal
@@ -923,6 +927,69 @@ class TestGarmin247Data:
             garmin_247.process_items_batch(db, user.id, "activityFiles", [self._WORKOUT_PUSHES["activityFiles"]])
 
         assert db.query(EventRecord).count() == 0
+
+    def test_a_database_error_saving_a_fit_file_fails_its_push(self, garmin_247: Garmin247Data, db: Session) -> None:
+        """The push raises, so its task retries it, instead of reporting a success its commit then discards."""
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="garmin", provider_user_id="garmin_user_123")
+        self._garmin_workouts(garmin_247).process_push_activities(
+            db, [GarminActivityJSON(**self._WORKOUT_PUSHES["activities"])], user.id
+        )
+
+        def cancelled(session: Session, *_args: Any) -> None:
+            session.execute(text("SET LOCAL statement_timeout = 1"))
+            session.execute(text("SELECT pg_sleep(1)"))
+
+        handler = GarminWebhookHandler(self._garmin_workouts(garmin_247), garmin_247, garmin_247.oauth)
+        push = {"activityFiles": [{**self._WORKOUT_PUSHES["activityFiles"], "userId": "garmin_user_123"}]}
+        with (
+            patch("app.services.providers.garmin.data_247.download_binary_content", return_value=make_running_fit()),
+            patch("app.services.providers.garmin.data_247.store_fit_file"),
+            patch(
+                "app.services.providers.garmin.data_247.event_record_service.lock_stored_workouts",
+                side_effect=cancelled,
+            ),
+            pytest.raises(OperationalError, match="statement timeout"),
+        ):
+            handler.process_payload(db, push, "trace")
+
+    def test_a_corrupt_fit_file_leaves_the_rest_of_its_batch_stored(
+        self, garmin_247: Garmin247Data, db: Session
+    ) -> None:
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="garmin")
+        workouts = self._garmin_workouts(garmin_247)
+        evening = {**self._WORKOUT_PUSHES["activities"], "activityId": 654, "startTimeInSeconds": 1748800800}
+        for activity in (self._WORKOUT_PUSHES["activities"], evening):
+            workouts.process_push_activities(db, [GarminActivityJSON(**activity)], user.id)
+        files = {
+            321: b"a FIT file whose lap holds a number JSON cannot",
+            654: make_running_fit(start=datetime(2025, 6, 1, 18, 0, tzinfo=timezone.utc)),
+        }
+
+        def parse(data: bytes, *args: Any, **kwargs: Any) -> FitParseResult:
+            if data == files[321]:
+                return FitParseResult(segments=[{"lap": 0, "avg_speed": float("nan")}])
+            return parse_fit_file(data, *args, **kwargs)
+
+        pushes = [
+            {**self._WORKOUT_PUSHES["activityFiles"], "activityId": activity_id, "callbackURL": f"https://x/{activity_id}"}
+            for activity_id in files
+        ]
+        with (
+            patch(
+                "app.services.providers.garmin.data_247.download_binary_content",
+                side_effect=lambda url, **_kwargs: files[int(url.rpartition("/")[2])],
+            ),
+            patch("app.services.providers.garmin.data_247.parse_fit_file", side_effect=parse),
+            patch("app.services.providers.garmin.data_247.store_fit_file"),
+        ):
+            garmin_247.process_items_batch(db, user.id, "activityFiles", pushes)
+
+        stored = {record.external_id: detail for record, detail, _ in self._user_workouts(db, user.id)}
+        assert (stored["321"].segments, stored["321"].label) == (None, "Morning Run")
+        assert stored["654"].segments
+        assert stored["654"].aerobic_training_effect == Decimal("3.4")
 
     def _garmin_workouts(self, garmin_247: Garmin247Data) -> GarminWorkouts:
         return GarminWorkouts(

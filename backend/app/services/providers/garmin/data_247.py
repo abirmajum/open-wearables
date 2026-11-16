@@ -9,7 +9,7 @@ from uuid import UUID, uuid4
 
 from redis.exceptions import RedisError
 from sqlalchemy import text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DataError, IntegrityError, SQLAlchemyError
 
 from app.config import settings
 from app.constants.sleep import SleepStageType
@@ -2009,10 +2009,13 @@ class Garmin247Data(Base247DataTemplate):
         # In activity id order, as each one locks its workout until the push commits
         for activity_id, fit_result in sorted(fit_workouts, key=itemgetter(0)):
             try:
-                if workout := self._save_fit_workout_fields(db, user_id, activity_id, fit_result):
-                    all_records.append(workout[0])
-                    all_workout_details.append(workout[1])
+                with db.begin_nested():
+                    workout = self._save_fit_workout_fields(db, user_id, activity_id, fit_result)
             except Exception as e:
+                # A value the database rejects is a fault of the file, like a bad file. Any other database error
+                # fails the push, so that its task retries it.
+                if isinstance(e, SQLAlchemyError) and not isinstance(e, DataError):
+                    raise
                 logger.warning(
                     "Failed to save FIT workout fields",
                     provider="garmin",
@@ -2021,6 +2024,10 @@ class Garmin247Data(Base247DataTemplate):
                     activity_id=activity_id,
                     error=str(e),
                 )
+                continue
+            if workout:
+                all_records.append(workout[0])
+                all_workout_details.append(workout[1])
 
         if epoch_items:
             all_samples.extend(self._build_epochs_samples(user_id, self.normalize_epochs(epoch_items, user_id, db)))

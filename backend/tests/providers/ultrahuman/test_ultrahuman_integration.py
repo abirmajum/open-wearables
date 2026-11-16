@@ -15,7 +15,7 @@ from uuid import UUID
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from app.models import (
@@ -1101,13 +1101,20 @@ class TestUltrahumanScoresIntegration:
         assert len(self._sleep_ids(client, user_id)) == 1
         assert "sleep" not in self._scores(client, user_id)
 
-    def test_a_fault_saving_the_score_fails_the_sync(self, db: Session, sample_ultrahuman_api_response: dict) -> None:
+    @pytest.mark.parametrize(
+        "error",
+        [RuntimeError("a bug"), OperationalError("INSERT INTO health_score", {}, Exception("deadlock detected"))],
+        ids=["bug", "database-fault"],
+    )
+    def test_a_fault_saving_the_score_fails_the_sync(
+        self, db: Session, sample_ultrahuman_api_response: dict, error: Exception
+    ) -> None:
         user = UserFactory()
         UserConnectionFactory(user=user, provider="ultrahuman", status="active", access_token="test_token")
         provider_impl = ProviderFactory().get_provider("ultrahuman").data_247
         with (
             patch.object(provider_impl, "_make_api_request", return_value=sample_ultrahuman_api_response),
-            patch.object(health_score_service, "upsert_event_score", side_effect=RuntimeError("a bug")),
+            patch.object(health_score_service, "upsert_event_score", side_effect=error),
         ):
             results = provider_impl.load_and_save_all(db, user.id, start_time=self.DAY, end_time=self.DAY)
 

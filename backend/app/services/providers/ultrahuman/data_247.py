@@ -7,7 +7,7 @@ from decimal import Decimal
 from typing import Any, TypeIs
 from uuid import UUID, uuid4
 
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import DataError, IntegrityError
 
 from app.config import settings
 from app.constants.sleep import SleepStageType
@@ -456,12 +456,12 @@ class Ultrahuman247Data(Base247DataTemplate):
         record_id: UUID,
     ) -> None:
         """The night's score on its stored night; a score that fails validation or that the database rejects is logged
-        and the night kept."""
+        and the night kept. Any other database error fails the night's sync."""
         try:
             with db.begin_nested():
                 if score := self._sleep_score(items_by_type, normalized_sleep, user_id):
                     health_score_service.upsert_event_score(db, score.model_copy(update={"event_record_id": record_id}))
-        except (ValueError, SQLAlchemyError) as e:
+        except (ValueError, IntegrityError, DataError) as e:
             logger.warning(
                 "Ultrahuman sleep score not saved",
                 provider="ultrahuman",

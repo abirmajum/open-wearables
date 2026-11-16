@@ -8,6 +8,8 @@ import logging
 from typing import Any
 from uuid import UUID
 
+from sqlalchemy.exc import SQLAlchemyError
+
 from app.database import DbSession
 from app.repositories import UserConnectionRepository
 from app.repositories.data_point_series_repository import WriteCounts
@@ -127,6 +129,9 @@ def process_wellness_items(
             )
         except Exception as e:
             db.rollback()
+            if isinstance(e, SQLAlchemyError):
+                # The push fails, so that its task retries it
+                raise
             logger.error(
                 "Error processing wellness data",
                 provider="garmin",
