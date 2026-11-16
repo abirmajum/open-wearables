@@ -22,6 +22,8 @@ from app.utils.structured_logging import get_logger
 
 logger = get_logger(__name__)
 
+# The activity schema names the first; the push handler read the second before, and no real payload settles it
+_ELEVATION_FIELDS = ("totalElevationGainInMeters", "elevationGainInMeters")
 _CADENCE_FIELDS = (
     "averageRunCadenceInStepsPerMinute",
     "averageBikingCadenceInRevPerMinute",
@@ -43,7 +45,9 @@ def activity_metrics(summary: Mapping[str, Any]) -> EventRecordMetrics:
         "distance": to_decimal(summary.get("distanceInMeters")),
         "average_speed": to_decimal(summary.get("averageSpeedInMetersPerSecond")),
         "max_speed": to_decimal(summary.get("maxSpeedInMetersPerSecond")),
-        "total_elevation_gain": to_decimal(summary.get("totalElevationGainInMeters")),
+        "total_elevation_gain": to_decimal(
+            next((e for f in _ELEVATION_FIELDS if (e := summary.get(f)) is not None), None)
+        ),
         "average_cadence": to_decimal(next((c for f in _CADENCE_FIELDS if (c := summary.get(f))), None)),
     }
 

@@ -982,6 +982,18 @@ class TestGarmin247Data:
             "high_stress_duration_seconds": 1800,
         }
 
+    def test_a_max_stress_garmin_could_not_measure_is_not_stored(
+        self, db: Session, garmin_247: Garmin247Data, sample_daily: dict[str, Any]
+    ) -> None:
+        user = UserFactory()
+
+        garmin_247.process_items_batch(
+            db, user.id, "dailies", [{**sample_daily, "maxStressLevel": -1, "stressDurationInSeconds": 14400}]
+        )
+
+        (stress,) = self._scores(db, user.id, HealthScoreCategory.STRESS)
+        assert {name: c["value"] for name, c in stress.components.items()} == {"stress_duration_seconds": 14400}
+
     def test_a_later_dailies_push_refreshes_the_days_stress_score(
         self, db: Session, garmin_247: Garmin247Data, sample_daily: dict[str, Any]
     ) -> None:
@@ -1232,6 +1244,15 @@ class TestGarmin247Data:
         assert record.type == "running"
         assert detail.distance == Decimal("5000")
 
+    @pytest.mark.parametrize("field", ["totalElevationGainInMeters", "elevationGainInMeters"])
+    def test_either_elevation_gain_field_fills_the_workout(self, garmin_247: Garmin247Data, field: str) -> None:
+        summary = {"activityId": 1, "activityType": "RUNNING", "startTimeInSeconds": 1705309200, field: 84.0}
+
+        result = garmin_247._build_activity_record(uuid4(), summary)
+
+        assert result is not None
+        assert result[1].total_elevation_gain == Decimal("84.0")
+
     def test_an_activity_details_summary_fills_the_workout_like_the_activities_push(
         self, garmin_247: Garmin247Data
     ) -> None:
@@ -1382,6 +1403,23 @@ class TestGarmin247Data:
         night = db.query(EventRecord).filter(EventRecord.external_id == "sleep_scored").one()
         scores = self._scores(db, user.id, HealthScoreCategory.SLEEP)
         assert [(s.event_record_id, s.value, s.qualifier) for s in scores] == [(night.id, Decimal("84"), "GOOD")]
+
+    @pytest.mark.parametrize(
+        "night",
+        [
+            {"overallSleepScore": {"value": 84, "qualifierKey": "GOOD"}, "sleepScoreQualifier": "FAIR"},
+            {"overallSleepScore": {"value": 84, "qualifier": "GOOD"}, "sleepScoreQualifier": "FAIR"},
+            {"overallSleepScore": {"value": 84}, "sleepScoreQualifier": "GOOD"},
+        ],
+        ids=["qualifierKey", "qualifier", "sleepScoreQualifier"],
+    )
+    def test_a_nights_qualifier_is_read_from_the_first_field_present(
+        self, garmin_247: Garmin247Data, night: dict[str, Any]
+    ) -> None:
+        _, score = garmin_247.normalize_sleep({**_SCORED_NIGHT, **night}, uuid4())
+
+        assert score is not None
+        assert (score.value, score.qualifier) == (84, "GOOD")
 
     def test_a_re_sent_night_refreshes_its_one_score(self, garmin_247: Garmin247Data, db: Session) -> None:
         user = UserFactory()

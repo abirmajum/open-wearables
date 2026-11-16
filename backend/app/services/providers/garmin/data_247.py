@@ -106,13 +106,14 @@ DAILY_BODY_BATTERY_COMPONENTS: dict[str, tuple[str, ...]] = {
 
 
 def _score_components(raw: dict[str, Any], paths: dict[str, tuple[str, ...]]) -> dict[str, ScoreComponent]:
-    """The components whose numbers the summary carries."""
+    """The components whose numbers the summary carries; Garmin sends a negative number where it lacks the data
+    (e.g. maxStressLevel -1), so those are left out."""
     components: dict[str, ScoreComponent] = {}
     for name, path in paths.items():
         value: Any = raw
         for key in path:
             value = value.get(key) if isinstance(value, dict) else None
-        if isinstance(value, int | float):
+        if isinstance(value, int | float) and value >= 0:
             components[name] = ScoreComponent(value=value)
     return components
 
@@ -351,7 +352,8 @@ class Garmin247Data(Base247DataTemplate):
         overall_score = raw_sleep.get("overallSleepScore")
         if overall_score and isinstance(overall_score, dict):
             sleep_score = overall_score.get("value")
-            sleep_qualifier = overall_score.get("qualifierKey")
+            sleep_qualifier = overall_score.get("qualifierKey") or overall_score.get("qualifier")
+        sleep_qualifier = sleep_qualifier or raw_sleep.get("sleepScoreQualifier")
 
         sleep_scores = raw_sleep.get("sleepScores") or {}
         sleep_score_components = {
