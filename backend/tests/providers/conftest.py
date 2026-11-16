@@ -307,17 +307,6 @@ def sample_ultrahuman_activity_samples() -> dict:
 
 
 @pytest.fixture
-def sample_ultrahuman_recovery_data() -> dict:
-    """Sample Ultrahuman recovery data."""
-    return {
-        "date": "2024-01-15",
-        "recovery_index": {"value": 85},
-        "movement_index": {"value": 72},
-        "metabolic_score": {"value": 78},
-    }
-
-
-@pytest.fixture
 def sample_ultrahuman_api_response() -> dict:
     """Sample complete Ultrahuman /user_data/metrics API response.
 
@@ -435,6 +424,12 @@ def sample_ultrahuman_api_response() -> dict:
                         "bedtime_start": 1705287600,
                         "bedtime_end": 1705314000,
                         "quick_metrics": [
+                            {
+                                "title": "SLEEP SCORE",
+                                "display_text": "81",
+                                "value": 81,
+                                "type": "sleep_score",
+                            },
                             {
                                 "title": "TIME IN BED",
                                 "display_text": "7h 20m",
@@ -587,7 +582,34 @@ def sample_ultrahuman_api_response() -> dict:
                 },
                 {
                     "type": "metabolic_score",
-                    "object": {"day_start_timestamp": 1705276800, "title": "Metabolic Score", "value": None},
+                    "object": {"day_start_timestamp": 1705276800, "title": "Metabolic Score", "value": 74},
+                },
+                {
+                    "type": "glucose",
+                    "object": {
+                        "day_start_timestamp": 1705276800,
+                        "title": "Glucose",
+                        "values": [
+                            {"value": 92, "timestamp": 1705276815},
+                            {"value": 118, "timestamp": 1705277715},
+                        ],
+                    },
+                },
+                {
+                    "type": "average_glucose",
+                    "object": {"day_start_timestamp": 1705276800, "title": "Average Glucose", "value": 101},
+                },
+                {
+                    "type": "glucose_variability",
+                    "object": {"day_start_timestamp": 1705276800, "title": "Glucose Variability", "value": 14.5},
+                },
+                {
+                    "type": "hba1c",
+                    "object": {"day_start_timestamp": 1705276800, "title": "HbA1c", "value": 5.3},
+                },
+                {
+                    "type": "time_in_target",
+                    "object": {"day_start_timestamp": 1705276800, "title": "Time In Target", "value": 88},
                 },
             ]
         },

@@ -250,6 +250,28 @@ class HealthScoreRepository(CrudRepository[HealthScore, HealthScoreCreate, Healt
             .execution_options(synchronize_session=False)
         )
 
+    def bulk_upsert(self, db_session: DbSession, creators: list[HealthScoreCreate]) -> WriteCounts:
+        """Bulk upsert health scores, a score sent again for the same time replacing the stored one.
+
+        For a daily score the provider recomputes as the day goes on, e.g. Ultrahuman's movement index.
+        """
+        if not creators:
+            return WriteCounts(0, 0)
+
+        stmt = insert(HealthScore).values([c.model_dump() for c in creators])
+        stmt = stmt.on_conflict_do_update(
+            constraint="uq_health_score_user_provider_source_category_time",
+            set_={
+                "value": stmt.excluded.value,
+                "qualifier": stmt.excluded.qualifier,
+                "components": stmt.excluded.components,
+            },
+        ).returning(literal_column("xmax = 0"))
+        was_insert = db_session.execute(stmt).scalars().all()
+        inserted = sum(was_insert)
+        # Caller is responsible for commit — allows batching with other operations
+        return WriteCounts(inserted, len(was_insert) - inserted)
+
     def bulk_create_keeping_highest(self, db_session: DbSession, creators: list[HealthScoreCreate]) -> WriteCounts:
         """Bulk upsert health scores, keeping the higher value when a score for the same time is sent again.
 

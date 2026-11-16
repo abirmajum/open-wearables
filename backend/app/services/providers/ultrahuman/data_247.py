@@ -1,5 +1,6 @@
 """Ultrahuman Ring Air 24/7 data implementation for sleep, recovery, and activity samples."""
 
+import re
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
@@ -11,17 +12,24 @@ from app.database import DbSession
 from app.models import EventRecord
 from app.repositories import EventRecordRepository, UserConnectionRepository
 from app.repositories.data_point_series_repository import WriteCounts
-from app.schemas.enums import EventCategory, daily_total_flag
+from app.schemas.enums import EventCategory, HealthScoreCategory, ProviderName, SeriesType, daily_total_flag
 from app.schemas.model_crud.activities.data_point_series import CalendarPeriod, TimeSeriesSampleCreate
 from app.schemas.model_crud.activities.event_record import EventRecordCreate
 from app.schemas.model_crud.activities.event_record_detail import EventRecordDetailCreate
+from app.schemas.model_crud.activities.health_score import HealthScoreCreate, ScoreComponent
 from app.schemas.model_crud.activities.sleep import SleepStage
 from app.services.event_record_service import event_record_service
+from app.services.health_score_service import health_score_service
 from app.services.providers.api_client import make_authenticated_request
 from app.services.providers.sync_247_result import Sync247Result, Sync247Run
 from app.services.providers.templates.base_247_data import Base247DataTemplate
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
-from app.services.providers.ultrahuman.coverage import ACTIVITY_SAMPLE_SERIES, DAILY_SCALAR_SERIES
+from app.services.providers.ultrahuman.coverage import (
+    ACTIVITY_SAMPLE_SERIES,
+    DAILY_SCALAR_SERIES,
+    DAILY_SCORES,
+    SCORE_COMPONENTS,
+)
 from app.services.raw_payload_storage import store_raw_payload
 from app.services.timeseries_service import timeseries_service
 from app.utils.conversion import as_int, seconds_to_minutes
@@ -37,6 +45,22 @@ SLEEP_GRAPH_STAGE_MAP: dict[str, SleepStageType] = {
     "rem_sleep": SleepStageType.REM,
     "awake": SleepStageType.AWAKE,
 }
+
+
+def _value_at(items_by_type: dict[str, Any], path: tuple[str, ...]) -> Any:
+    """The ``value`` of the object a component path leads to; None where the day lacks it."""
+    node: Any = items_by_type
+    for key in path:
+        node = node.get(key) if isinstance(node, dict) else None
+    return node.get("value") if isinstance(node, dict) else None
+
+
+def _components(category: HealthScoreCategory, items_by_type: dict[str, Any]) -> dict[str, ScoreComponent]:
+    return {
+        name: ScoreComponent(value=value)
+        for name, path in SCORE_COMPONENTS[category].items()
+        if (value := _value_at(items_by_type, path)) is not None
+    }
 
 
 class Ultrahuman247Data(Base247DataTemplate):
@@ -255,10 +279,10 @@ class Ultrahuman247Data(Base247DataTemplate):
         db: DbSession,
         user_id: UUID,
         normalized_sleep: dict[str, Any],
-    ) -> bool:
+    ) -> UUID | None:
         """Save normalized sleep data to database as EventRecord with SleepDetails.
 
-        Returns True if the record was saved, False if skipped.
+        Returns the stored record's id (a merge with an adjacent session keeps the merged one), None if skipped.
         """
         sleep_id = normalized_sleep["id"]
         start_dt = normalized_sleep.get("start_time")
@@ -272,7 +296,7 @@ class Ultrahuman247Data(Base247DataTemplate):
                 sleep_id=str(sleep_id),
                 user_id=str(user_id),
             )
-            return False
+            return None
 
         # Create EventRecord for sleep
         record = EventRecordCreate(
@@ -316,48 +340,83 @@ class Ultrahuman247Data(Base247DataTemplate):
             sleep_stages=normalized_sleep.get("stage_timestamps") or None,
         )
 
-        event_record_service.create_or_merge_sleep(db, user_id, record, detail, settings.sleep_end_gap_minutes)
-        return True
+        return event_record_service.create_or_merge_sleep(
+            db, user_id, record, detail, settings.sleep_end_gap_minutes
+        ).id
+
+    @staticmethod
+    def _sleep_score(
+        items_by_type: dict[str, Any],
+        normalized_sleep: dict[str, Any],
+        user_id: UUID,
+    ) -> HealthScoreCreate | None:
+        """The night's score at its end, with Ultrahuman's contributors and the night's readings as components."""
+        raw_sleep = items_by_type["Sleep"]
+        quick_metrics = {m.get("type"): m.get("value") for m in raw_sleep.get("quick_metrics") or []}
+        cycles = (raw_sleep.get("sleep_cycles") or {}).get("cycles")
+        readings = {
+            "avg_heart_rate": quick_metrics.get("avg_hr"),
+            "avg_hrv": quick_metrics.get("avg_hrv"),
+            "sleep_cycles": len(cycles) if isinstance(cycles, list) else None,
+        }
+        components = {
+            **{
+                re.sub(r"[^a-z0-9]+", "_", c["title"].lower()).strip("_"): ScoreComponent(
+                    value=c.get("score"), qualifier=c.get("state_title")
+                )
+                for c in raw_sleep.get("summary") or []
+                if c.get("title")
+            },
+            **_components(HealthScoreCategory.SLEEP, items_by_type),
+            **{name: ScoreComponent(value=value) for name, value in readings.items() if value is not None},
+        }
+        value = quick_metrics.get("sleep_score")
+        if value is None and not components:
+            return None
+        return HealthScoreCreate(
+            id=uuid4(),
+            user_id=user_id,
+            provider=ProviderName.ULTRAHUMAN,
+            category=HealthScoreCategory.SLEEP,
+            value=value,
+            recorded_at=normalized_sleep["end_time"],
+            components=components or None,
+        )
 
     # -------------------------------------------------------------------------
     # Recovery Data
     # -------------------------------------------------------------------------
 
-    def normalize_recovery(
+    def normalize_recovery(  # ty:ignore[invalid-method-override]
         self,
         raw_recovery: dict[str, Any],
         user_id: UUID,
-    ) -> dict[str, Any]:
-        """Normalize Ultrahuman recovery data to our schema."""
-        date_str = raw_recovery.get("ultrahuman_date")
+    ) -> list[HealthScoreCreate]:
+        """One day's scores from its metrics keyed by Ultrahuman type; a score without a value is not written.
 
-        recovery_index = None
-        movement_index = None
-        metabolic_score = None
-
-        if "recovery_index" in raw_recovery:
-            recovery_index = raw_recovery["recovery_index"].get("value")
-
-        if "movement_index" in raw_recovery:
-            movement_index = raw_recovery["movement_index"].get("value")
-
-        if "metabolic_score" in raw_recovery:
-            metabolic_score = raw_recovery["metabolic_score"].get("value")
-
-        return {
-            "id": uuid4(),
-            "user_id": user_id,
-            "provider": self.provider_name,
-            "timestamp": date_str,
-            "date": date_str,
-            "recovery_index": recovery_index,
-            "movement_index": movement_index,
-            "metabolic_score": metabolic_score,
-            "raw": raw_recovery,
-        }
+        Each score sits at its metric's day_start_timestamp, the instant the day's single-value samples take.
+        """
+        scores: list[HealthScoreCreate] = []
+        for metric_type, category in DAILY_SCORES.items():
+            metric = raw_recovery.get(metric_type) or {}
+            value, day_start = metric.get("value"), metric.get("day_start_timestamp")
+            if value is None or not day_start:
+                continue
+            scores.append(
+                HealthScoreCreate(
+                    id=uuid4(),
+                    user_id=user_id,
+                    provider=ProviderName.ULTRAHUMAN,
+                    category=category,
+                    value=value,
+                    recorded_at=datetime.fromtimestamp(day_start, tz=timezone.utc),
+                    components=_components(category, raw_recovery) or None,
+                )
+            )
+        return scores
 
     # -------------------------------------------------------------------------
-    # Activity Samples (HR, HRV, Temperature, Steps)
+    # Activity Samples (HR, HRV, Temperature, Steps, Glucose)
     # -------------------------------------------------------------------------
 
     def normalize_activity_samples(
@@ -365,89 +424,18 @@ class Ultrahuman247Data(Base247DataTemplate):
         raw_samples: list[dict[str, Any]],
         user_id: UUID,
     ) -> dict[str, list[dict[str, Any]]]:
-        """Normalize activity samples into categorized data.
-
-        raw_samples: List of sample dictionaries with type and values
-        """
-        result = {
-            "heart_rate": [],
-            "hrv": [],
-            "temperature": [],
-            "steps": [],
-        }
-
+        """Each timeline's readings by the series they belong to; zero-step readings are dropped."""
+        result: dict[str, list[dict[str, Any]]] = {}
         for sample in raw_samples:
-            sample_type = sample.get("type")
-
-            if sample_type == "hr":
-                values = sample.get("values", [])
-                for val in values:
-                    ts = val.get("timestamp")
-                    recorded_at = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat() if ts else None
-                    if recorded_at:
-                        result["heart_rate"].append(
-                            {
-                                "id": uuid4(),
-                                "user_id": user_id,
-                                "provider": self.provider_name,
-                                "recorded_at": recorded_at,
-                                "value": val.get("value"),
-                                "unit": "bpm",
-                            }
-                        )
-
-            elif sample_type == "hrv":
-                values = sample.get("values", [])
-                for val in values:
-                    ts = val.get("timestamp")
-                    recorded_at = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat() if ts else None
-                    if recorded_at:
-                        result["hrv"].append(
-                            {
-                                "id": uuid4(),
-                                "user_id": user_id,
-                                "provider": self.provider_name,
-                                "recorded_at": recorded_at,
-                                "value": val.get("value"),
-                                "unit": "ms",
-                            }
-                        )
-
-            elif sample_type == "temp":
-                values = sample.get("values", [])
-                for val in values:
-                    ts = val.get("timestamp")
-                    recorded_at = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat() if ts else None
-                    if recorded_at:
-                        result["temperature"].append(
-                            {
-                                "id": uuid4(),
-                                "user_id": user_id,
-                                "provider": self.provider_name,
-                                "recorded_at": recorded_at,
-                                "value": val.get("value"),
-                                "unit": "celsius",
-                            }
-                        )
-
-            elif sample_type == "steps":
-                values = sample.get("values", [])
-                for val in values:
-                    ts = val.get("timestamp")
-                    steps_val = val.get("value")
-                    recorded_at = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat() if ts else None
-                    if recorded_at and steps_val and steps_val > 0:
-                        result["steps"].append(
-                            {
-                                "id": uuid4(),
-                                "user_id": user_id,
-                                "provider": self.provider_name,
-                                "recorded_at": recorded_at,
-                                "value": steps_val,
-                                "unit": "count",
-                            }
-                        )
-
+            series_type = ACTIVITY_SAMPLE_SERIES.get(sample.get("type", ""))
+            if series_type is None:
+                continue
+            readings = result.setdefault(series_type.value, [])
+            for val in sample.get("values", []):
+                ts, value = val.get("timestamp"), val.get("value")
+                if not ts or (series_type is SeriesType.steps and not (value and value > 0)):
+                    continue
+                readings.append({"recorded_at": datetime.fromtimestamp(ts, tz=timezone.utc), "value": value})
         return result
 
     def _build_activity_samples(
@@ -463,23 +451,16 @@ class Ultrahuman247Data(Base247DataTemplate):
         samples: list[TimeSeriesSampleCreate] = []
 
         for key, entries in normalized_samples.items():
-            series_type = ACTIVITY_SAMPLE_SERIES.get(key)
-            if not series_type:
-                continue
-
+            series_type = SeriesType(key)
             for sample in entries:
-                recorded_at_str = sample.get("recorded_at")
-                if not recorded_at_str:
-                    continue
                 try:
-                    recorded_at = datetime.fromisoformat(recorded_at_str.replace("Z", "+00:00"))
                     samples.append(
                         TimeSeriesSampleCreate(
                             id=uuid4(),
                             user_id=user_id,
                             provider=self.provider_name,
-                            recorded_at=recorded_at,
-                            value=Decimal(str(sample.get("value"))),
+                            recorded_at=sample["recorded_at"],
+                            value=Decimal(str(sample["value"])),
                             series_type=series_type,
                             is_daily_total=daily_total_flag(series_type, is_daily=False),
                         )
@@ -491,7 +472,7 @@ class Ultrahuman247Data(Base247DataTemplate):
                         task="build_activity_samples",
                         series=key,
                         user_id=str(user_id),
-                        recorded_at=recorded_at_str or "unknown time",
+                        recorded_at=sample["recorded_at"],
                         error=str(e),
                     )
 
@@ -526,7 +507,7 @@ class Ultrahuman247Data(Base247DataTemplate):
         # A lost grant or a 403 from _fetch_daily_metrics invalidates every remaining
         # day, so it propagates instead of being recorded against one data type.
         run = self.sync_run(db, user_id, fatal=(ProviderConnectionError, ProviderError))
-        run.expect("sleep", "activity_samples")
+        run.expect("sleep", "recovery", "activity_samples")
 
         current_date = datetime.combine(start_time.date(), datetime.min.time(), tzinfo=timezone.utc)
         end_date = datetime.combine(end_time.date(), datetime.min.time(), tzinfo=timezone.utc)
@@ -536,10 +517,16 @@ class Ultrahuman247Data(Base247DataTemplate):
             if "Sleep" in items_by_type:
                 with run.step("sleep", accumulate=True, commit=True) as step:
                     normalized_sleep = self.normalize_sleep(items_by_type["Sleep"], user_id)
-                    step.record(1 if self.save_sleep_data(db, user_id, normalized_sleep) else 0)
+                    record_id = self.save_sleep_data(db, user_id, normalized_sleep)
+                    score = self._sleep_score(items_by_type, normalized_sleep, user_id) if record_id else None
+                    if score:
+                        health_score_service.upsert_event_score(
+                            db, score.model_copy(update={"event_record_id": record_id})
+                        )
+                    step.record(1 if record_id else 0)
 
-            # Recovery is fetched but not persisted: there is no daily-recovery table yet,
-            # and EventRecord has no type that fits generic daily recovery metrics.
+            with run.step("recovery", accumulate=True, commit=True) as step:
+                step.record(health_score_service.bulk_upsert(db, self.normalize_recovery(items_by_type, user_id)))
 
             with run.step("activity_samples", accumulate=True, commit=True) as step:
                 step.record(self._save_daily_activity(db, user_id, items_by_type, current_date.date()))
@@ -569,6 +556,10 @@ class Ultrahuman247Data(Base247DataTemplate):
             run.fail("daily_metrics", e)
             return {}
 
+        return self._items_by_type(metrics_list)
+
+    @staticmethod
+    def _items_by_type(metrics_list: list[dict[str, Any]]) -> dict[str, Any]:
         return {item["type"]: item["object"] for item in metrics_list if item.get("type") and item.get("object")}
 
     def _save_daily_activity(
@@ -581,7 +572,7 @@ class Ultrahuman247Data(Base247DataTemplate):
         """Persist one day's activity series plus its single-value daily metrics."""
         sample_inputs = [
             {"type": t, "values": items_by_type[t].get("values", [])}
-            for t in ("hr", "hrv", "temp", "steps")
+            for t in ACTIVITY_SAMPLE_SERIES
             if t in items_by_type
         ]
         samples: list[TimeSeriesSampleCreate] = []
@@ -655,28 +646,18 @@ class Ultrahuman247Data(Base247DataTemplate):
         start_time: datetime,
         end_time: datetime,
     ) -> list[dict[str, Any]]:
-        """Fetch recovery data from provider API for a date range.
+        """Fetch each day's metrics keyed by Ultrahuman type, the input normalize_recovery takes.
 
         Returns:
-            list[dict[str, Any]]: List of recovery data objects from API.
+            list[dict[str, Any]]: One dict of metrics per day.
         """
-        recovery_data = []
+        days = []
         current_date = start_time.date()
-        end_date = end_time.date()
-
-        while current_date <= end_date:
-            metrics_list = self._fetch_daily_metrics(db, user_id, datetime.combine(current_date, datetime.min.time()))
-            date_str = current_date.strftime("%Y-%m-%d")
-
-            for item in metrics_list:
-                item_type = item.get("type")
-                if item_type in ("recovery_index", "movement_index", "metabolic_score") and "object" in item:
-                    item["object"]["ultrahuman_date"] = date_str
-                    recovery_data.append(item["object"])
-
-            current_date = current_date + timedelta(days=1)
-
-        return recovery_data
+        while current_date <= end_time.date():
+            day = datetime.combine(current_date, datetime.min.time())
+            days.append(self._items_by_type(self._fetch_daily_metrics(db, user_id, day)))
+            current_date += timedelta(days=1)
+        return days
 
     def get_activity_samples(
         self,
@@ -700,7 +681,7 @@ class Ultrahuman247Data(Base247DataTemplate):
 
             for item in metrics_list:
                 item_type = item.get("type")
-                if item_type in ("hr", "hrv", "temp", "steps") and "object" in item:
+                if item_type in ACTIVITY_SAMPLE_SERIES and "object" in item:
                     item["object"]["ultrahuman_date"] = date_str
                     samples.append({"type": item_type, "object": item["object"]})
 

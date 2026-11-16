@@ -24,15 +24,25 @@ Ultrahuman provides access to sleep, recovery, and continuous activity data thro
 | Data Type | Support |
 |-----------|---------|
 | Sleep (with stages) | Yes |
+| Sleep score | Yes - `sleep` health score at the night's end, linked to the sleep session; components: the sleep contributors (score and rating), toss & turn, sleep cycles, SpO2, average heart rate and HRV, morning alertness |
 | Heart rate (24/7) | Yes |
 | HRV - RMSSD (24/7) | Yes |
 | Skin temperature (24/7) | Yes |
 | Skin temperature deviation | Yes - `temperature_deviation`, the night's deviation from baseline |
 | Steps (24/7) | Yes |
+| Glucose (CGM) | Yes - `glucose` readings as `blood_glucose` (mg/dL) |
 | VO2 max | Yes |
 | Resting heart rate | Yes - `sleep_rhr`, the ring's overnight average, one value per day |
-| Recovery metrics | Partial (normalized, not yet saved) |
+| Active minutes | Yes - `active_minutes` as `exercise_time`, one value per day |
+| Inactive time | Yes - `inactive_time` as `sedentary_time` (minutes), one value per day |
+| Recovery index | Yes - `recovery` health score; components: resting heart rate, HRV, SpO2, skin temperature deviation |
+| Movement index | Yes - `movement_index` health score; component: movements |
+| Metabolic score | Yes - `metabolic` health score; components: average glucose, glucose variability, HbA1c, time in target |
+| Weekly active minutes | No - a rolling 7-day sum of active minutes, which are stored per day |
+| Night resting heart rate timeline | No - its average is the stored resting heart rate |
 | Workouts / Activities | No (not available via Partnership API) |
+
+Daily scores sit at the start of the day Ultrahuman reports them for, like the daily values above, and a later sync of the same day replaces them. Naps are inferred from the sleep session, since Ultrahuman returns one sleep per day without a nap flag.
 
 ### Data delivery
 
