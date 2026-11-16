@@ -18,14 +18,25 @@ POLL_INTERVAL_SECONDS = 5.0
 ALEMBIC_INI = Path(__file__).resolve().parents[2] / "alembic.ini"
 
 
-def code_heads() -> set[str]:
+def _scripts() -> ScriptDirectory:
     config = Config(str(ALEMBIC_INI))
     config.set_main_option("script_location", str(ALEMBIC_INI.parent / "migrations"))
-    return set(ScriptDirectory.from_config(config).get_heads())
+    return ScriptDirectory.from_config(config)
 
 
-def wait_for_head(db_uri: str, heads: set[str], timeout: float, poll_interval: float) -> int:
-    """0 once the database is at ``heads``; 1 if it is not by ``timeout``, so the platform restarts the worker."""
+def code_heads() -> set[str]:
+    return set(_scripts().get_heads())
+
+
+def code_revisions() -> set[str]:
+    return {script.revision for script in _scripts().walk_revisions()}
+
+
+def wait_for_head(
+    db_uri: str, heads: set[str], timeout: float, poll_interval: float, known: set[str] | None = None
+) -> int:
+    """0 once the database is at ``heads``; 1 if it is not by ``timeout``, so the platform restarts the worker; 2 at
+    once if the database is at a revision outside ``known``, which no wait on this code fixes."""
     engine = create_engine(db_uri, pool_pre_ping=True)
     deadline = time.monotonic() + timeout
     try:
@@ -35,6 +46,14 @@ def wait_for_head(db_uri: str, heads: set[str], timeout: float, poll_interval: f
                     current: set[str] | str = set(MigrationContext.configure(connection).get_current_heads())
             except Exception as e:
                 current = f"unreachable ({type(e).__name__})"
+            if known is not None and isinstance(current, set) and (unknown := current - known):
+                print(
+                    f"Database at Alembic revision {sorted(unknown)}, which this code does not have (the database is "
+                    "ahead of it, as after a rollback): deploy the newer code or downgrade the database to "
+                    f"{sorted(heads)}; exiting",
+                    flush=True,
+                )
+                return 2
             if current == heads:
                 print(f"Database at Alembic head {sorted(heads)}; starting workers", flush=True)
                 return 0
@@ -54,7 +73,7 @@ def wait_for_head(db_uri: str, heads: set[str], timeout: float, poll_interval: f
 def main() -> int:
     from app.config import settings
 
-    return wait_for_head(settings.db_uri, code_heads(), TIMEOUT_SECONDS, POLL_INTERVAL_SECONDS)
+    return wait_for_head(settings.db_uri, code_heads(), TIMEOUT_SECONDS, POLL_INTERVAL_SECONDS, known=code_revisions())
 
 
 if __name__ == "__main__":

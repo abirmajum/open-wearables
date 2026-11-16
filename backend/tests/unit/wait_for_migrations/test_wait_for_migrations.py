@@ -58,6 +58,31 @@ def test_the_workers_start_once_the_migration_lands(wait: ModuleType, tmp_path: 
         migration.cancel()
 
 
+def test_a_database_ahead_of_this_code_fails_at_once_naming_the_revision(
+    wait: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    db_uri = f"sqlite:///{tmp_path / 'db.sqlite'}"
+    stamp(db_uri, "newer_rev")
+
+    started = time.monotonic()
+    assert wait.wait_for_head(db_uri, {"head_rev"}, timeout=5, poll_interval=1, known={"old_rev", "head_rev"}) == 2
+    assert time.monotonic() - started < 1
+    output = capsys.readouterr().out
+    assert "newer_rev" in output
+    assert "deploy the newer code or downgrade" in output
+
+
+def test_a_database_behind_head_on_a_known_revision_is_waited_for(wait: ModuleType, tmp_path: Path) -> None:
+    db_uri = f"sqlite:///{tmp_path / 'db.sqlite'}"
+    stamp(db_uri, "old_rev")
+
+    assert wait.wait_for_head(db_uri, {"head_rev"}, timeout=0.3, poll_interval=0.05, known={"old_rev", "head_rev"}) == 1
+
+
+def test_the_known_revisions_include_the_heads(wait: ModuleType) -> None:
+    assert wait.code_heads() <= wait.code_revisions()
+
+
 def test_an_unreachable_database_is_waited_for_then_fails(wait: ModuleType, tmp_path: Path) -> None:
     db_uri = f"sqlite:///{tmp_path / 'missing' / 'db.sqlite'}"
 
