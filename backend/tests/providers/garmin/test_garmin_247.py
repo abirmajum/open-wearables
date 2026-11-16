@@ -28,16 +28,16 @@ from app.repositories.data_type_coverage_repository import data_type_coverage_re
 from app.repositories.event_record_detail_repository import EventRecordDetailRepository
 from app.repositories.event_record_repository import EventRecordRepository
 from app.repositories.user_connection_repository import UserConnectionRepository
-from app.schemas.enums import ComputedBy, EventCategory, HealthScoreCategory, ProviderName
 from app.schemas.data_type_coverage import CoverageSpan
+from app.schemas.enums import ComputedBy, EventCategory, HealthScoreCategory, ProviderName
 from app.schemas.enums.series_types import SeriesType, get_series_type_id
 from app.schemas.model_crud.activities import CalendarPeriod, HealthScoreCreate
 from app.schemas.providers.garmin import ActivityJSON as GarminActivityJSON
 from app.schemas.sync_status import DataTypeKind, SyncScope, SyncSource
+from app.services.fit_parser import FitParseResult, parse_fit_file
 from app.services.health_score_service import health_score_service
 from app.services.providers.garmin.data_247 import Garmin247Data
 from app.services.providers.garmin.handlers.wellness import process_wellness_items
-from app.services.fit_parser import FitParseResult, parse_fit_file
 from app.services.providers.garmin.oauth import GarminOAuth
 from app.services.providers.garmin.webhook_handler import GarminWebhookHandler
 from app.services.providers.garmin.workouts import GarminWorkouts, activity_workout
@@ -975,7 +975,11 @@ class TestGarmin247Data:
             return parse_fit_file(data, *args, **kwargs)
 
         pushes = [
-            {**self._WORKOUT_PUSHES["activityFiles"], "activityId": activity_id, "callbackURL": f"https://x/{activity_id}"}
+            {
+                **self._WORKOUT_PUSHES["activityFiles"],
+                "activityId": activity_id,
+                "callbackURL": f"https://x/{activity_id}",
+            }
             for activity_id in files
         ]
         with (
@@ -1057,6 +1061,24 @@ class TestGarmin247Data:
         )
         [(device_copy, _, _)] = self._user_workouts(db, user.id)
         return device_copy.id, self._fit_copy(self._deviceless_source(user))
+
+    def test_a_workout_not_stored_names_the_record_holding_its_span(
+        self, garmin_247: Garmin247Data, db: Session
+    ) -> None:
+        user = UserFactory()
+        self._garmin_workouts(garmin_247).process_push_activities(
+            db, [GarminActivityJSON(**self._WORKOUT_PUSHES["activities"])], user.id
+        )
+        [(stored, _, _)] = self._user_workouts(db, user.id)
+        same_span = {"activityId": 999, "summary": {**self._WORKOUT_PUSHES["activityDetails"]["summary"]}}
+        same_span["summary"]["activityId"] = 999
+
+        with patch("app.services.event_record_service.logger") as logger:
+            garmin_247.process_items_batch(db, user.id, "activityDetails", [same_span])
+
+        logger.warning.assert_called_once()
+        assert logger.warning.call_args.kwargs["held_by"] == {"999": str(stored.id)}
+        assert [record.id for record, _, _ in self._user_workouts(db, user.id)] == [stored.id]
 
     def test_a_workout_stored_twice_is_found_by_its_devices_copy(self, garmin_247: Garmin247Data, db: Session) -> None:
         user = UserFactory()
@@ -1159,7 +1181,9 @@ class TestGarmin247Data:
         _, fit_copy = self._stored_twice(garmin_247, db, user)
         copy = db.get(EventRecord, fit_copy)
         assert copy is not None
-        span = CoverageSpan(user.id, "garmin", EventCategory.WORKOUT, DataTypeKind.EVENT, copy.start_datetime, copy.end_datetime)
+        span = CoverageSpan(
+            user.id, "garmin", EventCategory.WORKOUT, DataTypeKind.EVENT, copy.start_datetime, copy.end_datetime
+        )
         data_type_coverage_repository.record(db, [span])
 
         def coverage() -> tuple[datetime, datetime]:

@@ -4,7 +4,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from typing import cast
 from uuid import UUID, uuid4
 
-from sqlalchemy import Column, Table, and_, delete, exists, func, select
+from sqlalchemy import Column, Table, and_, delete, exists, func, select, tuple_
 from sqlalchemy import event as sa_event
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Query
@@ -686,9 +686,25 @@ class EventRecordService(
                     "Workouts not stored, other records of their sources hold their spans",
                     provider=provider,
                     user_id=str(user_id),
-                    external_ids=[record.external_id for record, _ in dropped],
+                    held_by=self._span_holders(db_session, [record for record, _ in dropped]),
                 )
         return [record.id for record, _ in new if record.id in inserted], updated
+
+    def _span_holders(self, db_session: DbSession, records: list[EventRecordCreate]) -> dict[str, str]:
+        """The id of the stored record holding each record's span in its data source, by the record's external id."""
+        sources = self.data_source_repo.resolve_creators(db_session, records)
+        spans = {
+            (sources.get(DataSourceIdentity.of(record)), record.start_datetime, record.end_datetime): str(
+                record.external_id
+            )
+            for record in records
+        }
+        held = db_session.execute(
+            select(EventRecord.id, EventRecord.data_source_id, EventRecord.start_datetime, EventRecord.end_datetime)
+            .where(tuple_(EventRecord.data_source_id, EventRecord.start_datetime, EventRecord.end_datetime).in_(spans))
+            .where(EventRecord.category != EventCategory.MEAL)
+        )
+        return {spans[(source_id, start, end)]: str(record_id) for record_id, source_id, start, end in held}
 
     def _refresh_workout(self, db_session: DbSession, stored: EventRecord, record: EventRecordCreate) -> None:
         """The stored workout takes the device, type and span the push names."""
