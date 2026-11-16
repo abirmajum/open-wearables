@@ -17,7 +17,7 @@ from app.services.event_record_service import event_record_service
 from app.services.providers.garmin.coverage import WORKOUT_ENERGY_SERIES
 from app.services.providers.templates.base_workouts import BaseWorkoutsTemplate
 from app.utils.conversion import as_int, to_decimal
-from app.utils.dates import offset_to_iso
+from app.utils.dates import as_utc, offset_to_iso
 from app.utils.structured_logging import get_logger
 
 logger = get_logger(__name__)
@@ -183,13 +183,12 @@ class GarminWorkouts(BaseWorkoutsTemplate):
 
         # Default to last 24 hours if no time range provided
         if not start_ts:
-            start_ts = int((datetime.now() - timedelta(hours=24)).timestamp())
+            start_ts = int((datetime.now(timezone.utc) - timedelta(hours=24)).timestamp())
         if not end_ts:
-            end_ts = int(datetime.now().timestamp())
+            end_ts = int(datetime.now(timezone.utc).timestamp())
 
-        # Convert to datetime for chunked fetching
-        start_dt = datetime.fromtimestamp(start_ts)
-        end_dt = datetime.fromtimestamp(end_ts)
+        start_dt = datetime.fromtimestamp(start_ts, tz=timezone.utc)
+        end_dt = datetime.fromtimestamp(end_ts, tz=timezone.utc)
 
         # Check if range exceeds 24 hours - if so, use chunked fetching
         if (end_dt - start_dt) > timedelta(hours=24):
@@ -221,7 +220,7 @@ class GarminWorkouts(BaseWorkoutsTemplate):
         except ValueError:
             pass
         try:
-            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            dt = as_utc(datetime.fromisoformat(value.replace("Z", "+00:00")))  # no offset in the string means UTC
             return int(dt.timestamp())
         except (ValueError, AttributeError):
             return None
