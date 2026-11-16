@@ -2,9 +2,9 @@
 
 import math
 import re
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
-from typing import Any
+from typing import Any, TypeIs
 from uuid import UUID, uuid4
 
 from app.config import settings
@@ -35,6 +35,7 @@ from app.services.providers.ultrahuman.coverage import (
 from app.services.raw_payload_storage import store_raw_payload
 from app.services.timeseries_service import timeseries_service
 from app.utils.conversion import as_int, seconds_to_minutes
+from app.utils.dates import offset_to_iso
 from app.utils.exceptions import ProviderConnectionError, ProviderError
 from app.utils.structured_logging import get_logger
 
@@ -47,6 +48,9 @@ SLEEP_GRAPH_STAGE_MAP: dict[str, SleepStageType] = {
     "rem_sleep": SleepStageType.REM,
     "awake": SleepStageType.AWAKE,
 }
+
+# The UTC offsets in use run from -12:00 to +14:00.
+_WESTMOST, _EASTMOST = timedelta(hours=-12), timedelta(hours=14)
 
 
 def _at(items_by_type: dict[str, Any], path: tuple[str, ...]) -> Any:
@@ -66,8 +70,23 @@ def _value_at(items_by_type: dict[str, Any], path: tuple[str, ...]) -> Any:
     return _at(items_by_type, (*path, "value"))
 
 
-def _is_number(value: Any) -> bool:
+def _is_number(value: Any) -> TypeIs[int | float]:
     return isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _zone_offset(day: date, metrics: list[dict[str, Any]]) -> str | None:
+    """The user's UTC offset on ``day``: Ultrahuman starts each metric's day at the user's local midnight. None when
+    no metric carries a day start that is a real offset from ``day``."""
+    midnight = datetime.combine(day, time(), timezone.utc)
+    for item in metrics:
+        metric = item.get("object")
+        day_start = metric.get("day_start_timestamp") if isinstance(metric, dict) else None
+        if not _is_number(day_start):
+            continue
+        offset = midnight - datetime.fromtimestamp(day_start, tz=timezone.utc)
+        if _WESTMOST <= offset <= _EASTMOST:
+            return offset_to_iso(int(offset.total_seconds()))
+    return None
 
 
 def _components(category: HealthScoreCategory, items_by_type: dict[str, Any]) -> dict[str, ScoreComponent]:
@@ -146,11 +165,13 @@ class Ultrahuman247Data(Base247DataTemplate):
             if response and "data" in response and "metric_data" in response["data"]:
                 # Add date to each metric item for reference
                 metrics = response["data"]["metric_data"]
+                zone_offset = _zone_offset(date.date(), metrics)
                 for item in metrics:
                     item["date"] = date_str
-                    # Inject date into the inner object for use in normalization
+                    # Inject the day and its offset into the inner object for use in normalization
                     if "object" in item and isinstance(item["object"], dict):
                         item["object"]["ultrahuman_date"] = date_str
+                        item["object"]["ultrahuman_zone_offset"] = zone_offset
                 return metrics
         except ProviderConnectionError as e:
             # Fatal errors - should be raised to trigger token refresh or invalidate connection
@@ -286,6 +307,7 @@ class Ultrahuman247Data(Base247DataTemplate):
             },
             "stage_timestamps": self._normalize_sleep_stages(raw_sleep),
             "ultrahuman_date": date_str,
+            "zone_offset": raw_sleep.get("ultrahuman_zone_offset"),
             "raw": raw_sleep,
         }
 
@@ -322,6 +344,7 @@ class Ultrahuman247Data(Base247DataTemplate):
             duration_seconds=normalized_sleep.get("duration_seconds"),
             start_datetime=start_dt,
             end_datetime=end_dt,
+            zone_offset=normalized_sleep.get("zone_offset"),
             external_id=f"sleep-{normalized_sleep.get('ultrahuman_date')}",
             provider=self.provider_name,
             user_id=user_id,
@@ -395,6 +418,7 @@ class Ultrahuman247Data(Base247DataTemplate):
             category=HealthScoreCategory.SLEEP,
             value=value,
             recorded_at=normalized_sleep["end_time"],
+            zone_offset=normalized_sleep.get("zone_offset"),
             components=components or None,
         )
 
@@ -409,7 +433,8 @@ class Ultrahuman247Data(Base247DataTemplate):
     ) -> list[HealthScoreCreate]:
         """One day's scores from its metrics keyed by Ultrahuman type; a score without a value is not written.
 
-        Each score sits at its metric's day_start_timestamp, the instant the day's single-value samples take.
+        Each score sits at its metric's day_start_timestamp, the instant the day's single-value samples take, at the
+        user's offset that day so it reads as the user's date.
         """
         scores: list[HealthScoreCreate] = []
         for metric_type, category in DAILY_SCORES.items():
@@ -425,6 +450,7 @@ class Ultrahuman247Data(Base247DataTemplate):
                     category=category,
                     value=value,
                     recorded_at=datetime.fromtimestamp(day_start, tz=timezone.utc),
+                    zone_offset=metric.get("ultrahuman_zone_offset"),
                     components=_components(category, raw_recovery) or None,
                 )
             )
@@ -450,7 +476,13 @@ class Ultrahuman247Data(Base247DataTemplate):
                 ts, value = val.get("timestamp"), val.get("value")
                 if not ts or (series_type is SeriesType.steps and not (value and value > 0)):
                     continue
-                readings.append({"recorded_at": datetime.fromtimestamp(ts, tz=timezone.utc), "value": value})
+                readings.append(
+                    {
+                        "recorded_at": datetime.fromtimestamp(ts, tz=timezone.utc),
+                        "zone_offset": sample.get("zone_offset"),
+                        "value": value,
+                    }
+                )
         return result
 
     def _build_activity_samples(
@@ -475,6 +507,7 @@ class Ultrahuman247Data(Base247DataTemplate):
                             user_id=user_id,
                             provider=self.provider_name,
                             recorded_at=sample["recorded_at"],
+                            zone_offset=sample.get("zone_offset"),
                             value=Decimal(str(sample["value"])),
                             series_type=series_type,
                             is_daily_total=daily_total_flag(series_type, is_daily=False),
@@ -586,7 +619,11 @@ class Ultrahuman247Data(Base247DataTemplate):
     ) -> WriteCounts:
         """Persist one day's activity series plus its single-value daily metrics."""
         sample_inputs = [
-            {"type": t, "values": items_by_type[t].get("values", [])}
+            {
+                "type": t,
+                "values": items_by_type[t].get("values", []),
+                "zone_offset": items_by_type[t].get("ultrahuman_zone_offset"),
+            }
             for t in ACTIVITY_SAMPLE_SERIES
             if t in items_by_type
         ]
@@ -601,19 +638,19 @@ class Ultrahuman247Data(Base247DataTemplate):
             value, day_start = scalar.get("value"), scalar.get("day_start_timestamp")
             if value is None or not day_start:
                 continue
-            # day_start is the local midnight as Ultrahuman reports it, stored as the UTC instant; the day row
-            # takes the same instant, so it and the sample read as one day everywhere.
             recorded_at = datetime.fromtimestamp(day_start, tz=timezone.utc)
+            zone_offset = scalar.get("ultrahuman_zone_offset")
             samples.append(
                 TimeSeriesSampleCreate(
                     id=uuid4(),
                     user_id=user_id,
                     provider=self.provider_name,
                     recorded_at=recorded_at,
+                    zone_offset=zone_offset,
                     value=Decimal(str(value)),
                     series_type=series_type,
                     is_daily_total=daily_total_flag(series_type, True),
-                    period=CalendarPeriod.local_day(recorded_at),
+                    period=CalendarPeriod.local_day(recorded_at, zone_offset=zone_offset),
                 )
             )
 

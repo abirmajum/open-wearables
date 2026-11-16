@@ -53,7 +53,18 @@ def _users() -> list[dict[str, Any]]:
             "garmin": "fixture-garmin-3",
             "ultrahuman": True,
         },
+        {
+            "label": "ultrahuman_east",
+            "id": "5eed0000-0000-4000-8000-000000000004",
+            "ultrahuman": True,
+            "ultrahuman_zone": "+04:00",
+        },
     ]
+
+
+def _ultrahuman_token(user: dict[str, Any]) -> str:
+    """The user's Ultrahuman access token, which tells the offline API whose responses to answer with."""
+    return f"rumi-fixture-ultrahuman-{user.get('ultrahuman_zone', '+00:00')}"
 
 
 # ---------------------------------------------------------------------------
@@ -91,11 +102,15 @@ def _garmin_pushes(today: date, garmin_user_id: str) -> tuple[list[dict[str, Any
     return _shift(json.loads(raw), days), _shift(seed["fit_files"], days)
 
 
-def _ultrahuman_responses(today: date) -> dict[str, dict[str, Any]]:
+def _ultrahuman_responses(today: date) -> dict[str, dict[str, dict[str, Any]]]:
+    """Each zone's responses by date; the UTC user's are the seed's ``responses``."""
     seed, days = _load_seed("ultrahuman", today)
     return {
-        (date.fromisoformat(day) + timedelta(days=days)).isoformat(): _shift(response, days)
-        for day, response in seed["responses"].items()
+        zone: {
+            (date.fromisoformat(day) + timedelta(days=days)).isoformat(): _shift(response, days)
+            for day, response in responses.items()
+        }
+        for zone, responses in {"+00:00": seed["responses"], **seed["responses_by_zone"]}.items()
     }
 
 
@@ -196,8 +211,9 @@ def _containers() -> Generator[tuple[Any, str, int]]:
         )
 
 
-def _offline_http(ultrahuman: dict[str, dict[str, Any]], fit_files: dict[str, bytes]) -> Any:
-    """An httpx transport that answers the seeded provider requests and fails every other one."""
+def _offline_http(ultrahuman: dict[str, dict[str, dict[str, Any]]], fit_files: dict[str, bytes]) -> Any:
+    """An httpx transport that answers the seeded provider requests and fails every other one; an Ultrahuman
+    request gets the responses of its access token."""
     import httpx
 
     def handle(request: httpx.Request) -> httpx.Response:
@@ -206,7 +222,8 @@ def _offline_http(ultrahuman: dict[str, dict[str, Any]], fit_files: dict[str, by
             return httpx.Response(200, content=fit_files[url])
         if request.url.path.endswith("/user_data/metrics"):
             day = request.url.params.get("date", "")
-            return httpx.Response(200, json=ultrahuman.get(day, {"data": {"metric_data": []}, "status": 200}))
+            responses = ultrahuman[request.headers.get("Authorization", "").removeprefix("Bearer ")]
+            return httpx.Response(200, json=responses.get(day, {"data": {"metric_data": []}, "status": 200}))
         raise httpx.ConnectError(f"rumi fixture server: no outbound requests ({request.method} {url})")
 
     return httpx.MockTransport(handle)
@@ -314,7 +331,7 @@ def _create_users_and_key(api_key: str) -> None:
                         user_id=uuid.UUID(user["id"]),
                         provider="ultrahuman",
                         provider_user_id=f"uh-{user['label']}",
-                        access_token="rumi-fixture-ultrahuman-token",
+                        access_token=_ultrahuman_token(user),
                         refresh_token="rumi-fixture-ultrahuman-refresh",
                         token_expires_at=datetime.now(timezone.utc) + timedelta(days=3650),
                         scope="ring_data cgm_data profile",
@@ -363,7 +380,10 @@ def seed(today: date, api_key: str) -> list[str]:
     from app.main import api
 
     users = _users()
-    ultrahuman = _ultrahuman_responses(today)
+    ultrahuman = {
+        _ultrahuman_token({"ultrahuman_zone": zone}): responses
+        for zone, responses in _ultrahuman_responses(today).items()
+    }
     garmin = {user["id"]: _garmin_pushes(today, user["garmin"]) for user in users if user.get("garmin")}
     fit_files = {url: _fit_file(spec) for _, specs in garmin.values() for url, spec in specs.items()}
 
@@ -375,7 +395,7 @@ def seed(today: date, api_key: str) -> list[str]:
             if user["id"] in garmin:
                 _ingest_garmin(client, garmin[user["id"]][0])
             if user.get("ultrahuman"):
-                _ingest_ultrahuman(user["id"], today, len(ultrahuman))
+                _ingest_ultrahuman(user["id"], today, len(ultrahuman[_ultrahuman_token(user)]))
         _post_process()
     return skipped
 

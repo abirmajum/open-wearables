@@ -20,6 +20,9 @@ ANCHOR_DATE = date(2026, 1, 15)
 DAYS = 10
 GARMIN_OFFSET = 3600  # UTC+01:00
 GARMIN_USER_ID = "GARMIN_USER_ID"  # replaced per fixture user by the server
+# Ultrahuman users away from UTC (offset -> seconds east of UTC): a user east of UTC starts each day on the previous
+# UTC date.
+ULTRAHUMAN_ZONES = {"+04:00": 4 * 3600}
 FIT_CALLBACK_URL = "https://apis.garmin.com/wellness-api/rest/activityFile?id={activity_id}&token=fixture"
 
 
@@ -516,15 +519,19 @@ def garmin_seed() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _values(day: date, hours: range, value: Any) -> list[dict[str, Any]]:
-    return [{"value": value(h), "timestamp": _epoch(day, h)} for h in hours]
+def _ultrahuman_day(i: int, day: date, is_today: bool, offset: int = 0) -> dict[str, Any]:
+    """One ``/user_data/metrics?date=`` response for a user ``offset`` seconds east of UTC: every time is that
+    zone's local time, so the day starts at its local midnight."""
 
+    def at(d: date, hour: float) -> int:
+        return _epoch(d, hour, offset)
 
-def _ultrahuman_day(i: int, day: date, is_today: bool) -> dict[str, Any]:
-    """One ``/user_data/metrics?date=`` response. The user is on UTC, so a local midnight is a UTC one."""
-    midnight = _epoch(day, 0)
+    def values(d: date, hours: range, value: Any) -> list[dict[str, Any]]:
+        return [{"value": value(h), "timestamp": at(d, h)} for h in hours]
+
+    midnight = at(day, 0)
     hours = range(13 if is_today else 24)
-    bed_start, bed_end = _epoch(day - timedelta(days=1), 23.25), _epoch(day, 6.75)
+    bed_start, bed_end = at(day - timedelta(days=1), 23.25), at(day, 6.75)
     deep, light, rem, awake = 4800 + i * 60, 12600, 6300 - i * 30, 3300 - i * 30
     time_in_bed = bed_end - bed_start
     total_sleep = time_in_bed - awake
@@ -543,7 +550,7 @@ def _ultrahuman_day(i: int, day: date, is_today: bool) -> dict[str, Any]:
     sleep_hr, sleep_hrv = int(_wave(i, 53, 3)), int(_wave(i, 51, 8))
     spo2 = int(_wave(i, 97, 1))
     sleep_score = int(_wave(i, 81, 8))
-    steps_values = _values(day, hours, lambda h: 0 if h < 7 else 300 + (h * 37 + i) % 500)
+    steps_values = values(day, hours, lambda h: 0 if h < 7 else 300 + (h * 37 + i) % 500)
 
     def single(metric: str, title: str, value: Any, **extra: Any) -> dict[str, Any]:
         return {"type": metric, "object": {"value": value, "title": title, "day_start_timestamp": midnight, **extra}}
@@ -556,8 +563,8 @@ def _ultrahuman_day(i: int, day: date, is_today: bool) -> dict[str, Any]:
                     "object": {
                         "day_start_timestamp": midnight,
                         "title": "Heart Rate",
-                        "values": _values(day, hours, lambda h: 52 + (h * 5 + i) % 45),
-                        "last_reading": {"value": 64, "timestamp": _epoch(day, hours[-1])},
+                        "values": values(day, hours, lambda h: 52 + (h * 5 + i) % 45),
+                        "last_reading": {"value": 64, "timestamp": at(day, hours[-1])},
                         "unit": "bpm",
                     },
                 },
@@ -566,8 +573,8 @@ def _ultrahuman_day(i: int, day: date, is_today: bool) -> dict[str, Any]:
                     "object": {
                         "day_start_timestamp": midnight,
                         "title": "Skin Temperature",
-                        "values": _values(day, hours, lambda h: round(34.6 + ((h + i) % 6) * 0.2, 1)),
-                        "last_reading": {"value": 35.2, "timestamp": _epoch(day, hours[-1])},
+                        "values": values(day, hours, lambda h: round(34.6 + ((h + i) % 6) * 0.2, 1)),
+                        "last_reading": {"value": 35.2, "timestamp": at(day, hours[-1])},
                         "unit": "°C",
                     },
                 },
@@ -576,7 +583,7 @@ def _ultrahuman_day(i: int, day: date, is_today: bool) -> dict[str, Any]:
                     "object": {
                         "day_start_timestamp": midnight,
                         "title": "HRV",
-                        "values": _values(day, range(0, 7), lambda h: 44 + (h * 3 + i) % 15),
+                        "values": values(day, range(0, 7), lambda h: 44 + (h * 3 + i) % 15),
                         "subtitle": "Average",
                         "avg": sleep_hrv,
                         "trend_title": "Stable",
@@ -600,7 +607,7 @@ def _ultrahuman_day(i: int, day: date, is_today: bool) -> dict[str, Any]:
                     "object": {
                         "day_start_timestamp": midnight,
                         "title": "Resting HR",
-                        "values": _values(day, range(0, 7), lambda h: sleep_hr - 1 + h % 3),
+                        "values": values(day, range(0, 7), lambda h: sleep_hr - 1 + h % 3),
                         "subtitle": "Sleep Time Average",
                         "avg": sleep_hr,
                         "trend_title": "Stable",
@@ -755,7 +762,7 @@ def _ultrahuman_day(i: int, day: date, is_today: bool) -> dict[str, Any]:
                     "object": {
                         "day_start_timestamp": midnight,
                         "title": "Glucose",
-                        "values": _values(day, hours, lambda h: 88 + (h * 9 + i) % 40),
+                        "values": values(day, hours, lambda h: 88 + (h * 9 + i) % 40),
                     },
                 },
                 single("average_glucose", "Average Glucose", int(_wave(i, 98, 6))),
@@ -770,9 +777,15 @@ def _ultrahuman_day(i: int, day: date, is_today: bool) -> dict[str, Any]:
 
 
 def ultrahuman_seed() -> dict[str, Any]:
+    """The UTC user's responses, and the same days for each user elsewhere under their offset."""
+
+    def responses(offset: int) -> dict[str, Any]:
+        return {d.isoformat(): _ultrahuman_day(i, d, i == DAYS - 1, offset) for i, d in _days()}
+
     return {
         "anchor_date": ANCHOR_DATE.isoformat(),
-        "responses": {d.isoformat(): _ultrahuman_day(i, d, i == DAYS - 1) for i, d in _days()},
+        "responses": responses(0),
+        "responses_by_zone": {zone: responses(offset) for zone, offset in ULTRAHUMAN_ZONES.items()},
     }
 
 

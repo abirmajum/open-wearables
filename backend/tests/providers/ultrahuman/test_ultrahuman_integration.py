@@ -14,13 +14,22 @@ from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import func
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.models import DataSource, EventRecord, SeriesAggregate, SeriesSample, SeriesTypeDefinition, SleepDetails
+from app.models import (
+    DataSource,
+    EventRecord,
+    HealthScore,
+    SeriesAggregate,
+    SeriesSample,
+    SeriesTypeDefinition,
+    SleepDetails,
+)
 from app.schemas.enums.series_types import SeriesType
 from app.services.providers.factory import ProviderFactory
 from app.services.providers.ultrahuman.data_247 import Ultrahuman247Data
+from app.utils.dates import local_date
 from tests.factories import (
     ApiKeyFactory,
     DataSourceFactory,
@@ -1094,3 +1103,114 @@ class TestUltrahumanScoresIntegration:
 
         assert read("blood_glucose", "raw") == [(92, "mg_dl"), (118, "mg_dl")]
         assert read("sedentary_time", "1day") == [(210, "minutes")]
+
+
+class TestUltrahumanLocalDays:
+    """A day's values land on the user's own date wherever the user is: Ultrahuman starts each day at the user's
+    local midnight, which for a user east of UTC is the previous UTC date."""
+
+    DAY = datetime(2024, 1, 15, tzinfo=timezone.utc)
+
+    @staticmethod
+    def _in_zone(response: dict, hours: int) -> dict:
+        """The response as a user ``hours`` east of UTC gets it: the same local times, so earlier instants."""
+
+        def shift(value: Any) -> Any:
+            if isinstance(value, dict):
+                return {k: shift(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [shift(v) for v in value]
+            if isinstance(value, int) and not isinstance(value, bool) and value > 1_000_000_000:
+                return value - hours * 3600
+            return value
+
+        return shift(response)
+
+    def _sync(self, db: Session, response: dict, user_id: UUID | None = None) -> UUID:
+        if user_id is None:
+            user = UserFactory()
+            UserConnectionFactory(user=user, provider="ultrahuman", status="active", access_token="test_token")
+            user_id = user.id
+        provider_impl = ProviderFactory().get_provider("ultrahuman").data_247
+        assert isinstance(provider_impl, Ultrahuman247Data)
+        with patch.object(provider_impl, "_make_api_request", return_value=response):
+            results = provider_impl.load_and_save_all(db, user_id, start_time=self.DAY, end_time=self.DAY)
+        assert not results.failures
+        return user_id
+
+    @staticmethod
+    def _get(client: TestClient, path: str, **params: Any) -> list[dict[str, Any]]:
+        response = client.get(path, params=params, headers=api_key_headers(ApiKeyFactory().plain_key))
+        assert response.status_code == 200, response.text
+        return response.json()["data"]
+
+    def _local_days(self, client: TestClient, user_id: UUID) -> dict[str, Any]:
+        """The local date and offset of each kind of value, as the API serves them."""
+        base = f"/api/v1/users/{user_id}"
+        span = {"start_date": "2024-01-13T00:00:00Z", "end_date": "2024-01-17T00:00:00Z"}
+
+        def local(timestamp: str, zone_offset: str | None) -> tuple[str, str | None]:
+            return local_date(datetime.fromisoformat(timestamp), zone_offset).isoformat(), zone_offset
+
+        def days(series_type: str) -> list[tuple[str, str | None]]:
+            readings = self._get(
+                client,
+                f"{base}/timeseries",
+                start_time=span["start_date"],
+                end_time=span["end_date"],
+                types=series_type,
+                resolution="1day",
+            )
+            return [local(r["timestamp"], r["zone_offset"]) for r in readings]
+
+        scores = self._get(client, f"{base}/health-scores", provider="ultrahuman")
+        [sleep] = self._get(client, f"{base}/events/sleep", **span)
+        return {
+            **{s["category"]: local(s["recorded_at"], s["zone_offset"]) for s in scores},
+            "sleep_session": local(sleep["end_time"], sleep["zone_offset"]),
+            "recovery_summary": [d["date"] for d in self._get(client, f"{base}/summaries/recovery", **span)],
+            "vo2_max": days("vo2_max"),
+            "steps": days("steps"),
+        }
+
+    @staticmethod
+    def _on(zone_offset: str) -> dict[str, Any]:
+        day = ("2024-01-15", zone_offset)
+        return {
+            **dict.fromkeys(("recovery", "movement_index", "metabolic", "sleep", "sleep_session"), day),
+            "recovery_summary": ["2024-01-15"],
+            "vo2_max": [day],
+            "steps": [day],
+        }
+
+    @pytest.mark.parametrize(("hours", "zone_offset"), [(4, "+04:00"), (0, "+00:00"), (-5, "-05:00")])
+    def test_a_day_lands_on_the_users_date(
+        self,
+        client: TestClient,
+        db: Session,
+        sample_ultrahuman_api_response: dict,
+        hours: int,
+        zone_offset: str,
+    ) -> None:
+        user_id = self._sync(db, self._in_zone(sample_ultrahuman_api_response, hours))
+
+        assert self._local_days(client, user_id) == self._on(zone_offset)
+
+    def test_a_resync_moves_days_stored_without_the_offset(
+        self, client: TestClient, db: Session, sample_ultrahuman_api_response: dict
+    ) -> None:
+        response = self._in_zone(sample_ultrahuman_api_response, 4)
+        user_id = self._sync(db, response)
+        sources = select(DataSource.id).where(DataSource.user_id == user_id)
+        # The rows as syncs stored them before the user's offset was kept.
+        db.query(HealthScore).filter(HealthScore.user_id == user_id).update({"zone_offset": None})
+        for model, utc in ((SeriesAggregate, "+00:00"), (SeriesSample, None), (EventRecord, None)):
+            db.query(model).filter(model.data_source_id.in_(sources)).update(
+                {"zone_offset": utc}, synchronize_session=False
+            )
+        db.flush()
+        assert self._local_days(client, user_id)["recovery_summary"] == ["2024-01-14"]
+
+        self._sync(db, response, user_id)
+
+        assert self._local_days(client, user_id) == self._on("+04:00")

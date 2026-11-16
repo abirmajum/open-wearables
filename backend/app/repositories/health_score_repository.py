@@ -264,6 +264,7 @@ class HealthScoreRepository(CrudRepository[HealthScore, HealthScoreCreate, Healt
             set_={
                 "value": stmt.excluded.value,
                 "qualifier": stmt.excluded.qualifier,
+                "zone_offset": stmt.excluded.zone_offset,
                 "components": stmt.excluded.components,
             },
         ).returning(literal_column("xmax = 0"))

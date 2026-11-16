@@ -42,7 +42,7 @@ Ultrahuman provides access to sleep, recovery, and continuous activity data thro
 | Night resting heart rate timeline | No - its average is the stored resting heart rate |
 | Workouts / Activities | No (not available via Partnership API) |
 
-Daily scores sit at the start of the day Ultrahuman reports them for, like the daily values above, and a later sync of the same day replaces them. Naps are inferred from the sleep session, since Ultrahuman returns one sleep per day without a nap flag.
+Daily scores sit at the start of the day Ultrahuman reports them for, like the daily values above, and a later sync of the same day replaces them. Every value carries the user's UTC offset that day, taken from the day's `day_start_timestamp` (the user's local midnight), so it falls on the user's own date east or west of UTC; a later sync of a stored day refreshes the offset too. Naps are inferred from the sleep session, since Ultrahuman returns one sleep per day without a nap flag.
 
 ### Data delivery
 
