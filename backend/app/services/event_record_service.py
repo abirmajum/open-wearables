@@ -555,7 +555,8 @@ class EventRecordService(
         device, a value either holds kept and the device's kept where both do, and then deleted.
 
         Copies under two devices, or under none, are no copy of a FIT file and its summary, so all are kept and the
-        first stands for the workout.
+        first stands for the workout. Coverage is not recounted, as when a push shortens a stored workout. The recount
+        would wait on the global coverage lock that WHOOP syncs take, with this workout still locked.
         """
         target = copies[0][0]
         if len(copies) == 1:
@@ -617,7 +618,6 @@ class EventRecordService(
                 removed_record_id=str(copy.id),
             )
         db_session.expire(target)
-        data_type_coverage_repository.refresh_events(db_session, [(user_id, provider, EventCategory.WORKOUT)])
         mark_dirty_days(db_session, days)
         return target
 

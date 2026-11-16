@@ -7,6 +7,7 @@ and delete the user they created (its data sources, workouts and details cascade
 
 import threading
 import time
+from datetime import datetime, timezone
 from collections.abc import Callable, Generator
 from decimal import Decimal
 from typing import Any
@@ -18,6 +19,7 @@ from sqlalchemy import Engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.models import DataSource, EventRecord, WorkoutDetails
+from app.repositories.data_type_coverage_repository import data_type_coverage_repository
 from app.repositories.event_record_repository import EventRecordRepository
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.schemas.providers.garmin import ActivityJSON as GarminActivityJSON
@@ -25,7 +27,7 @@ from app.services.providers.garmin.data_247 import Garmin247Data
 from app.services.providers.garmin.oauth import GarminOAuth
 from app.services.providers.garmin.webhook_handler import GarminWebhookHandler
 from app.services.providers.garmin.workouts import GarminWorkouts
-from tests.factories import UserConnectionFactory, UserFactory
+from tests.factories import DataSourceFactory, EventRecordFactory, UserConnectionFactory, UserFactory
 from tests.fixtures.fit_builder import make_running_fit
 
 _RUN = {
@@ -270,3 +272,41 @@ def test_two_pushes_each_carrying_one_users_details_and_the_others_fit_file_stor
         assert detail is not None
         assert (detail.steps_count, detail.aerobic_training_effect) == (8240, Decimal("3.4"))
         assert detail.segments
+
+
+def test_merging_a_workout_stored_twice_does_not_wait_for_a_coverage_replacement(
+    engine: Engine, committed_user: UUID, garmin: tuple[Garmin247Data, GarminWorkouts]
+) -> None:
+    """A WHOOP sync replacing its cycles holds the coverage lock: the merge, under its workout's lock, never asks for
+    it, so neither waits for the other."""
+    data_247, workouts = garmin
+    factory = sessionmaker(bind=engine, autoflush=False)
+    with factory() as session:
+        workouts.process_push_activities(session, [GarminActivityJSON(**_PUSHES["activities"])], committed_user)
+    with factory() as session:
+        source = DataSourceFactory.build(
+            user_id=committed_user, provider="garmin", source="garmin", device_model=None, device_type=None
+        )
+        copy = EventRecordFactory.build(
+            data_source_id=source.id,
+            external_id="321",
+            source_name="Garmin",
+            start_datetime=datetime(2025, 6, 1, 7, 59, 57, tzinfo=timezone.utc),
+            duration_seconds=23,
+        )
+        session.add(source)
+        session.flush()
+        session.add(copy)
+        session.commit()
+
+    with factory() as whoop, factory() as session:
+        data_type_coverage_repository.lock_for_replacement(whoop)
+        session.execute(text("SET LOCAL lock_timeout = '2s'"))
+        data_247.process_items_batch(session, committed_user, "activityDetails", [_PUSHES["activityDetails"]])
+        session.commit()
+        whoop.rollback()
+
+    [(record, detail, source)] = _workouts(engine, committed_user)
+    assert (record.external_id, source.device_model) == ("321", "forerunner965")
+    assert detail is not None
+    assert detail.steps_count == 8240

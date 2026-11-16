@@ -24,14 +24,16 @@ from app.models import (
     WorkoutDetails,
 )
 from app.repositories.data_point_series_repository import WriteCounts
+from app.repositories.data_type_coverage_repository import data_type_coverage_repository
 from app.repositories.event_record_detail_repository import EventRecordDetailRepository
 from app.repositories.event_record_repository import EventRecordRepository
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.schemas.enums import ComputedBy, EventCategory, HealthScoreCategory, ProviderName
+from app.schemas.data_type_coverage import CoverageSpan
 from app.schemas.enums.series_types import SeriesType, get_series_type_id
 from app.schemas.model_crud.activities import CalendarPeriod, HealthScoreCreate
 from app.schemas.providers.garmin import ActivityJSON as GarminActivityJSON
-from app.schemas.sync_status import SyncScope, SyncSource
+from app.schemas.sync_status import DataTypeKind, SyncScope, SyncSource
 from app.services.health_score_service import health_score_service
 from app.services.providers.garmin.data_247 import Garmin247Data
 from app.services.providers.garmin.handlers.wellness import process_wellness_items
@@ -1118,6 +1120,27 @@ class TestGarmin247Data:
             (other_activity, "999", "garmin"),
             (other_provider, "321", "polar"),
         }
+
+    def test_merging_a_workout_stored_twice_leaves_its_coverage(self, garmin_247: Garmin247Data, db: Session) -> None:
+        """Coverage is not narrowed when the kept copy is shorter, as when a push shortens a stored workout."""
+        user = UserFactory()
+        _, fit_copy = self._stored_twice(garmin_247, db, user)
+        copy = db.get(EventRecord, fit_copy)
+        assert copy is not None
+        span = CoverageSpan(user.id, "garmin", EventCategory.WORKOUT, DataTypeKind.EVENT, copy.start_datetime, copy.end_datetime)
+        data_type_coverage_repository.record(db, [span])
+
+        def coverage() -> tuple[datetime, datetime]:
+            db.expire_all()
+            row = data_type_coverage_repository.get(db, user.id, "garmin", EventCategory.WORKOUT, DataTypeKind.EVENT)
+            assert row is not None
+            return row.coverage_start, row.coverage_end
+
+        before = coverage()
+        garmin_247.process_items_batch(db, user.id, "activityDetails", [self._WORKOUT_PUSHES["activityDetails"]])
+
+        assert db.get(EventRecord, fit_copy) is None
+        assert coverage() == before == (datetime(2025, 6, 1, 7, 59, 57, tzinfo=timezone.utc), copy.end_datetime)
 
     def test_copies_of_a_workout_under_two_devices_are_both_kept(self, garmin_247: Garmin247Data, db: Session) -> None:
         user = UserFactory()
