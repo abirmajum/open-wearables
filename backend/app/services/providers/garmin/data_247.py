@@ -284,12 +284,13 @@ class Garmin247Data(Base247DataTemplate):
         normalized_sleep: dict[str, Any],
         user_id: UUID,
     ) -> HealthScoreCreate | None:
-        """Extract sleep health score from a normalized Garmin sleep record."""
+        """The night's SLEEP score; a night Garmin did not score still carries its in-sleep aggregates on one,
+        without a value."""
         sleep_score = normalized_sleep.get("sleep_score")
         sleep_qualifier = normalized_sleep.get("sleep_qualifier")
-        sleep_score_components = normalized_sleep.get("sleep_score_components")
+        sleep_score_components = normalized_sleep.get("sleep_score_components") or None
 
-        if sleep_score is None and sleep_qualifier is None:
+        if sleep_score is None and sleep_qualifier is None and sleep_score_components is None:
             return None
 
         # The wake-up, so the score belongs to the day the user wakes up

@@ -179,6 +179,9 @@ def _garmin_sleep(i: int, day: date) -> dict[str, Any]:
         "sleepHRV": {"value": int(_wave(i, 48, 7))},
         "naps": [],
     }
+    if i == DAYS - 6:
+        # Garmin leaves a night it could not score without overallSleepScore
+        del sleep["overallSleepScore"]
     if i == DAYS - 3:
         nap_start = _epoch(day, 14, GARMIN_OFFSET)
         sleep["naps"] = [

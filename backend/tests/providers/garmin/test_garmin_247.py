@@ -1407,6 +1407,33 @@ class TestGarmin247Data:
             "sleep_hrv": 48,
         }
 
+    def test_an_unscored_nights_in_sleep_aggregates_are_kept_on_a_score_without_a_value(
+        self, garmin_247: Garmin247Data, db: Session
+    ) -> None:
+        user = UserFactory()
+        unscored = {key: value for key, value in _SCORED_NIGHT.items() if key != "overallSleepScore"}
+
+        garmin_247.process_items_batch(db, user.id, "sleeps", [unscored])
+
+        night = db.query(EventRecord).filter(EventRecord.external_id == "sleep_scored").one()
+        (score,) = self._scores(db, user.id, HealthScoreCategory.SLEEP)
+        assert (score.event_record_id, score.value, score.qualifier) == (night.id, None, None)
+        assert {name: c["value"] for name, c in score.components.items()} == {
+            "average_heart_rate": 54,
+            "lowest_heart_rate": 47,
+            "respiration_avg": 14.2,
+            "avg_oxygen_saturation": 95.5,
+            "sleep_hrv": 48,
+        }
+
+    def test_a_night_without_a_score_or_aggregates_has_no_score(self, garmin_247: Garmin247Data, db: Session) -> None:
+        user = UserFactory()
+        bare = {key: _SCORED_NIGHT[key] for key in ("summaryId", "startTimeInSeconds", "durationInSeconds")}
+
+        garmin_247.process_items_batch(db, user.id, "sleeps", [bare])
+
+        assert self._scores(db, user.id, HealthScoreCategory.SLEEP) == []
+
     def test_a_nights_spo2_and_respiration_are_samples_at_their_offsets(
         self, garmin_247: Garmin247Data, db: Session
     ) -> None:

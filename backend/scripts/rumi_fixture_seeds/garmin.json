@@ -3454,10 +3454,6 @@
       "21600": 13.5,
       "23400": 13.9
      },
-     "overallSleepScore": {
-      "value": 80,
-      "qualifierKey": "GOOD"
-     },
      "sleepScores": {
       "totalDuration": {
        "qualifierKey": "GOOD"
