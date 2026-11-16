@@ -634,6 +634,43 @@ class TestHealthScoreRepositoryBulkCreateKeepingHighest:
         assert (written.inserted, written.updated) == (0, 0)
 
 
+class TestHealthScoreRepositoryBulkUpsert:
+    @staticmethod
+    def _stress(user_id: UUID, value: str, qualifier: str | None) -> HealthScoreCreate:
+        return HealthScoreCreate(
+            id=uuid4(),
+            user_id=user_id,
+            provider=ProviderName.GARMIN,
+            category=HealthScoreCategory.STRESS,
+            value=Decimal(value),
+            qualifier=qualifier,
+            recorded_at=datetime(2026, 10, 28, tzinfo=timezone.utc),
+        )
+
+    def test_a_resent_score_replaces_the_value_and_keeps_a_qualifier_it_omits(
+        self, db: Session, repo: HealthScoreRepository
+    ) -> None:
+        user = UserFactory()
+        repo.bulk_upsert(db, [self._stress(user.id, "31", "Balanced")])
+
+        written = repo.bulk_upsert(db, [self._stress(user.id, "42", None)])
+        db.commit()
+
+        [score] = db.query(HealthScore).filter(HealthScore.user_id == user.id).all()
+        assert (score.value, score.qualifier) == (Decimal("42"), "Balanced")
+        assert (written.inserted, written.updated) == (0, 1)
+
+    def test_a_resent_qualifier_replaces_the_stored_one(self, db: Session, repo: HealthScoreRepository) -> None:
+        user = UserFactory()
+        repo.bulk_upsert(db, [self._stress(user.id, "31", "Balanced")])
+
+        repo.bulk_upsert(db, [self._stress(user.id, "64", "Stressful")])
+        db.commit()
+
+        [score] = db.query(HealthScore).filter(HealthScore.user_id == user.id).all()
+        assert (score.value, score.qualifier) == (Decimal("64"), "Stressful")
+
+
 class TestProviderSleepScoreOfAReSentNight:
     """A provider sleep score sits at its night's end, which a re-sent night moves: one score per night stays."""
 
