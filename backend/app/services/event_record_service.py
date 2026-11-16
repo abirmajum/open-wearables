@@ -1,8 +1,10 @@
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
+from typing import cast
 from uuid import UUID, uuid4
 
+from sqlalchemy import Column, Table, and_, delete, exists, func, select
 from sqlalchemy import event as sa_event
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Query
@@ -127,6 +129,22 @@ def pace_sec_per_km(distance_meters: float | None, seconds: int | None) -> float
 def _first_number(*values: Decimal | None) -> float | None:
     """The first value that is set, so a provider's 0 kcal is kept rather than skipped."""
     return next((float(value) for value in values if value is not None), None)
+
+
+def _fill_nulls(db_session: DbSession, key: Column, target: UUID, source: UUID, columns: Iterable[str]) -> None:
+    """Each of these columns of the ``target`` row that is null takes the ``source`` row's value."""
+    table = key.table
+    other = table.alias("other")
+    db_session.execute(
+        table.update()
+        .where(key == target)
+        .values(
+            {
+                c: func.coalesce(table.c[c], select(other.c[c]).where(other.c[key.key] == source).scalar_subquery())
+                for c in columns
+            }
+        )
+    )
 
 
 class EventRecordService(
@@ -513,6 +531,96 @@ class EventRecordService(
             },
         )
 
+    def lock_stored_workouts(
+        self, db_session: DbSession, user_id: UUID, provider: str, external_ids: Iterable[str]
+    ) -> dict[str, EventRecord]:
+        """Lock these workout ids of the user until the transaction ends, and return the stored workout of each.
+
+        A workout stored twice, as two concurrent pushes could before the lock, is merged into its copy under the
+        device first (see :meth:`_merge_workout_copies`).
+        """
+        ids = list(external_ids)
+        self.crud.lock_workouts(db_session, user_id, provider, ids)
+        stored: dict[str, EventRecord] = {}
+        for external_id, copies in self.crud.get_copies_by_external_ids(
+            db_session, user_id, ids, provider, EventCategory.WORKOUT
+        ).items():
+            stored[external_id] = self._merge_workout_copies(db_session, user_id, provider, copies)
+        return stored
+
+    def _merge_workout_copies(
+        self, db_session: DbSession, user_id: UUID, provider: str, copies: list[tuple[EventRecord, str | None]]
+    ) -> EventRecord:
+        """The one workout these copies of an id are: each copy under no device is merged into the one copy under a
+        device, a value either holds kept and the device's kept where both do, and then deleted.
+
+        Copies under two devices, or under none, are no copy of a FIT file and its summary, so all are kept and the
+        first stands for the workout.
+        """
+        target = copies[0][0]
+        if len(copies) == 1:
+            return target
+        record_ids = [str(record.id) for record, _ in copies]
+        devices = [record for record, device_model in copies if device_model is not None]
+        if len(devices) != 1:
+            logger.warning(
+                "Workout stored more than once, copies not merged",
+                provider=provider,
+                user_id=str(user_id),
+                external_id=target.external_id,
+                record_ids=record_ids,
+            )
+            return target
+        db_session.flush()
+        records = cast(Table, EventRecord.__table__)
+        details = cast(Table, WorkoutDetails.__table__)
+        stats = cast(Table, EventRecordAggregate.__table__)
+        days = local_days(target.data_source_id, target.start_datetime, target.end_datetime, target.zone_offset)
+        for copy, _ in copies[1:]:
+            _fill_nulls(db_session, records.c.id, target.id, copy.id, ("type", "subtype", "zone_offset"))
+            other_details = details.alias("other_details")
+            db_session.execute(
+                details.update()
+                .where(details.c.record_id == copy.id, ~exists().where(other_details.c.record_id == target.id))
+                .values(record_id=target.id)
+            )
+            _fill_nulls(
+                db_session,
+                details.c.record_id,
+                target.id,
+                copy.id,
+                [c.key for c in details.columns if c.key not in ("record_id", "created_at")],
+            )
+            other_stats = stats.alias("other_stats")
+            same_series = and_(
+                other_stats.c.series_type_definition_id == stats.c.series_type_definition_id,
+                other_stats.c.computed_by == stats.c.computed_by,
+            )
+            db_session.execute(
+                stats.update()
+                .where(stats.c.record_id == target.id, other_stats.c.record_id == copy.id, same_series)
+                .values({c: func.coalesce(stats.c[c], other_stats.c[c]) for c in ("sum", "avg", "min", "max", "last")})
+            )
+            db_session.execute(
+                stats.update()
+                .where(stats.c.record_id == copy.id, ~exists().where(other_stats.c.record_id == target.id, same_series))
+                .values(record_id=target.id)
+            )
+            days += local_days(copy.data_source_id, copy.start_datetime, copy.end_datetime, copy.zone_offset)
+            db_session.execute(delete(EventRecord).where(EventRecord.id == copy.id))
+            logger.warning(
+                "Workout stored twice, merged into its device's copy and the other copy removed",
+                provider=provider,
+                user_id=str(user_id),
+                external_id=target.external_id,
+                record_id=str(target.id),
+                removed_record_id=str(copy.id),
+            )
+        db_session.expire(target)
+        data_type_coverage_repository.refresh_events(db_session, [(user_id, provider, EventCategory.WORKOUT)])
+        mark_dirty_days(db_session, days)
+        return target
+
     def update_stored_workouts(
         self,
         db_session: DbSession,
@@ -530,14 +638,9 @@ class EventRecordService(
         Returns:
             The workouts not stored yet, and the ids of the stored ones updated.
         """
-        self.crud.lock_workouts(db_session, user_id, provider, (record.external_id or "" for record, _ in workouts))
-        stored = {
-            external_id: record
-            for external_id, record in self.crud.get_by_external_ids(
-                db_session, user_id, (record.external_id for record, _ in workouts if record.external_id), provider
-            ).items()
-            if record.category == EventCategory.WORKOUT
-        }
+        stored = self.lock_stored_workouts(
+            db_session, user_id, provider, (record.external_id or "" for record, _ in workouts)
+        )
         new: list[tuple[EventRecordCreate, EventRecordDetailCreate]] = []
         updated: list[UUID] = []
         for record, detail in workouts:

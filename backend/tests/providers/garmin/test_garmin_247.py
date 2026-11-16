@@ -25,7 +25,7 @@ from app.repositories.data_point_series_repository import WriteCounts
 from app.repositories.event_record_detail_repository import EventRecordDetailRepository
 from app.repositories.event_record_repository import EventRecordRepository
 from app.repositories.user_connection_repository import UserConnectionRepository
-from app.schemas.enums import ComputedBy, HealthScoreCategory, ProviderName
+from app.schemas.enums import ComputedBy, EventCategory, HealthScoreCategory, ProviderName
 from app.schemas.enums.series_types import SeriesType, get_series_type_id
 from app.schemas.model_crud.activities import CalendarPeriod, HealthScoreCreate
 from app.schemas.providers.garmin import ActivityJSON as GarminActivityJSON
@@ -37,7 +37,13 @@ from app.services.providers.garmin.oauth import GarminOAuth
 from app.services.providers.garmin.workouts import GarminWorkouts, activity_workout
 from app.utils.context import sync_run_var
 from app.utils.conversion import to_decimal
-from tests.factories import UserConnectionFactory, UserFactory
+from tests.factories import (
+    DataSourceFactory,
+    EventRecordFactory,
+    UserConnectionFactory,
+    UserFactory,
+    WorkoutDetailsFactory,
+)
 from tests.fixtures.fit_builder import make_cycling_fit, make_running_fit
 
 # One day's stressDetails as Garmin sends it after midnight, and again in the morning with more data
@@ -881,6 +887,146 @@ class TestGarmin247Data:
             garmin_247.process_items_batch(db, user.id, "activityFiles", [self._WORKOUT_PUSHES["activityFiles"]])
 
         assert db.query(EventRecord).count() == 0
+
+    def _garmin_workouts(self, garmin_247: Garmin247Data) -> GarminWorkouts:
+        return GarminWorkouts(
+            workout_repo=EventRecordRepository(EventRecord),
+            connection_repo=garmin_247.connection_repo,
+            provider_name="garmin",
+            api_base_url="https://apis.garmin.com",
+            oauth=garmin_247.oauth,
+        )
+
+    @staticmethod
+    def _deviceless_source(user: Any, provider: ProviderName = ProviderName.GARMIN) -> DataSource:
+        return DataSourceFactory(
+            user=user,
+            provider=provider,
+            source=provider.value,
+            device_model=None,
+            device_type=None,
+            software_version=None,
+        )
+
+    @staticmethod
+    def _fit_copy(
+        source: DataSource,
+        external_id: str = "321",
+        start: datetime = datetime(2025, 6, 1, 7, 59, 57, tzinfo=timezone.utc),
+    ) -> UUID:
+        """A second copy of a workout, under no device, as a FIT file pushed beside its summary stored it before
+        workouts were locked: it starts earlier, and holds the FIT's fields and a speed of its own."""
+        record = EventRecordFactory(
+            data_source=source,
+            external_id=external_id,
+            category=EventCategory.WORKOUT,
+            type="running",
+            source_name="Garmin",
+            start_datetime=start,
+            duration_seconds=23,
+        )
+        WorkoutDetailsFactory(
+            event_record=record,
+            steps_count=None,
+            max_speed=Decimal("9.9"),
+            training_load=Decimal("142"),
+            segments=[{"lap": 0}],
+        )
+        return record.id
+
+    def _user_workouts(self, db: Session, user_id: UUID) -> list[tuple[EventRecord, WorkoutDetails, DataSource]]:
+        db.expire_all()
+        return (
+            db.query(EventRecord, WorkoutDetails, DataSource)
+            .join(WorkoutDetails, WorkoutDetails.record_id == EventRecord.id)
+            .join(DataSource, DataSource.id == EventRecord.data_source_id)
+            .filter(DataSource.user_id == user_id)
+            .order_by(EventRecord.external_id, DataSource.provider, EventRecord.start_datetime)
+            .all()
+        )
+
+    def _stored_twice(self, garmin_247: Garmin247Data, db: Session, user: Any) -> tuple[UUID, UUID]:
+        """The user's activity 321 stored by its activities push under the device, and again under no device."""
+        self._garmin_workouts(garmin_247).process_push_activities(
+            db, [GarminActivityJSON(**self._WORKOUT_PUSHES["activities"])], user.id
+        )
+        [(device_copy, _, _)] = self._user_workouts(db, user.id)
+        return device_copy.id, self._fit_copy(self._deviceless_source(user))
+
+    def test_a_workout_stored_twice_is_found_by_its_devices_copy(self, garmin_247: Garmin247Data, db: Session) -> None:
+        user = UserFactory()
+        device_copy, _ = self._stored_twice(garmin_247, db, user)
+
+        found = EventRecordRepository(EventRecord).get_by_external_ids(
+            db, user.id, ["321"], "garmin", EventCategory.WORKOUT
+        )
+
+        assert found["321"].id == device_copy
+
+    @pytest.mark.parametrize("summary_type", ["activityDetails", "activityFiles"])
+    def test_a_push_to_a_workout_stored_twice_merges_it_into_its_devices_copy(
+        self, garmin_247: Garmin247Data, db: Session, summary_type: str
+    ) -> None:
+        user = UserFactory()
+        device_copy, fit_copy = self._stored_twice(garmin_247, db, user)
+
+        with (
+            patch("app.services.providers.garmin.data_247.download_binary_content", return_value=make_running_fit()),
+            patch("app.services.providers.garmin.data_247.store_fit_file"),
+        ):
+            garmin_247.process_items_batch(db, user.id, summary_type, [self._WORKOUT_PUSHES[summary_type]])
+
+        [(record, detail, source)] = self._user_workouts(db, user.id)
+        assert (record.id, source.device_model) == (device_copy, "forerunner965")
+        assert db.get(EventRecord, fit_copy) is None
+        assert (detail.label, detail.entry_source, detail.max_speed) == ("Morning Run", "automatic", Decimal("4.1"))
+        assert (detail.training_load, detail.heart_rate_avg) == (Decimal("142"), Decimal("145.5"))
+        assert detail.segments
+        stats = {
+            (s.series_type_definition_id, s.computed_by): s
+            for s in db.query(EventRecordAggregate).filter(EventRecordAggregate.record_id == device_copy)
+        }
+        assert stats[(get_series_type_id(SeriesType.heart_rate), ComputedBy.PROVIDER)].avg == Decimal("145.5")
+        assert stats[(get_series_type_id(SeriesType.speed), ComputedBy.PROVIDER)].max == Decimal("4.1")
+        if summary_type == "activityDetails":
+            assert (detail.steps_count, detail.segments) == (8240, [{"lap": 0}])
+        else:
+            assert detail.aerobic_training_effect == Decimal("3.4")
+
+    def test_merging_a_workout_stored_twice_touches_no_other_record(
+        self, garmin_247: Garmin247Data, db: Session
+    ) -> None:
+        user, other_user = UserFactory(), UserFactory()
+        _, fit_copy = self._stored_twice(garmin_247, db, user)
+        other_users_copies = set(self._stored_twice(garmin_247, db, other_user))
+        other_activity = self._fit_copy(
+            db.query(DataSource).filter(DataSource.user_id == user.id, DataSource.device_model.is_(None)).one(),
+            "999",
+            datetime(2025, 6, 2, 7, 0, tzinfo=timezone.utc),
+        )
+        other_provider = self._fit_copy(self._deviceless_source(user, ProviderName.POLAR))
+
+        garmin_247.process_items_batch(db, user.id, "activityDetails", [self._WORKOUT_PUSHES["activityDetails"]])
+
+        assert db.get(EventRecord, fit_copy) is None
+        assert {r.id for r, _, _ in self._user_workouts(db, other_user.id)} == other_users_copies
+        kept = {(r.id, r.external_id, s.provider, s.device_model) for r, _, s in self._user_workouts(db, user.id)}
+        assert {(i, e, p) for i, e, p, d in kept if d is None} == {
+            (other_activity, "999", "garmin"),
+            (other_provider, "321", "polar"),
+        }
+
+    def test_copies_of_a_workout_under_two_devices_are_both_kept(self, garmin_247: Garmin247Data, db: Session) -> None:
+        user = UserFactory()
+        _, fit_copy = self._stored_twice(garmin_247, db, user)
+        second_device = DataSourceFactory(
+            user=user, provider=ProviderName.GARMIN, source="garmin", device_model="edge1040"
+        )
+        db.query(EventRecord).filter(EventRecord.id == fit_copy).update({"data_source_id": second_device.id})
+
+        garmin_247.process_items_batch(db, user.id, "activityDetails", [self._WORKOUT_PUSHES["activityDetails"]])
+
+        assert len(self._user_workouts(db, user.id)) == 2
 
     def test_process_items_batch_hrv_missing_start_time(self, garmin_247: Garmin247Data, db: Session) -> None:
         """Test saving HRV data with missing start time."""

@@ -1771,8 +1771,9 @@ class Garmin247Data(Base247DataTemplate):
         if fit.power_zones is not None:
             fields["power_zones"] = fit.power_zones.model_dump()
         fields.update(fit.session)
-        self.event_record_repo.lock_workouts(db, user_id, self.provider_name, [activity_id])
-        record = self.event_record_repo.get_by_external_id(db, user_id, activity_id, source=self.provider_name)
+        record = event_record_service.lock_stored_workouts(db, user_id, self.provider_name, [activity_id]).get(
+            activity_id
+        )
         if record is not None:
             self.event_record_detail_repo.update_workout_fields(db, record.id, fields)
             return None

@@ -60,6 +60,9 @@ from app.schemas.model_crud.activities import (
 from app.schemas.sync_status import DataTypeKind
 from app.utils.dates import local_date
 from app.utils.pagination import decode_cursor
+from app.utils.structured_logging import get_logger
+
+logger = get_logger(__name__)
 
 # PostgreSQL's limit on bind parameters in one statement
 _MAX_BIND_PARAMS = 65_535
@@ -203,20 +206,57 @@ class EventRecordRepository(
             )
 
     def get_by_external_ids(
-        self, db_session: DbSession, user_id: UUID, external_ids: Iterable[str], provider: str | None = None
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        external_ids: Iterable[str],
+        provider: str | None = None,
+        category: EventCategory | None = None,
     ) -> dict[str, EventRecord]:
-        """The user's records carrying these provider ids, in one query, by external id."""
+        """The user's records carrying these provider ids, in one query, by external id; of an id stored more than
+        once, the copy that :meth:`get_copies_by_external_ids` lists first."""
+        copies = self.get_copies_by_external_ids(db_session, user_id, external_ids, provider, category)
+        if repeated := {
+            external_id: [str(record.id) for record, _ in records]
+            for external_id, records in copies.items()
+            if len(records) > 1
+        }:
+            logger.warning(
+                "Records stored more than once under one id, using the first",
+                provider=provider,
+                user_id=str(user_id),
+                record_ids=repeated,
+            )
+        return {external_id: records[0][0] for external_id, records in copies.items()}
+
+    def get_copies_by_external_ids(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        external_ids: Iterable[str],
+        provider: str | None = None,
+        category: EventCategory | None = None,
+    ) -> dict[str, list[tuple[EventRecord, str | None]]]:
+        """Every record of the user under each of these provider ids, with its source's device model: the copy
+        under a device first, then by start and id, so every lookup takes the same one."""
         ids = list({external_id for external_id in external_ids if external_id})
         if not ids:
             return {}
         query = (
-            db_session.query(self.model)
+            db_session.query(self.model, DataSource.device_model)
             .join(DataSource, self.model.data_source_id == DataSource.id)
             .filter(DataSource.user_id == user_id, self.model.external_id.in_(ids))
+            .order_by(DataSource.device_model.is_(None), self.model.start_datetime, self.model.id)
         )
         if provider is not None:
             query = query.filter(DataSource.provider == provider)
-        return {record.external_id: record for record in query if record.external_id}
+        if category is not None:
+            query = query.filter(self.model.category == category)
+        copies: dict[str, list[tuple[EventRecord, str | None]]] = {}
+        for record, device_model in query:
+            if record.external_id:
+                copies.setdefault(record.external_id, []).append((record, device_model))
+        return copies
 
     def get_main_sleeps_by_external_ids(
         self, db_session: DbSession, user_id: UUID, external_ids: Iterable[str], provider: str
