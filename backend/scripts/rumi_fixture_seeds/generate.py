@@ -486,7 +486,13 @@ def _garmin_fit_spec(summary: dict[str, Any]) -> dict[str, Any]:
             {"start": start, "end": start + half, "distance_meters": 4480, "avg_hr": 148, "max_hr": 166},
             {"start": start + half, "end": start + duration, "distance_meters": 4487, "avg_hr": 156, "max_hr": 174},
         ],
-        "session": {"end": start + duration, "aerobic_effect": 3.4, "anaerobic_effect": 1.2, "training_load": 142.0},
+        "session": {
+            "end": start + duration,
+            "sport": summary["activityType"].lower(),
+            "aerobic_effect": 3.4,
+            "anaerobic_effect": 1.2,
+            "training_load": 142.0,
+        },
         # The session's time_in_zone message, as a Garmin watch writes it at the end of an activity
         "time_in_zone": {
             "time_in_hr_zone": zone_seconds,
@@ -610,8 +616,7 @@ def garmin_seed() -> dict[str, Any]:
                 }
             ]
         },
-        {"activities": [run, ride]},
-        {"activityDetails": [run_details]},
+        # The run's FIT file arrives before its summaries; the ride comes as Garmin usually sends one
         {
             "activityFiles": [
                 {
@@ -625,6 +630,8 @@ def garmin_seed() -> dict[str, Any]:
                 }
             ]
         },
+        {"activities": [run, ride]},
+        {"activityDetails": [run_details]},
     ]
     today_daily = _garmin_daily(today_index, days[today_index][1], True)
     # Garmin re-sends today's summary as the day goes on; the later push carries the evening's stress

@@ -210,7 +210,12 @@ def _fit_file(spec: dict[str, Any]) -> bytes:
     if session := spec.get("session"):
         end = _fit_ts(datetime.fromtimestamp(session["end"], tz=timezone.utc))
         messages += _session_message(
-            end, session["aerobic_effect"], session["anaerobic_effect"], session["training_load"]
+            _fit_ts(datetime.fromtimestamp(start, tz=timezone.utc)),
+            end,
+            session["sport"],
+            session["aerobic_effect"],
+            session["anaerobic_effect"],
+            session["training_load"],
         )
         if zones := spec.get("time_in_zone"):
             seconds, tops = zones["time_in_hr_zone"], zones["hr_zone_high_boundary"]

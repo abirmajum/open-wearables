@@ -16063,6 +16063,19 @@
    ]
   },
   {
+   "activityFiles": [
+    {
+     "userId": "GARMIN_USER_ID",
+     "summaryId": "21000101-file",
+     "activityId": 21000101,
+     "fileType": "FIT",
+     "callbackURL": "https://apis.garmin.com/wellness-api/rest/activityFile?id=21000101&token=fixture",
+     "startTimeInSeconds": 1768372200,
+     "manual": false
+    }
+   ]
+  },
+  {
    "activities": [
     {
      "userId": "GARMIN_USER_ID",
@@ -16852,19 +16865,6 @@
    ]
   },
   {
-   "activityFiles": [
-    {
-     "userId": "GARMIN_USER_ID",
-     "summaryId": "21000101-file",
-     "activityId": 21000101,
-     "fileType": "FIT",
-     "callbackURL": "https://apis.garmin.com/wellness-api/rest/activityFile?id=21000101&token=fixture",
-     "startTimeInSeconds": 1768372200,
-     "manual": false
-    }
-   ]
-  },
-  {
    "dailies": [
     {
      "userId": "GARMIN_USER_ID",
@@ -17316,6 +17316,7 @@
    ],
    "session": {
     "end": 1768375140,
+    "sport": "running",
     "aerobic_effect": 3.4,
     "anaerobic_effect": 1.2,
     "training_load": 142.0
