@@ -27,6 +27,7 @@ from app.models import (
     SleepDetails,
 )
 from app.schemas.enums.series_types import SeriesType
+from app.services.health_score_service import health_score_service
 from app.services.providers.factory import ProviderFactory
 from app.services.providers.ultrahuman.data_247 import Ultrahuman247Data
 from app.utils.dates import local_date
@@ -1033,6 +1034,60 @@ class TestUltrahumanScoresIntegration:
         not_numbers = [(places[0], "81"), (places[1], None), (places[2], True)]
         response = self._with_sleep_score_at(sample_ultrahuman_api_response, [*not_numbers, (places[3], 66)])
         assert self._scores(client, self._sync(db, response))["sleep"]["value"] == 66
+
+    @staticmethod
+    def _sleep_ids(client: TestClient, user_id: UUID) -> list[str]:
+        sessions = client.get(
+            f"/api/v1/users/{user_id}/events/sleep",
+            params={"start_date": "2024-01-14T00:00:00Z", "end_date": "2024-01-16T00:00:00Z"},
+            headers=api_key_headers(ApiKeyFactory().plain_key),
+        ).json()["data"]
+        return [s["id"] for s in sessions]
+
+    @pytest.mark.parametrize(
+        ("summary", "contributors"),
+        [
+            (["Sleep Efficiency", {"title": "Temperature", "score": 92}], {"temperature": (92, None)}),
+            ([{"title": 7, "score": 88}, {"title": "Temperature", "score": 92}], {"temperature": (92, None)}),
+            (
+                [{"title": "Sleep Efficiency", "score": "high", "state_title": 3}],
+                {"sleep_efficiency": (None, None)},
+            ),
+            ({"title": "Temperature", "score": 92}, {}),
+        ],
+        ids=["item-not-an-object", "title-not-a-string", "score-not-a-number", "summary-not-a-list"],
+    )
+    def test_a_malformed_contributor_is_skipped_and_the_night_kept(
+        self,
+        client: TestClient,
+        db: Session,
+        sample_ultrahuman_api_response: dict,
+        summary: Any,
+        contributors: dict[str, tuple[Any, Any]],
+    ) -> None:
+        response = copy.deepcopy(sample_ultrahuman_api_response)
+        for item in response["data"]["metric_data"]:
+            if item["type"] == "Sleep":
+                item["object"]["summary"] = summary
+
+        user_id = self._sync(db, response)
+
+        sleep = self._scores(client, user_id)["sleep"]
+        assert self._sleep_ids(client, user_id) == [sleep["event_record_id"]]
+        assert sleep["value"] == 81
+        values = self._values(sleep)
+        assert {name: values[name] for name in ("sleep_efficiency", "temperature") if name in values} == contributors
+
+    def test_a_score_that_cannot_be_saved_keeps_the_night(
+        self, client: TestClient, db: Session, sample_ultrahuman_api_response: dict
+    ) -> None:
+        with patch.object(
+            health_score_service, "upsert_event_score", side_effect=ValueError("event_score_identity_conflict")
+        ):
+            user_id = self._sync(db, sample_ultrahuman_api_response)
+
+        assert len(self._sleep_ids(client, user_id)) == 1
+        assert "sleep" not in self._scores(client, user_id)
 
     def test_a_score_without_a_value_is_not_written(
         self, client: TestClient, db: Session, sample_ultrahuman_api_response: dict

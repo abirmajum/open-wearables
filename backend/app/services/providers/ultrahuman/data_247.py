@@ -70,6 +70,11 @@ def _value_at(items_by_type: dict[str, Any], path: tuple[str, ...]) -> Any:
     return _at(items_by_type, (*path, "value"))
 
 
+def _dicts(items: Any) -> list[dict[str, Any]]:
+    """The objects of a list in a payload; anything else in it, or a payload that is not a list, gives none."""
+    return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+
+
 def _is_number(value: Any) -> TypeIs[int | float]:
     return isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
 
@@ -388,9 +393,11 @@ class Ultrahuman247Data(Base247DataTemplate):
         normalized_sleep: dict[str, Any],
         user_id: UUID,
     ) -> HealthScoreCreate | None:
-        """The night's score at its end, with Ultrahuman's contributors and the night's readings as components."""
+        """The night's score at its end, with Ultrahuman's contributors and the night's readings as components.
+
+        Ultrahuman publishes no schema for these lists, so an item of an unexpected shape is skipped."""
         raw_sleep = items_by_type["Sleep"]
-        quick_metrics = {m.get("type"): m.get("value") for m in raw_sleep.get("quick_metrics") or []}
+        quick_metrics = {m.get("type"): m.get("value") for m in _dicts(raw_sleep.get("quick_metrics"))}
         cycles = (raw_sleep.get("sleep_cycles") or {}).get("cycles")
         readings = {
             "avg_heart_rate": quick_metrics.get("avg_hr"),
@@ -399,14 +406,17 @@ class Ultrahuman247Data(Base247DataTemplate):
         }
         components = {
             **{
-                re.sub(r"[^a-z0-9]+", "_", c["title"].lower()).strip("_"): ScoreComponent(
-                    value=c.get("score"), qualifier=c.get("state_title")
+                # The display title is the only name a contributor has
+                key: ScoreComponent(
+                    value=score if _is_number(score := c.get("score")) else None,
+                    qualifier=qualifier if isinstance(qualifier := c.get("state_title"), str) else None,
                 )
-                for c in raw_sleep.get("summary") or []
-                if c.get("title")
+                for c in _dicts(raw_sleep.get("summary"))
+                if isinstance(title := c.get("title"), str)
+                and (key := re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_"))
             },
             **_components(HealthScoreCategory.SLEEP, items_by_type),
-            **{name: ScoreComponent(value=value) for name, value in readings.items() if value is not None},
+            **{name: ScoreComponent(value=value) for name, value in readings.items() if _is_number(value)},
         }
         value = next((v for v in (_at(items_by_type, p) for p in SLEEP_SCORE_LOCATIONS) if _is_number(v)), None)
         if value is None and not components:
@@ -421,6 +431,29 @@ class Ultrahuman247Data(Base247DataTemplate):
             zone_offset=normalized_sleep.get("zone_offset"),
             components=components or None,
         )
+
+    def _save_sleep_score(
+        self,
+        db: DbSession,
+        user_id: UUID,
+        items_by_type: dict[str, Any],
+        normalized_sleep: dict[str, Any],
+        record_id: UUID,
+    ) -> None:
+        """The night's score on its stored night; a score that cannot be built or saved is logged and the night
+        kept."""
+        try:
+            with db.begin_nested():
+                if score := self._sleep_score(items_by_type, normalized_sleep, user_id):
+                    health_score_service.upsert_event_score(db, score.model_copy(update={"event_record_id": record_id}))
+        except Exception as e:
+            logger.warning(
+                "Ultrahuman sleep score not saved",
+                provider="ultrahuman",
+                user_id=str(user_id),
+                record_id=str(record_id),
+                error=str(e),
+            )
 
     # -------------------------------------------------------------------------
     # Recovery Data
@@ -566,11 +599,8 @@ class Ultrahuman247Data(Base247DataTemplate):
                 with run.step("sleep", accumulate=True, commit=True) as step:
                     normalized_sleep = self.normalize_sleep(items_by_type["Sleep"], user_id)
                     record_id = self.save_sleep_data(db, user_id, normalized_sleep)
-                    score = self._sleep_score(items_by_type, normalized_sleep, user_id) if record_id else None
-                    if score:
-                        health_score_service.upsert_event_score(
-                            db, score.model_copy(update={"event_record_id": record_id})
-                        )
+                    if record_id:
+                        self._save_sleep_score(db, user_id, items_by_type, normalized_sleep, record_id)
                     step.record(1 if record_id else 0)
 
             with run.step("recovery", accumulate=True, commit=True) as step:
