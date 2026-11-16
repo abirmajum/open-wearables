@@ -7,7 +7,7 @@ Tests cover:
 - get_latest_by_category
 - get_latest_per_category
 - bulk_create with on_conflict_do_nothing
-- bulk_create_keeping_highest
+- bulk_create_keeping_highest, value and components merged
 """
 
 from datetime import datetime, timedelta, timezone
@@ -24,7 +24,7 @@ from app.repositories import ProviderPriorityRepository
 from app.repositories.health_score_repository import HealthScoreRepository
 from app.repositories.repositories import SourceRanking
 from app.schemas.enums import HealthScoreCategory, ProviderName
-from app.schemas.model_crud.activities import HealthScoreCreate, HealthScoreQueryParams
+from app.schemas.model_crud.activities import HealthScoreCreate, HealthScoreQueryParams, ScoreComponent
 from tests.factories import (
     DataSourceFactory,
     EventRecordFactory,
@@ -515,7 +515,7 @@ class TestHealthScoreRepositorySourcePriority:
         assert results == [(score, source)]
 
 
-def _body_battery(user_id: UUID, recorded_at: datetime, value: str | None) -> HealthScoreCreate:
+def _body_battery(user_id: UUID, recorded_at: datetime, value: str | None, **components: int) -> HealthScoreCreate:
     return HealthScoreCreate(
         id=uuid4(),
         user_id=user_id,
@@ -523,7 +523,12 @@ def _body_battery(user_id: UUID, recorded_at: datetime, value: str | None) -> He
         category=HealthScoreCategory.BODY_BATTERY,
         value=Decimal(value) if value is not None else None,
         recorded_at=recorded_at,
+        components={name: ScoreComponent(value=v) for name, v in components.items()} or None,
     )
+
+
+def _values(components: dict[str, Any] | None) -> dict[str, Any] | None:
+    return {name: c["value"] for name, c in components.items()} if components is not None else None
 
 
 class TestHealthScoreRepositoryBulkCreateKeepingHighest:
@@ -566,6 +571,54 @@ class TestHealthScoreRepositoryBulkCreateKeepingHighest:
         [score] = db.query(HealthScore).filter(HealthScore.user_id == user.id).all()
         assert score.value == Decimal("78")
         assert (written.inserted, written.updated) == (0, 1)
+
+    @pytest.mark.parametrize("peak_first", [True, False], ids=["peak-first", "components-first"])
+    def test_a_score_without_a_value_adds_its_components_to_the_days_peak(
+        self, db: Session, repo: HealthScoreRepository, peak_first: bool
+    ) -> None:
+        user = UserFactory()
+        day = datetime(2026, 10, 28, tzinfo=timezone.utc)
+        peak, components = _body_battery(user.id, day, "78"), _body_battery(user.id, day, None, charged=61, drained=44)
+
+        for score in (peak, components) if peak_first else (components, peak):
+            repo.bulk_create_keeping_highest(db, [score])
+        db.commit()
+
+        [score] = db.query(HealthScore).filter(HealthScore.user_id == user.id).all()
+        assert (score.value, _values(score.components)) == (Decimal("78"), {"charged": 61, "drained": 44})
+
+    def test_resent_components_replace_only_their_own(self, db: Session, repo: HealthScoreRepository) -> None:
+        user = UserFactory()
+        day = datetime(2026, 10, 28, tzinfo=timezone.utc)
+        repo.bulk_create_keeping_highest(db, [_body_battery(user.id, day, "78", charged=61, drained=44)])
+
+        written = repo.bulk_create_keeping_highest(db, [_body_battery(user.id, day, "60", charged=70)])
+        db.commit()
+
+        [score] = db.query(HealthScore).filter(HealthScore.user_id == user.id).all()
+        assert (score.value, _values(score.components)) == (Decimal("78"), {"charged": 70, "drained": 44})
+        assert (written.inserted, written.updated) == (0, 1)
+
+    def test_one_batch_merges_a_days_value_and_components(self, db: Session, repo: HealthScoreRepository) -> None:
+        user = UserFactory()
+        day = datetime(2026, 10, 28, tzinfo=timezone.utc)
+        scores = [_body_battery(user.id, day, None, charged=61), _body_battery(user.id, day, "78")]
+
+        written = repo.bulk_create_keeping_highest(db, scores)
+        db.commit()
+
+        [score] = db.query(HealthScore).filter(HealthScore.user_id == user.id).all()
+        assert (score.value, _values(score.components)) == (Decimal("78"), {"charged": 61})
+        assert (written.inserted, written.updated) == (1, 0)
+
+    def test_the_same_score_again_writes_nothing(self, db: Session, repo: HealthScoreRepository) -> None:
+        user = UserFactory()
+        day = datetime(2026, 10, 28, tzinfo=timezone.utc)
+        repo.bulk_create_keeping_highest(db, [_body_battery(user.id, day, "78", charged=61)])
+
+        written = repo.bulk_create_keeping_highest(db, [_body_battery(user.id, day, "78", charged=61)])
+
+        assert (written.inserted, written.updated) == (0, 0)
 
     def test_a_score_without_a_value_or_components_is_skipped(self, db: Session, repo: HealthScoreRepository) -> None:
         user = UserFactory()
