@@ -51,6 +51,7 @@ class EventRecord(BaseDbModel):
 
     category: Mapped[str_32]
     type: Mapped[str_32 | None]
+    subtype: Mapped[str_32 | None]
     source_name: Mapped[str_64]
 
     # The whole start-to-end span; for sleep, awake time included (time asleep is in SleepDetails).

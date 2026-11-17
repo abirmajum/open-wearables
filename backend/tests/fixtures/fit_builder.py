@@ -32,6 +32,7 @@ _UINT8: int = 0x02
 _UINT16: int = 0x84
 _UINT32: int = 0x86
 _SINT32: int = 0x85
+_ENUM: int = 0x00
 
 # GPS: degrees × (2^31 / 180) = semicircles
 _DEG_TO_SEMICIRCLES: float = 2**31 / 180
@@ -138,6 +139,47 @@ def _lap_messages(laps: list[tuple[int, int, int, int, int, int]]) -> bytes:
     return out
 
 
+# Session message (global_mesg_num=18) fields used here:
+#   253  timestamp                        uint32  (FIT epoch seconds — end of session)
+#     2  start_time                       uint32  (FIT epoch seconds)
+#     5  sport                            enum    (FIT_SPORTS)
+#     7  total_elapsed_time               uint32  (raw = seconds * 1000; fitdecode applies scale=1000)
+#    24  total_training_effect            uint8   (raw = effect * 10; fitdecode applies scale=10)
+#   137  total_anaerobic_training_effect  uint8   (raw = effect * 10)
+#   168  training_load_peak               sint32  (raw = load * 65536)
+_SESSION_FIELDS: list[_Field] = [
+    _Field(253, _UINT32, 4),
+    _Field(2, _UINT32, 4),
+    _Field(5, _ENUM, 1),
+    _Field(7, _UINT32, 4),
+    _Field(24, _UINT8, 1),
+    _Field(137, _UINT8, 1),
+    _Field(168, _SINT32, 4),
+]
+
+FIT_SPORTS: dict[str, int] = {"running": 1, "cycling": 2}
+
+
+def _session_message(
+    start_ts: int, end_ts: int, sport: str, aerobic_effect: float, anaerobic_effect: float, training_load: float
+) -> bytes:
+    """Definition + data message for one session (local_type=2, global=18): its span, sport, training effect and
+    load."""
+    return _definition_msg(_SESSION_FIELDS, local_type=2, global_num=18) + _data_msg(
+        _SESSION_FIELDS,
+        [
+            end_ts,
+            start_ts,
+            FIT_SPORTS[sport],
+            (end_ts - start_ts) * 1000,
+            round(aerobic_effect * 10),
+            round(anaerobic_effect * 10),
+            round(training_load * 65536),
+        ],
+        local_type=2,
+    )
+
+
 def _fit_file(messages: bytes) -> bytes:
     data_size = len(messages)
     header_no_crc = struct.pack("<BBHI4s", 14, 0x20, 2132, data_size, b".FIT")
@@ -152,7 +194,9 @@ def _fit_file(messages: bytes) -> bytes:
 # ---------------------------------------------------------------------------
 
 
-def make_running_fit(n_records: int = 20) -> bytes:
+def make_running_fit(
+    n_records: int = 20, start: datetime = datetime(2025, 6, 1, 8, 0, 0, tzinfo=timezone.utc)
+) -> bytes:
     """Synthetic running activity: full sensor set including GPS, running dynamics, and 2 laps."""
     lat = int(50.0 * _DEG_TO_SEMICIRCLES)  # 50°N
     lon = int(20.0 * _DEG_TO_SEMICIRCLES)  # 20°E
@@ -173,7 +217,7 @@ def make_running_fit(n_records: int = 20) -> bytes:
         _Field(83, _UINT16, 2),  # vertical_ratio (raw = % * 100)
         _Field(84, _UINT16, 2),  # stance_time_balance (raw = % * 100)
     ]
-    start_ts = _fit_ts(datetime(2025, 6, 1, 8, 0, 0, tzinfo=timezone.utc))
+    start_ts = _fit_ts(start)
     messages = _definition_msg(record_fields)
     for i in range(n_records):
         messages += _data_msg(
@@ -201,6 +245,9 @@ def make_running_fit(n_records: int = 20) -> bytes:
             (start_ts, start_ts + half, half, half * 3, 152, 160),  # lap 0: ~3 m/s
             (start_ts + half, start_ts + n_records, half, half * 3, 156, 164),  # lap 1
         ]
+    )
+    messages += _session_message(
+        start_ts, start_ts + n_records, "running", aerobic_effect=3.4, anaerobic_effect=1.2, training_load=142.0
     )
     return _fit_file(messages)
 

@@ -43,6 +43,9 @@ class HealthScoreService(
     def bulk_create(self, db_session: DbSession, scores: list[HealthScoreCreate]) -> WriteCounts:
         return self.crud.bulk_create(db_session, scores)
 
+    def bulk_upsert(self, db_session: DbSession, scores: list[HealthScoreCreate]) -> WriteCounts:
+        return self.crud.bulk_upsert(db_session, scores)
+
     def bulk_create_keeping_highest(self, db_session: DbSession, scores: list[HealthScoreCreate]) -> WriteCounts:
         return self.crud.bulk_create_keeping_highest(db_session, scores)
 

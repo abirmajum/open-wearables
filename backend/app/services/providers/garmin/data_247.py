@@ -3,14 +3,17 @@
 import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from operator import itemgetter
 from typing import Any
 from uuid import UUID, uuid4
 
 from redis.exceptions import RedisError
 from sqlalchemy import text
+from sqlalchemy.exc import DataError, IntegrityError, SQLAlchemyError
 
 from app.config import settings
 from app.constants.sleep import SleepStageType
+from app.constants.workout_types.garmin import get_unified_workout_type
 from app.database import DbSession
 from app.integrations.redis_client import get_redis_client
 from app.models import EventRecord, EventRecordDetail, SeriesSample
@@ -33,15 +36,17 @@ from app.schemas.model_crud.activities import (
     TimeSeriesSampleCreate,
 )
 from app.services.event_record_service import event_record_service
-from app.services.fit_parser import parse_fit_file
+from app.services.fit_parser import FitParseResult, parse_fit_file
 from app.services.health_score_service import health_score_service
 from app.services.providers.api_client import download_binary_content, make_authenticated_request
 from app.services.providers.garmin.coverage import (
     ACTIVITY_SAMPLE_SERIES,
+    DAILIES_HEART_RATE_STATS,
     DAILIES_SERIES,
     EPOCHS_SERIES,
-    WORKOUT_ENERGY_SERIES,
+    SLEEP_SERIES,
 )
+from app.services.providers.garmin.workouts import activity_workout
 from app.services.providers.sync_247_result import Sync247Result
 from app.services.providers.templates.base_247_data import Base247DataTemplate
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
@@ -72,6 +77,47 @@ EPOCH_SLOT_SECONDS = 900
 # so it is summed over the slot's types and merged across pushes.
 EPOCH_SUMMED_FIELDS = {"steps": "steps", "energy": "activeKilocalories"}
 EPOCH_STORED_FIELDS = (*EPOCH_SUMMED_FIELDS.values(), "activeTimeInSeconds")
+
+# Score component → its path in a Garmin summary: the sleep summary's in-sleep aggregates on the night's SLEEP score,
+# the daily summary's stress and Body Battery fields on the day's STRESS and BODY_BATTERY scores.
+SLEEP_SCORE_COMPONENTS: dict[str, tuple[str, ...]] = {
+    "average_heart_rate": ("averageHeartRate",),
+    "lowest_heart_rate": ("lowestHeartRate",),
+    "highest_heart_rate": ("highestHeartRate",),
+    "respiration_avg": ("respirationAvg",),
+    "respiration_low": ("respirationLow",),
+    "respiration_high": ("respirationHigh",),
+    "avg_oxygen_saturation": ("avgOxygenSaturation",),
+    "low_oxygen_saturation_percentage": ("lowOxygenSaturationPercentage",),
+    "high_oxygen_saturation_percentage": ("highOxygenSaturationPercentage",),
+    "sleep_hrv": ("sleepHRV", "value"),
+}
+DAILY_STRESS_COMPONENTS: dict[str, tuple[str, ...]] = {
+    "max_stress_level": ("maxStressLevel",),
+    "stress_duration_seconds": ("stressDurationInSeconds",),
+    "rest_stress_duration_seconds": ("restStressDurationInSeconds",),
+    "activity_stress_duration_seconds": ("activityStressDurationInSeconds",),
+    "low_stress_duration_seconds": ("lowStressDurationInSeconds",),
+    "medium_stress_duration_seconds": ("mediumStressDurationInSeconds",),
+    "high_stress_duration_seconds": ("highStressDurationInSeconds",),
+}
+DAILY_BODY_BATTERY_COMPONENTS: dict[str, tuple[str, ...]] = {
+    "charged": ("bodyBatteryChargedValue",),
+    "drained": ("bodyBatteryDrainedValue",),
+}
+
+
+def _score_components(raw: dict[str, Any], paths: dict[str, tuple[str, ...]]) -> dict[str, ScoreComponent]:
+    """The components whose numbers the summary carries; Garmin sends a negative number where it lacks the data
+    (e.g. maxStressLevel -1), so those are left out."""
+    components: dict[str, ScoreComponent] = {}
+    for name, path in paths.items():
+        value: Any = raw
+        for key in path:
+            value = value.get(key) if isinstance(value, dict) else None
+        if isinstance(value, int | float) and value >= 0:
+            components[name] = ScoreComponent(value=value)
+    return components
 
 
 class Garmin247Data(Base247DataTemplate):
@@ -242,12 +288,13 @@ class Garmin247Data(Base247DataTemplate):
         normalized_sleep: dict[str, Any],
         user_id: UUID,
     ) -> HealthScoreCreate | None:
-        """Extract sleep health score from a normalized Garmin sleep record."""
+        """The night's SLEEP score; a night Garmin did not score still carries its in-sleep aggregates on one,
+        without a value."""
         sleep_score = normalized_sleep.get("sleep_score")
         sleep_qualifier = normalized_sleep.get("sleep_qualifier")
-        sleep_score_components = normalized_sleep.get("sleep_score_components")
+        sleep_score_components = normalized_sleep.get("sleep_score_components") or None
 
-        if sleep_score is None and sleep_qualifier is None:
+        if sleep_score is None and sleep_qualifier is None and sleep_score_components is None:
             return None
 
         # The wake-up, so the score belongs to the day the user wakes up
@@ -307,12 +354,13 @@ class Garmin247Data(Base247DataTemplate):
         overall_score = raw_sleep.get("overallSleepScore")
         if overall_score and isinstance(overall_score, dict):
             sleep_score = overall_score.get("value")
-            sleep_qualifier = overall_score.get("qualifier")
+            sleep_qualifier = overall_score.get("qualifierKey") or overall_score.get("qualifier")
+        sleep_qualifier = sleep_qualifier or raw_sleep.get("sleepScoreQualifier")
 
         sleep_scores = raw_sleep.get("sleepScores") or {}
         sleep_score_components = {
             key: ScoreComponent(qualifier=value.get("qualifierKey")) for key, value in sleep_scores.items()
-        }
+        } | _score_components(raw_sleep, SLEEP_SCORE_COMPONENTS)
 
         normalized = {
             "id": uuid4(),
@@ -339,6 +387,27 @@ class Garmin247Data(Base247DataTemplate):
             "raw": raw_sleep,
         }
         return normalized, self._normalize_sleep_health_score(normalized, user_id)
+
+    def _build_sleep_vitals_samples(self, user_id: UUID, raw_sleep: dict[str, Any]) -> list[TimeSeriesSampleCreate]:
+        """In-sleep SpO2 and respiration readings, each at its offset from the sleep's start (no DB interaction)."""
+        start_ts = raw_sleep.get("startTimeInSeconds")
+        if not start_ts:
+            return []
+        zone_offset = offset_to_iso(raw_sleep.get("startTimeOffsetInSeconds"))
+        return [
+            TimeSeriesSampleCreate(
+                id=uuid4(),
+                user_id=user_id,
+                source=self.provider_name,
+                recorded_at=self._from_epoch_seconds(start_ts + int(offset)),
+                zone_offset=zone_offset,
+                value=Decimal(str(value)),
+                series_type=series_type,
+            )
+            for field, series_type in SLEEP_SERIES.items()
+            for offset, value in (raw_sleep.get(field) or {}).items()
+            if value is not None and value > 0
+        ]
 
     def _build_nap_record(
         self,
@@ -505,6 +574,7 @@ class Garmin247Data(Base247DataTemplate):
         avg_stress = normalized_daily.get("avg_stress")
         raw_qualifier = normalized_daily.get("stress_qualifier")
         stress_qualifier = raw_qualifier.replace("_", " ").title() if raw_qualifier else None
+        zone_offset = normalized_daily.get("zone_offset")
         # averageStressLevel is -1 when there is not enough data to calculate
         if avg_stress is not None and avg_stress != -1:
             scores.append(
@@ -516,6 +586,21 @@ class Garmin247Data(Base247DataTemplate):
                     value=avg_stress,
                     qualifier=stress_qualifier,
                     recorded_at=recorded_at,
+                    zone_offset=zone_offset,
+                    components=normalized_daily.get("stress_components") or None,
+                )
+            )
+        # No value: the day's Body Battery is its peak from stressDetails, which these components join
+        if body_battery_components := normalized_daily.get("body_battery_components"):
+            scores.append(
+                HealthScoreCreate(
+                    id=uuid4(),
+                    user_id=user_id,
+                    provider=ProviderName.GARMIN,
+                    category=HealthScoreCategory.BODY_BATTERY,
+                    recorded_at=recorded_at,
+                    zone_offset=zone_offset,
+                    components=body_battery_components,
                 )
             )
 
@@ -542,12 +627,15 @@ class Garmin247Data(Base247DataTemplate):
             "avg_heart_rate": raw_daily.get("averageHeartRateInBeatsPerMinute"),
             "resting_heart_rate": raw_daily.get("restingHeartRateInBeatsPerMinute"),
             "avg_stress": raw_daily.get("averageStressLevel"),
-            "max_stress": raw_daily.get("maxStressLevel"),
             "stress_qualifier": raw_daily.get("stressQualifier"),
+            "stress_components": _score_components(raw_daily, DAILY_STRESS_COMPONENTS),
+            "body_battery_components": _score_components(raw_daily, DAILY_BODY_BATTERY_COMPONENTS),
             "exercise_time": seconds_to_minutes(
                 raw_daily.get("moderateIntensityDurationInSeconds"),
                 raw_daily.get("vigorousIntensityDurationInSeconds"),
             ),
+            "moderate_intensity_time": seconds_to_minutes(raw_daily.get("moderateIntensityDurationInSeconds")),
+            "vigorous_intensity_time": seconds_to_minutes(raw_daily.get("vigorousIntensityDurationInSeconds")),
             "active_time": seconds_to_minutes(raw_daily.get("activeTimeInSeconds")),
             "heart_rate_samples": raw_daily.get("timeOffsetHeartRateSamples"),
             "garmin_summary_id": raw_daily.get("summaryId"),
@@ -584,7 +672,10 @@ class Garmin247Data(Base247DataTemplate):
             else CalendarPeriod.of_date(recorded_at.date(), zone_offset)
         )
 
-        for field, series_type in DAILIES_SERIES:
+        day_values = [(field, series_type, None) for field, series_type in DAILIES_SERIES] + [
+            (field, SeriesType.heart_rate, stat) for field, stat in DAILIES_HEART_RATE_STATS.items()
+        ]
+        for field, series_type, stat in day_values:
             value = normalized_daily.get(field)
             if value is not None:
                 samples.append(
@@ -598,7 +689,7 @@ class Garmin247Data(Base247DataTemplate):
                         series_type=series_type,
                         external_id=normalized_daily.get("garmin_summary_id"),
                         is_daily_total=daily_total_flag(series_type, is_daily=True),
-                        period=period,
+                        period=period.model_copy(update={"stat": stat}),
                     )
                 )
 
@@ -1042,70 +1133,6 @@ class Garmin247Data(Base247DataTemplate):
     # Activity Data - /wellness-api/rest/activities
     # -------------------------------------------------------------------------
 
-    def _build_activity_record(
-        self,
-        user_id: UUID,
-        raw_activity: dict[str, Any],
-    ) -> tuple[EventRecordCreate, EventRecordDetailCreate] | None:
-        """Build EventRecord + WorkoutDetail for an activity (no DB interaction)."""
-        activity_id = raw_activity.get("activityId")
-        if not activity_id:
-            return None
-
-        start_ts = raw_activity.get("startTimeInSeconds", 0)
-        duration = raw_activity.get("durationInSeconds", 0)
-
-        if not start_ts:
-            return None
-
-        start_dt = self._from_epoch_seconds(start_ts)
-        end_dt = self._from_epoch_seconds(start_ts + duration) if duration else start_dt
-        zone_offset = offset_to_iso(raw_activity.get("startTimeOffsetInSeconds"))
-
-        activity_type = raw_activity.get("activityType", "unknown")
-
-        record_id = uuid4()
-        record = EventRecordCreate(
-            id=record_id,
-            category=EventCategory.WORKOUT,
-            type=activity_type.lower(),
-            source_name="Garmin",
-            device_model=raw_activity.get("deviceName"),
-            duration_seconds=duration,
-            start_datetime=start_dt,
-            end_datetime=end_dt,
-            zone_offset=zone_offset,
-            external_id=str(activity_id),
-            source=self.provider_name,
-            user_id=user_id,
-        )
-
-        distance = raw_activity.get("distanceInMeters")
-        calories = raw_activity.get("activeKilocalories")
-        avg_hr = raw_activity.get("averageHeartRateInBeatsPerMinute")
-        max_hr = raw_activity.get("maxHeartRateInBeatsPerMinute")
-        elevation_gain = raw_activity.get("elevationGainInMeters")
-        avg_speed = raw_activity.get("averageSpeedInMetersPerSecond")
-        avg_cadence = (
-            raw_activity.get("averageRunCadenceInStepsPerMinute")
-            or raw_activity.get("averageBikingCadenceInRevPerMinute")
-            or raw_activity.get("averageSwimCadenceInStrokesPerMinute")
-        )
-
-        detail = EventRecordDetailCreate(
-            record_id=record_id,
-            distance=Decimal(str(distance)) if distance is not None else None,
-            energy_burned=Decimal(str(calories)) if calories is not None else None,
-            energy_series=WORKOUT_ENERGY_SERIES,
-            heart_rate_avg=Decimal(str(avg_hr)) if avg_hr is not None else None,
-            heart_rate_max=max_hr,
-            total_elevation_gain=Decimal(str(elevation_gain)) if elevation_gain is not None else None,
-            average_speed=Decimal(str(avg_speed)) if avg_speed is not None else None,
-            average_cadence=Decimal(str(avg_cadence)) if avg_cadence is not None else None,
-        )
-
-        return record, detail
-
     def _build_activity_samples(
         self,
         user_id: UUID,
@@ -1145,27 +1172,6 @@ class Garmin247Data(Base247DataTemplate):
                     )
                 )
         return result
-
-    def save_activity_data(
-        self,
-        db: DbSession,
-        user_id: UUID,
-        raw_activity: dict[str, Any],
-    ) -> int:
-        """Save activity data as EventRecord with WorkoutDetails."""
-        result = self._build_activity_record(user_id, raw_activity)
-        if not result:
-            return 0
-
-        record, detail = result
-        try:
-            created_record = event_record_service.create(db, record)
-            detail.record_id = created_record.id
-            event_record_service.create_detail(db, detail, detail_type=EventCategory.WORKOUT)
-            return 1
-        except Exception as e:
-            logger.debug("Activity may already exist", provider="garmin", user_id=str(user_id), error=str(e))
-            return 0
 
     # -------------------------------------------------------------------------
     # Stress Data - /wellness-api/rest/stressDetails
@@ -1676,11 +1682,13 @@ class Garmin247Data(Base247DataTemplate):
         zone_offset = offset_to_iso(raw_moveiq.get("startTimeOffsetInSeconds"))
 
         activity_type = raw_moveiq.get("activityType", "unknown")
+        subtype = raw_moveiq.get("activitySubType")
 
         return EventRecordCreate(
             id=uuid4(),
             category=EventCategory.ACTIVITY,
             type=f"moveiq_{activity_type.lower()}",
+            subtype=subtype.lower() if isinstance(subtype, str) and subtype else None,
             source_name="Garmin Move IQ",
             device_model=None,
             duration_seconds=duration,
@@ -1753,36 +1761,45 @@ class Garmin247Data(Base247DataTemplate):
         return record, detail
 
     def _save_fit_workout_fields(
-        self,
-        db: DbSession,
-        user_id: UUID,
-        activity_id: str,
-        segments: list[dict],
-        hr_zones: dict | None = None,
-        power_zones: dict | None = None,
-    ) -> None:
-        """Update workout_details fields derived from the FIT file.
-
-        No-op if the event_record doesn't exist yet (activityFiles arrived before
-        activityDetails). activityDetails is always processed first within the same
-        webhook because WELLNESS_TYPES orders it before activityFiles.
-        """
-        record = self.event_record_repo.get_by_external_id(db, user_id, activity_id, source=self.provider_name)
-        if record is None:
+        self, db: DbSession, user_id: UUID, activity_id: str, fit: FitParseResult
+    ) -> tuple[EventRecordCreate, EventRecordDetailCreate] | None:
+        """Fill the stored workout's fields from its FIT file, or, with none stored yet, return the workout the file's
+        sessions stand for, for the push to create; its activities and activityDetails pushes fill in the rest."""
+        fields: dict[str, Any] = {"segments": fit.segments}
+        if fit.hr_zones is not None:
+            fields["hr_zones"] = fit.hr_zones.model_dump()
+        if fit.power_zones is not None:
+            fields["power_zones"] = fit.power_zones.model_dump()
+        fields.update(fit.session)
+        record = event_record_service.lock_stored_workouts(db, user_id, self.provider_name, [activity_id]).get(
+            activity_id
+        )
+        if record is not None:
+            self.event_record_detail_repo.update_workout_fields(db, record.id, fields)
+            return None
+        if fit.workout is None:
             logger.warning(
-                "No event_record found for activityFiles — FIT workout fields not saved",
+                "FIT file pushed before its workout has no session to stand for it, FIT workout fields not saved",
                 provider="garmin",
                 task="_save_fit_workout_fields",
                 user_id=str(user_id),
                 activity_id=activity_id,
             )
-            return
-        fields: dict = {"segments": segments}
-        if hr_zones is not None:
-            fields["hr_zones"] = hr_zones
-        if power_zones is not None:
-            fields["power_zones"] = power_zones
-        self.event_record_detail_repo.update_workout_fields(db, record.id, fields)
+            return None
+        workout = EventRecordCreate(
+            id=uuid4(),
+            category=EventCategory.WORKOUT,
+            type=get_unified_workout_type(fit.workout.sport).value if fit.workout.sport else None,
+            source_name="Garmin",
+            device_model=None,
+            duration_seconds=int((fit.workout.end - fit.workout.start).total_seconds()),
+            start_datetime=fit.workout.start,
+            end_datetime=fit.workout.end,
+            external_id=activity_id,
+            source=self.provider_name,
+            user_id=user_id,
+        )
+        return workout, EventRecordDetailCreate(record_id=workout.id, **fields)
 
     # -------------------------------------------------------------------------
     # Batch Processing (for webhook handlers)
@@ -1816,8 +1833,11 @@ class Garmin247Data(Base247DataTemplate):
         all_sleep_details: list[EventRecordDetailCreate] = []
         all_mct_details: list[MenstrualCycleDetailCreate] = []
         all_health_scores: list[HealthScoreCreate] = []
-        body_battery_peaks: list[HealthScoreCreate] = []
+        night_scores: list[tuple[EventRecordCreate | None, HealthScoreCreate]] = []
+        # A night is one sleep summary: re-sent under its summaryId, it updates the stored night whatever its span
+        nights: dict[str, tuple[EventRecordCreate, EventRecordDetailCreate]] = {}
         epoch_items: list[dict[str, Any]] = []
+        fit_workouts: list[tuple[str, FitParseResult]] = []
 
         for item in items:
             try:
@@ -1837,7 +1857,7 @@ class Garmin247Data(Base247DataTemplate):
                     case "stressDetails":
                         all_samples.extend(self._build_stress_samples(user_id, item))
                         if score := self._normalize_body_battery_health_score(user_id, item):
-                            body_battery_peaks.append(score)
+                            all_health_scores.append(score)
                     case "allDayRespiration":
                         all_samples.extend(self._build_respiration_samples(user_id, item))
                     case "pulseox":
@@ -1857,10 +1877,13 @@ class Garmin247Data(Base247DataTemplate):
                         result = self._build_sleep_record(user_id, normalized)
                         if result:
                             record, detail = result
-                            all_records.append(record)
-                            all_sleep_details.append(detail)
+                            if record.external_id:
+                                nights[record.external_id] = (record, detail)
+                            else:
+                                all_records.append(record)
+                                all_sleep_details.append(detail)
                         if health_score:
-                            all_health_scores.append(health_score)
+                            night_scores.append((result[0] if result else None, health_score))
                         for raw_nap in normalized.get("naps", []):
                             nap_result = self._build_nap_record(
                                 raw_nap, user_id, normalized.get("garmin_summary_id"), normalized.get("validation")
@@ -1869,16 +1892,11 @@ class Garmin247Data(Base247DataTemplate):
                                 nap_record, nap_detail = nap_result
                                 all_records.append(nap_record)
                                 all_sleep_details.append(nap_detail)
-                    case "activities":
-                        result = self._build_activity_record(user_id, item)
-                        if result:
-                            record, detail = result
-                            all_records.append(record)
-                            all_workout_details.append(detail)
+                        all_samples.extend(self._build_sleep_vitals_samples(user_id, item))
                     case "activityDetails":
-                        # activityDetails items nest summary data one level deeper.
-                        result = self._build_activity_record(user_id, item.get("summary", {}))
-                        if result:
+                        summary = item.get("summary") or {}
+                        identified = {**summary, "activityId": summary.get("activityId") or item.get("activityId")}
+                        if result := activity_workout(identified, user_id):
                             record, detail = result
                             all_records.append(record)
                             all_workout_details.append(detail)
@@ -1943,25 +1961,14 @@ class Garmin247Data(Base247DataTemplate):
                                 error=str(e),
                             )
                             continue
-                        if fit_result.segments or fit_result.hr_zones or fit_result.power_zones:
-                            try:
-                                self._save_fit_workout_fields(
-                                    db,
-                                    user_id,
-                                    activity_id,
-                                    fit_result.segments,
-                                    hr_zones=fit_result.hr_zones.model_dump() if fit_result.hr_zones else None,
-                                    power_zones=fit_result.power_zones.model_dump() if fit_result.power_zones else None,
-                                )
-                            except Exception as e:
-                                logger.warning(
-                                    "Failed to save FIT workout fields",
-                                    provider="garmin",
-                                    task="process_items_batch",
-                                    user_id=str(user_id),
-                                    activity_id=activity_id,
-                                    error=str(e),
-                                )
+                        if activity_id and (
+                            fit_result.workout
+                            or fit_result.segments
+                            or fit_result.hr_zones
+                            or fit_result.power_zones
+                            or fit_result.session
+                        ):
+                            fit_workouts.append((activity_id, fit_result))
                         fit_samples: list[TimeSeriesSampleCreate] = []
                         if settings.ingest_workout_samples:
                             fit_samples = [
@@ -1999,10 +2006,65 @@ class Garmin247Data(Base247DataTemplate):
                     error=str(e),
                 )
 
+        # In activity id order, as each one locks its workout until the batch commits
+        for activity_id, fit_result in sorted(fit_workouts, key=itemgetter(0)):
+            try:
+                with db.begin_nested():
+                    workout = self._save_fit_workout_fields(db, user_id, activity_id, fit_result)
+            except Exception as e:
+                # A value the database rejects is a fault of the file, like a bad file. Any other database error
+                # fails the push, so that its task retries it.
+                if isinstance(e, SQLAlchemyError) and not isinstance(e, DataError):
+                    raise
+                logger.warning(
+                    "Failed to save FIT workout fields",
+                    provider="garmin",
+                    task="process_items_batch",
+                    user_id=str(user_id),
+                    activity_id=activity_id,
+                    error=str(e),
+                )
+                continue
+            if workout:
+                all_records.append(workout[0])
+                all_workout_details.append(workout[1])
+
         if epoch_items:
             all_samples.extend(self._build_epochs_samples(user_id, self.normalize_epochs(epoch_items, user_id, db)))
 
         count = WriteCounts(0, 0)
+
+        if nights:
+            stored_nights = self.event_record_repo.get_main_sleeps_by_external_ids(
+                db, user_id, nights, self.provider_name
+            )
+            for summary_id, (record, detail) in nights.items():
+                if not (versions := stored_nights.get(summary_id)):
+                    all_records.append(record)
+                    all_sleep_details.append(detail)
+                    continue
+                if len(versions) > 1:
+                    logger.warning(
+                        "Garmin night stored more than once, updating the latest",
+                        provider="garmin",
+                        user_id=str(user_id),
+                        summary_id=summary_id,
+                        record_ids=[str(version.id) for version in versions],
+                    )
+                try:
+                    with db.begin_nested():
+                        event_record_service.refresh_sleep(db, user_id, versions[0], record, detail)
+                except IntegrityError as e:
+                    logger.warning(
+                        "Re-sent Garmin night not updated, another record holds its span",
+                        provider="garmin",
+                        user_id=str(user_id),
+                        summary_id=summary_id,
+                        record_id=str(versions[0].id),
+                        error=str(e),
+                    )
+                    continue
+                count += WriteCounts(0, 1)
 
         # Single bulk insert for SeriesSample
         if all_samples:
@@ -2010,7 +2072,14 @@ class Garmin247Data(Base247DataTemplate):
 
         # Single bulk insert for EventRecords
         if all_records:
-            inserted_ids = event_record_service.bulk_create(db, all_records)
+            # A workout is its Garmin activity id: one already stored takes what this push carries, whichever of
+            # its pushes (activities, activityDetails, its FIT file) came first
+            details = {d.record_id: d for d in all_workout_details}
+            created, updated = event_record_service.save_workouts(
+                db, user_id, self.provider_name, [(r, details[r.id]) for r in all_records if r.id in details]
+            )
+            count += WriteCounts(len(created), len(updated))
+            inserted_ids = event_record_service.bulk_create(db, [r for r in all_records if r.id not in details])
             db.flush()
 
             inserted_set = set(inserted_ids)
@@ -2020,11 +2089,6 @@ class Garmin247Data(Base247DataTemplate):
             if sleep_details:
                 event_record_service.bulk_create_details(db, sleep_details, detail_type=EventCategory.SLEEP)
 
-            # Bulk create workout details for actually inserted records
-            workout_details = [d for d in all_workout_details if d.record_id in inserted_set]
-            if workout_details:
-                event_record_service.bulk_create_details(db, workout_details, detail_type=EventCategory.WORKOUT)
-
             # Bulk create MCT details for actually inserted records
             mct_details = [d for d in all_mct_details if d.record_id in inserted_set]
             if mct_details:
@@ -2032,14 +2096,65 @@ class Garmin247Data(Base247DataTemplate):
 
             count += WriteCounts(len(inserted_ids), 0)
 
-        if all_health_scores:
-            count += health_score_service.bulk_create(db, all_health_scores)
+        if night_scores:
+            count += self._save_night_scores(db, user_id, night_scores)
+
+        # Garmin re-sends a day as it goes on: its stress is replaced, while Body Battery is the day's peak, which
+        # a later push raises and the dailies only add components to
+        peaks = [s for s in all_health_scores if s.category == HealthScoreCategory.BODY_BATTERY]
+        if scores := [s for s in all_health_scores if s.category != HealthScoreCategory.BODY_BATTERY]:
+            count += health_score_service.bulk_upsert(db, scores)
             db.commit()
-        if body_battery_peaks:
-            # A day may already hold a lower peak from an earlier push
-            count += health_score_service.bulk_create_keeping_highest(db, body_battery_peaks)
+        if peaks:
+            count += health_score_service.bulk_create_keeping_highest(db, peaks)
             db.commit()
 
+        return count
+
+    def _save_night_scores(
+        self, db: DbSession, user_id: UUID, night_scores: list[tuple[EventRecordCreate | None, HealthScoreCreate]]
+    ) -> WriteCounts:
+        """Each SLEEP score on its stored night: a re-sent night is not inserted again, so it is found by its
+        summary id and span, and its score is refreshed in place. A score whose night is not found is stored
+        unlinked, as before scores were linked."""
+        stored = self.event_record_repo.get_ids_by_external_span(
+            db,
+            user_id,
+            [(record.external_id, record.start_datetime, record.end_datetime) for record, _ in night_scores if record],
+            self.provider_name,
+        )
+        count = WriteCounts(0, 0)
+        unlinked: list[HealthScoreCreate] = []
+        for record, score in night_scores:
+            if (
+                record is None
+                or (record_id := stored.get((record.external_id, record.start_datetime, record.end_datetime))) is None
+            ):
+                unlinked.append(score)
+                continue
+            try:
+                with db.begin_nested():
+                    saved = health_score_service.upsert_event_score(
+                        db, score.model_copy(update={"event_record_id": record_id})
+                    )
+            except (ValueError, IntegrityError) as e:
+                logger.warning(
+                    "Sleep score not linked to its night",
+                    provider="garmin",
+                    user_id=str(user_id),
+                    summary_id=record.external_id,
+                    error=str(e),
+                )
+                continue
+            count += WriteCounts(1, 0) if saved.id == score.id else WriteCounts(0, 1)
+        if unlinked:
+            logger.info(
+                "Sleep scores stored without their night",
+                provider="garmin",
+                user_id=str(user_id),
+                recorded_at=[score.recorded_at.isoformat() for score in unlinked],
+            )
+            count += health_score_service.bulk_create(db, unlinked)
         return count
 
     # -------------------------------------------------------------------------

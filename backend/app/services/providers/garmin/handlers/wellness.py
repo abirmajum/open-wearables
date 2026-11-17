@@ -8,6 +8,8 @@ import logging
 from typing import Any
 from uuid import UUID
 
+from sqlalchemy.exc import SQLAlchemyError
+
 from app.database import DbSession
 from app.repositories import UserConnectionRepository
 from app.repositories.data_point_series_repository import WriteCounts
@@ -94,6 +96,9 @@ def process_wellness_items(
         try:
             with sync_run_context(SyncRunContext(run_id=run_id, source=sync_source, scope=SyncScope.LIVE)):
                 count = garmin_247.process_items_batch(db, uid, summary_type, items)
+            # Each batch commits on its own, so its workout locks are never held while another batch downloads
+            # FIT files or locks another user's workouts.
+            db.commit()
             total_saved += count
             synced_user_ids.add(uid)
             succeeded_users.append(str(uid))
@@ -123,6 +128,10 @@ def process_wellness_items(
                 },
             )
         except Exception as e:
+            db.rollback()
+            if isinstance(e, SQLAlchemyError):
+                # The push fails, so that its task retries it
+                raise
             logger.error(
                 "Error processing wellness data",
                 provider="garmin",

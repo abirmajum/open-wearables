@@ -91,6 +91,9 @@ The `types` parameter in the timeseries endpoint accepts the following values:
 | `flights_climbed` | count | Floors/flights climbed |
 | `active_time` | minutes | Provider-reported daily active (non-sedentary) time |
 | `total_energy` | kcal | Total energy (active + basal) from providers that don't report the split, e.g. Whoop |
+| `sedentary_time` | minutes | Provider-reported daily inactive (sedentary) time, e.g. Ultrahuman |
+| `moderate_intensity_time` | minutes | Provider-reported daily moderate intensity minutes, e.g. Garmin |
+| `vigorous_intensity_time` | minutes | Provider-reported daily vigorous intensity minutes, e.g. Garmin |
 
 ### Activity - Distance
 
@@ -340,11 +343,12 @@ Besides timeseries and workouts, the API returns these record types:
 | `/events/sleep` | Sleep sessions with stage totals and, with `?include=stages`, stage intervals |
 | `/events/meals` | Meals with calories, macros and per-nutrient values (the `dietary_*` types above) |
 | `/events/menstrual-cycles` | Menstrual cycle records (cycle day, phase, period and cycle length) |
+| `/events/activities` | Activities the device detected by itself outside a recorded workout, such as Garmin Move IQ walks (type, start, end, duration) |
 | `/summaries/activity`, `/summaries/sleep`, `/summaries/recovery` | Per-day rollups |
 | `/summaries/body` | Current snapshot: latest slow-changing values (weight, body fat, ...), vitals averaged over `average_period` days, and readings from the last `latest_window_hours` |
 | `/health-scores` | Provider and Open Wearables scores |
 
-Health scores use these categories: `sleep`, `recovery`, `readiness`, `activity`, `stress`, `resilience`, `body_battery`, `strain`. See [Health Scores](/scores/health-scores) for how each one is sourced.
+Health scores use these categories: `sleep`, `recovery`, `readiness`, `activity`, `stress`, `resilience`, `body_battery`, `strain`, `movement_index`, `metabolic`. See [Health Scores](/scores/health-scores) for how each one is sourced.
 
 ---
 

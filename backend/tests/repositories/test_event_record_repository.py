@@ -581,3 +581,30 @@ class TestFindAdjacentSleepRecord:
         oura = self._night(user, "com.ouraring.oura", hours_later=1)
 
         assert self._adjacent(db, user, None) == oura
+
+
+class TestBulkUpsertMeals:
+    def test_more_meals_than_one_statement_can_bind_are_all_stored(self, db: Session) -> None:
+        """A meal row binds 11 parameters, so 6,000 meals exceed PostgreSQL's 65,535 in one statement."""
+        user = UserFactory()
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        meals = [
+            EventRecordCreate(
+                id=uuid4(),
+                user_id=user.id,
+                source="apple",
+                category="meal",
+                type="meal",
+                source_name="Food Log",
+                external_id=f"meal-{i}",
+                start_datetime=start + timedelta(minutes=i),
+                end_datetime=start + timedelta(minutes=i),
+            )
+            for i in range(6_000)
+        ]
+
+        stored = EventRecordRepository(EventRecord).bulk_upsert_meals(db, meals)
+
+        assert len(stored) == 6_000
+        assert all(is_inserted for _, is_inserted in stored.values())
+        assert db.query(EventRecord).filter(EventRecord.category == "meal").count() == 6_000

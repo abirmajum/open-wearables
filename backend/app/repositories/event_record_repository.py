@@ -1,5 +1,5 @@
 import contextlib
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from uuid import UUID
@@ -60,6 +60,19 @@ from app.schemas.model_crud.activities import (
 from app.schemas.sync_status import DataTypeKind
 from app.utils.dates import local_date
 from app.utils.pagination import decode_cursor
+from app.utils.structured_logging import get_logger
+
+logger = get_logger(__name__)
+
+# PostgreSQL's limit on bind parameters in one statement
+_MAX_BIND_PARAMS = 65_535
+
+
+def _param_chunks[T](rows: list[T], columns: int) -> Iterator[list[T]]:
+    """``rows`` in slices whose ``columns`` bound parameters per row stay under PostgreSQL's limit."""
+    size = _MAX_BIND_PARAMS // columns
+    for i in range(0, len(rows), size):
+        yield rows[i : i + size]
 
 
 def _nap_condition(is_nap: bool) -> ColumnElement[bool]:
@@ -178,21 +191,121 @@ class EventRecordRepository(
             .one_or_none()
         )
 
+    @staticmethod
+    def lock_workouts(db_session: DbSession, user_id: UUID, provider: str, external_ids: Iterable[str]) -> None:
+        """Hold these workout ids of the user until the transaction ends.
+
+        The pushes of one workout file it under different data sources (its FIT file under no device, its summaries
+        under the device), so no unique index stops two of them inserting it at once. Ids are taken in one order, so
+        two pushes sharing several ids cannot deadlock.
+        """
+        for external_id in sorted({external_id for external_id in external_ids if external_id}):
+            db_session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+                {"key": f"{provider}-workout:{user_id}:{external_id}"},
+            )
+
     def get_by_external_ids(
-        self, db_session: DbSession, user_id: UUID, external_ids: Iterable[str], provider: str | None = None
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        external_ids: Iterable[str],
+        provider: str | None = None,
+        category: EventCategory | None = None,
     ) -> dict[str, EventRecord]:
-        """The user's records carrying these provider ids, in one query, by external id."""
+        """The user's records carrying these provider ids, in one query, by external id; of an id stored more than
+        once, the copy that :meth:`get_copies_by_external_ids` lists first."""
+        copies = self.get_copies_by_external_ids(db_session, user_id, external_ids, provider, category)
+        if repeated := {
+            external_id: [str(record.id) for record, _ in records]
+            for external_id, records in copies.items()
+            if len(records) > 1
+        }:
+            logger.warning(
+                "Records stored more than once under one id, using the first",
+                provider=provider,
+                user_id=str(user_id),
+                record_ids=repeated,
+            )
+        return {external_id: records[0][0] for external_id, records in copies.items()}
+
+    def get_copies_by_external_ids(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        external_ids: Iterable[str],
+        provider: str | None = None,
+        category: EventCategory | None = None,
+    ) -> dict[str, list[tuple[EventRecord, str | None]]]:
+        """Every record of the user under each of these provider ids, with its source's device model: the copy
+        under a device first, then by start and id, so every lookup takes the same one."""
         ids = list({external_id for external_id in external_ids if external_id})
         if not ids:
             return {}
         query = (
-            db_session.query(self.model)
+            db_session.query(self.model, DataSource.device_model)
             .join(DataSource, self.model.data_source_id == DataSource.id)
             .filter(DataSource.user_id == user_id, self.model.external_id.in_(ids))
+            .order_by(DataSource.device_model.is_(None), self.model.start_datetime, self.model.id)
         )
         if provider is not None:
             query = query.filter(DataSource.provider == provider)
-        return {record.external_id: record for record in query if record.external_id}
+        if category is not None:
+            query = query.filter(self.model.category == category)
+        copies: dict[str, list[tuple[EventRecord, str | None]]] = {}
+        for record, device_model in query:
+            if record.external_id:
+                copies.setdefault(record.external_id, []).append((record, device_model))
+        return copies
+
+    def get_main_sleeps_by_external_ids(
+        self, db_session: DbSession, user_id: UUID, external_ids: Iterable[str], provider: str
+    ) -> dict[str, list[EventRecord]]:
+        """The user's main sleeps of this provider under each id, latest end first; naps sent under a night's id
+        are left out."""
+        ids = list({external_id for external_id in external_ids if external_id})
+        if not ids:
+            return {}
+        rows = (
+            db_session.query(self.model)
+            .join(DataSource, self.model.data_source_id == DataSource.id)
+            .filter(
+                DataSource.user_id == user_id,
+                DataSource.provider == provider,
+                self.model.category == EventCategory.SLEEP,
+                self.model.external_id.in_(ids),
+                _nap_condition(False),
+            )
+            .order_by(self.model.end_datetime.desc(), self.model.id)
+        )
+        nights: dict[str, list[EventRecord]] = {}
+        for record in rows:
+            if record.external_id:
+                nights.setdefault(record.external_id, []).append(record)
+        return nights
+
+    def get_ids_by_external_span(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        spans: Iterable[tuple[str | None, datetime, datetime]],
+        provider: str,
+    ) -> dict[tuple[str | None, datetime, datetime], UUID]:
+        """The user's records of this provider by (external id, start, end): a night and the naps sent under its id
+        stay apart."""
+        keys = list({span for span in spans if span[0]})
+        if not keys:
+            return {}
+        rows = (
+            db_session.query(self.model.id, self.model.external_id, self.model.start_datetime, self.model.end_datetime)
+            .join(DataSource, self.model.data_source_id == DataSource.id)
+            .filter(
+                DataSource.user_id == user_id,
+                DataSource.provider == provider,
+                tuple_(self.model.external_id, self.model.start_datetime, self.model.end_datetime).in_(keys),
+            )
+        )
+        return {(external_id, start, end): record_id for record_id, external_id, start, end in rows}
 
     def main_sleep_ended_before(
         self, db_session: DbSession, user_id: UUID, at: datetime, within: timedelta, provider: str
@@ -333,6 +446,7 @@ class EventRecordRepository(
                     "data_source_id": source_id,
                     "category": creator.category,
                     "type": creator.type,
+                    "subtype": creator.subtype,
                     "source_name": creator.source_name,
                     "duration_seconds": creator.duration_seconds,
                     "start_datetime": creator.start_datetime,
@@ -355,12 +469,8 @@ class EventRecordRepository(
         if not values_list:
             return []
 
-        # Batch insert with ON CONFLICT DO NOTHING
-        # Chunk to stay under PostgreSQL's 65535 parameter limit (10 params/row → max ~6553 rows)
-        chunk_size = 6_500
         inserted_ids: set[UUID] = set()
-        for i in range(0, len(values_list), chunk_size):
-            chunk = values_list[i : i + chunk_size]
+        for chunk in _param_chunks(values_list, len(values_list[0])):
             stmt = (
                 insert(self.model)
                 .values(chunk)
@@ -425,9 +535,7 @@ class EventRecordRepository(
 
         result: dict[UUID, tuple[UUID, bool]] = {}
         entries = list(values_by_key.values())
-        chunk_size = 6_500
-        for i in range(0, len(entries), chunk_size):
-            chunk = entries[i : i + chunk_size]
+        for chunk in _param_chunks(entries, len(entries[0][1])):
             stmt = insert(self.model).values([values for _, values in chunk])
             stmt = stmt.on_conflict_do_update(
                 index_elements=["data_source_id", "external_id"],

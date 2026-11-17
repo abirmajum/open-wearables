@@ -3,7 +3,7 @@
 import io
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
@@ -66,6 +66,15 @@ _RECORD_FIELD_MAP: tuple[_FieldMapping, ...] = (
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class FitWorkout:
+    """The activity a FIT file records, from its sessions: the span they cover and the first one's sport."""
+
+    start: datetime
+    end: datetime
+    sport: str | None
+
+
 @dataclass
 class FitParseResult:
     samples: list[TimeSeriesSampleCreate] = field(default_factory=list)
@@ -73,6 +82,18 @@ class FitParseResult:
     developer_fields_found: list[str] = field(default_factory=list)
     hr_zones: HRZones | None = None
     power_zones: PowerZones | None = None
+    # Workout detail column → the session's value of it (SESSION_FIELDS)
+    session: dict[str, Decimal] = field(default_factory=dict)
+    workout: FitWorkout | None = None
+
+
+# FIT session field → the workout detail column it fills; the first session carrying it wins (multisport files
+# have one per leg). fitdecode applies the profile's scale, so these arrive as 0.0-5.0 and as load points.
+SESSION_FIELDS: dict[str, str] = {
+    "total_training_effect": "aerobic_training_effect",
+    "total_anaerobic_training_effect": "anaerobic_training_effect",
+    "training_load_peak": "training_load",
+}
 
 
 def parse_fit_file(
@@ -120,6 +141,12 @@ def parse_fit_file(
                 if ref == "session":
                     result.hr_zones = _parse_hr_zones(frame)
                     result.power_zones = _parse_power_zones(frame)
+
+            elif frame.name == "session":
+                for fit_name, column in SESSION_FIELDS.items():
+                    if column not in result.session and (value := _r2(_field_val(frame, fit_name))) is not None:
+                        result.session[column] = Decimal(str(value))
+                result.workout = _widen_workout(result.workout, frame)
 
             elif frame.name in _SEGMENT_KINDS:
                 numeric, enums = _SEGMENT_KINDS[frame.name]
@@ -190,6 +217,19 @@ _SEGMENT_KINDS: dict[str, tuple] = {
     "split": (_SPLIT_NUMERIC, _SPLIT_ENUMS),
     "length": (_LENGTH_NUMERIC, _LENGTH_ENUMS),
 }
+
+
+def _widen_workout(workout: FitWorkout | None, session: fitdecode.FitDataMessage) -> FitWorkout | None:
+    """The workout widened to a session's span; a session without its start or elapsed time adds nothing."""
+    start, elapsed = _field_val(session, "start_time"), _r2(_field_val(session, "total_elapsed_time"))
+    if not isinstance(start, datetime) or elapsed is None:
+        return workout
+    start = start if start.tzinfo else start.replace(tzinfo=timezone.utc)
+    end = start + timedelta(seconds=round(elapsed))
+    if workout is None:
+        sport = _field_val(session, "sport")
+        return FitWorkout(start, end, str(sport) if sport is not None else None)
+    return FitWorkout(min(workout.start, start), max(workout.end, end), workout.sport)
 
 
 def _field_val(frame: fitdecode.FitDataMessage, name: str) -> Any:
