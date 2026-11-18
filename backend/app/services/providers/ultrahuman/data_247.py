@@ -475,7 +475,7 @@ class Ultrahuman247Data(Base247DataTemplate):
     # Recovery Data
     # -------------------------------------------------------------------------
 
-    def normalize_recovery(  # ty:ignore[invalid-method-override]
+    def normalize_recovery(  # ty:ignore[incompatible-method-override]
         self,
         raw_recovery: dict[str, Any],
         user_id: UUID,

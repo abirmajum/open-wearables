@@ -119,7 +119,13 @@ class TestGarminOAuth:
         self, client: TestClient, db: Session, user_id_answer: dict | Exception
     ) -> None:
         user = UserFactory()
-        state = client.get("/api/v1/oauth/garmin/authorize", params={"user_id": str(user.id)}).json()["state"]
+        response = client.get(
+            "/api/v1/oauth/garmin/authorize",
+            params={"user_id": str(user.id)},
+            headers=developer_auth_headers(DeveloperFactory().id),
+        )
+        assert response.status_code == 200
+        state = response.json()["state"]
         token = MagicMock(status_code=200)
         token.json.return_value = {
             "access_token": "fictional-access",

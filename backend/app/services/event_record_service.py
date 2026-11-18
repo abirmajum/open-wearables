@@ -531,6 +531,9 @@ class EventRecordService(
             },
         )
 
+    def lock_workouts(self, db_session: DbSession, user_id: UUID, provider: str, external_ids: Iterable[str]) -> None:
+        self.crud.lock_workouts(db_session, user_id, provider, external_ids)
+
     def lock_stored_workouts(
         self, db_session: DbSession, user_id: UUID, provider: str, external_ids: Iterable[str]
     ) -> dict[str, EventRecord]:
@@ -540,7 +543,7 @@ class EventRecordService(
         device first (see :meth:`_merge_workout_copies`).
         """
         ids = list(external_ids)
-        self.crud.lock_workouts(db_session, user_id, provider, ids)
+        self.lock_workouts(db_session, user_id, provider, ids)
         stored: dict[str, EventRecord] = {}
         for external_id, copies in self.crud.get_copies_by_external_ids(
             db_session, user_id, ids, provider, EventCategory.WORKOUT
@@ -675,12 +678,32 @@ class EventRecordService(
         if not workouts:
             return [], []
         new, updated = self.update_stored_workouts(db_session, user_id, provider, workouts)
-        inserted = set(self.bulk_create(db_session, [record for record, _ in new]))
-        self.bulk_create_details(db_session, [detail for record, detail in new if record.id in inserted])
-        # The same workout twice in one push: the first copy inserted it
-        if repeated := [(record, detail) for record, detail in new if record.id not in inserted]:
+        first_inserted: set[UUID] = set()
+        fallback_inserted: set[UUID] = set()
+        candidates = [record for record, _ in new]
+        inserted_this_round = first_inserted
+        while candidates:
+            first_deliveries = []
+            later_deliveries = []
+            seen: set[str] = set()
+            for record in candidates:
+                if record.external_id:
+                    if record.external_id in seen:
+                        later_deliveries.append(record)
+                        continue
+                    seen.add(record.external_id)
+                first_deliveries.append(record)
+            stored = self.bulk_create(db_session, first_deliveries)
+            inserted_this_round.update(record_id for record_id, stored_id in stored.items() if record_id == stored_id)
+            stored_keys = {record.external_id for record in first_deliveries if record.id in stored}
+            candidates = [record for record in later_deliveries if record.external_id not in stored_keys]
+            inserted_this_round = fallback_inserted
+        inserted = first_inserted | fallback_inserted
+        self.bulk_create_details(db_session, [detail for record, detail in new if record.id in first_inserted])
+        # If an earlier span was occupied, replay details in delivery order onto the later insert.
+        if repeated := [(record, detail) for record, detail in new if record.id not in first_inserted]:
             dropped, again = self.update_stored_workouts(db_session, user_id, provider, repeated)
-            updated += again
+            updated.extend(record_id for record_id in again if record_id not in fallback_inserted)
             if dropped:
                 logger.warning(
                     "Workouts not stored, other records of their sources hold their spans",
@@ -688,6 +711,20 @@ class EventRecordService(
                     user_id=str(user_id),
                     held_by=self._span_holders(db_session, [record for record, _ in dropped]),
                 )
+        if fallback_inserted and svix_service.is_enabled():
+            self._queue_bulk_webhooks(
+                db_session,
+                [
+                    EventRecordDetailCreate.model_validate(detail, from_attributes=True)
+                    for record_id in fallback_inserted
+                    if (
+                        detail := self.event_record_detail_repo.get_by_record_id(
+                            db_session, record_id, EventCategory.WORKOUT
+                        )
+                    )
+                    is not None
+                ],
+            )
         return [record.id for record, _ in new if record.id in inserted], updated
 
     def _span_holders(self, db_session: DbSession, records: list[EventRecordCreate]) -> dict[str, str]:
@@ -1106,7 +1143,7 @@ class EventRecordService(
         self,
         db_session: DbSession,
         records: list[EventRecordCreate],
-    ) -> list[UUID]:
+    ) -> dict[UUID, UUID]:
         """Bulk create event records with batch data source resolution."""
         # Webhooks are not emitted for bulk-created records; they fire from
         # bulk_create_details() when the matching details are inserted.
@@ -1117,10 +1154,21 @@ class EventRecordService(
         db_session: DbSession,
         details: list[EventRecordDetailCreate],
         detail_type: DetailType = EventCategory.WORKOUT,
+        created: set[UUID] | None = None,
     ) -> None:
-        """Bulk create event record details and fire one webhook per detail on commit."""
+        """Bulk create event record details and fire one webhook per detail on commit.
+
+        With created given, only those records fire it; the rest are refreshes of stored records.
+        """
+        # Several deliveries of one workout in a batch resolve to one record; the last one's detail stands
+        details = list({d.record_id: d for d in details}.values())
         self.event_record_detail_repo.bulk_create(db_session, details, detail_type=detail_type)
 
+        if created is not None:
+            details = [d for d in details if d.record_id in created]
+        self._queue_bulk_webhooks(db_session, details)
+
+    def _queue_bulk_webhooks(self, db_session: DbSession, details: list[EventRecordDetailCreate]) -> None:
         if not details or not svix_service.is_enabled():
             return
 

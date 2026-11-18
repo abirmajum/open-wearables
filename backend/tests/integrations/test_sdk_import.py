@@ -5,24 +5,35 @@ Tests the full import flow for Apple HealthKit data via SDK.
 """
 
 import json
-from datetime import datetime, timezone
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 from unittest.mock import MagicMock, patch
 from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy import Engine, text
 from sqlalchemy.orm import Session
 
 from app.constants.celery_tasks import CeleryTask
 from app.constants.series_types.sdk import get_series_type_from_metric_type
-from app.models import DataSource, EventRecord, EventRecordAggregate, MealDetails, SeriesSample, WorkoutDetails
+from app.models import (
+    DataSource,
+    EventRecord,
+    EventRecordAggregate,
+    MealDetails,
+    ProviderPriority,
+    SeriesSample,
+    WorkoutDetails,
+)
 from app.schemas.enums import ProviderName, SeriesType, get_series_type_id
 from app.schemas.enums.series_types import get_series_type_from_id
 from app.schemas.model_crud.activities import EventRecordQueryParams, TimeSeriesQueryParams
 from app.schemas.providers.mobile_sdk import SyncRequest as SDKSyncRequest
 from app.services.event_record_service import event_record_service
-from app.services.sdk.import_service import ImportService
+from app.services.sdk.import_service import ImportService, _parse_sync_request
 from app.services.timeseries_service import timeseries_service
 from tests.factories import DataSourceFactory, EventRecordFactory, UserFactory
 
@@ -435,6 +446,91 @@ class TestAppleSDKImport:
 
         assert result["records_saved"] >= 0
 
+    def test_repeated_workout_uses_previous_span_if_latest_is_occupied(
+        self,
+        db: Session,
+        import_service: ImportService,
+        sample_sdk_payload: dict[str, Any],
+    ) -> None:
+        user = UserFactory()
+        fixed_span = sample_sdk_payload["data"]["workouts"][0]
+        payload = {**SDK_ENVELOPE, "data": {"workouts": [fixed_span]}}
+        assert import_service.load_data(db, payload, str(user.id))["workouts_saved"] == 1
+
+        earlier_end = (datetime.fromisoformat(fixed_span["endDate"]) - timedelta(minutes=1)).isoformat()
+        latest = {
+            **fixed_span,
+            "id": "repeated-workout",
+            "values": [{"type": "distance", "unit": "m", "value": 6000}],
+        }
+        earlier = {**latest, "endDate": earlier_end, "values": [{"type": "distance", "unit": "m", "value": 5000}]}
+        result = import_service.load_data(db, {**SDK_ENVELOPE, "data": {"workouts": [earlier, latest]}}, str(user.id))
+
+        assert result["workouts_saved"] == 1
+        workout = db.query(EventRecord).filter_by(external_id=latest["id"]).one()
+        assert workout.end_datetime == datetime.fromisoformat(earlier_end)
+        detail = db.get(WorkoutDetails, workout.id)
+        assert detail is not None
+        assert detail.distance == Decimal("6000")
+
+    def test_concurrent_workout_batches_do_not_duplicate_a_workout(
+        self, engine: Engine, import_service: ImportService, sample_sdk_payload: dict[str, Any]
+    ) -> None:
+        newest = sample_sdk_payload["data"]["workouts"][0]
+        earlier_end = (datetime.fromisoformat(newest["endDate"]) - timedelta(minutes=1)).isoformat()
+        earlier = {**newest, "endDate": earlier_end}
+        first_payload = {**SDK_ENVELOPE, "data": {"workouts": [newest]}}
+        second_payload = {**SDK_ENVELOPE, "data": {"workouts": [earlier, newest]}}
+        with Session(engine) as setup:
+            had_priority = (
+                setup.query(ProviderPriority).filter_by(provider=ProviderName.APPLE).one_or_none() is not None
+            )
+            user = UserFactory.build()
+            setup.add(user)
+            setup.flush()
+            user_id = user.id
+            setup.commit()
+
+        second_pid: Future[int] = Future()
+
+        def import_second() -> int:
+            with Session(engine) as session:
+                session.execute(text("SET LOCAL lock_timeout = '10s'"))
+                second_pid.set_result(session.execute(text("SELECT pg_backend_pid()")).scalar_one())
+                result = import_service.load_data(session, second_payload, str(user_id))
+                session.commit()
+                return result["workouts_saved"]
+
+        try:
+            with ThreadPoolExecutor(max_workers=1) as worker, Session(engine) as first, engine.connect() as monitor:
+                with patch.object(first, "commit"):
+                    assert import_service.load_data(first, first_payload, str(user_id))["workouts_saved"] == 1
+                second = worker.submit(import_second)
+                pid = second_pid.result(timeout=5)
+                deadline = time.monotonic() + 5
+                while not monitor.execute(
+                    text("SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = :pid AND NOT granted)"), {"pid": pid}
+                ).scalar_one():
+                    assert not second.done()
+                    assert time.monotonic() < deadline, "the second import did not wait on the uncommitted first import"
+                    time.sleep(0.01)
+                first.commit()
+                assert second.result(timeout=5) == 0
+
+            with Session(engine) as check:
+                records = (
+                    check.query(EventRecord)
+                    .join(DataSource)
+                    .filter(DataSource.user_id == user_id, EventRecord.external_id == newest["id"])
+                )
+                assert records.count() == 1
+        finally:
+            with Session(engine) as cleanup:
+                cleanup.execute(text('DELETE FROM "user" WHERE id = :id'), {"id": user_id})
+                if not had_priority:
+                    cleanup.query(ProviderPriority).filter_by(provider=ProviderName.APPLE).delete()
+                cleanup.commit()
+
     def test_raw_timeseries_flags_summable_readings_as_not_daily_totals(
         self,
         db: Session,
@@ -575,6 +671,35 @@ class TestAppleSDKImport:
         assert details is not None
         assert details.steps_count == 4500
         assert details.distance == Decimal("3200")
+
+    def test_last_delivery_of_a_workout_in_one_request_keeps_its_details(
+        self,
+        db: Session,
+        import_service: ImportService,
+    ) -> None:
+        user = UserFactory()
+
+        def delivery(end: str, steps: int) -> dict[str, Any]:
+            return {
+                "id": "ABAB0000-1111-2222-3333-444455556666",
+                "type": "walking",
+                "startDate": "2025-01-29T12:00:00Z",
+                "endDate": end,
+                "source": {"name": "Apple Watch", "bundleIdentifier": "com.apple.health"},
+                "values": [{"type": "stepCount", "unit": "count", "value": steps}],
+            }
+
+        payload = {
+            **SDK_ENVELOPE,
+            "data": {"workouts": [delivery("2025-01-29T12:40:00Z", 4000), delivery("2025-01-29T12:45:00Z", 4500)]},
+        }
+
+        result = import_service.load_data(db, payload, str(user.id))
+
+        assert result["workouts_saved"] == 1
+        workout = db.query(EventRecord).filter(EventRecord.category == "workout").one()
+        details = db.query(WorkoutDetails).filter(WorkoutDetails.record_id == workout.id).one()
+        assert details.steps_count == 4500
 
     def test_import_workout_with_fractional_steps(
         self,
@@ -1179,6 +1304,66 @@ class TestSDKImportUnitConversion:
         assert len(samples) == 1
         assert samples[0].series_type == SeriesType.height
         assert samples[0].value == Decimal("175.2600")
+
+    @pytest.mark.parametrize("metric_type", ["ACTIVITY_INTENSITY_MODERATE", "ACTIVITY_INTENSITY_VIGOROUS"])
+    def test_health_connect_activity_intensity_minutes_are_exercise_time(
+        self,
+        import_service: ImportService,
+        metric_type: str,
+    ) -> None:
+        """Moderate and vigorous minutes are both exercise_time, taken from the record's length, not its value."""
+        record = self._record(metric_type, 999, unit="s") | {
+            "startDate": "2025-04-10T10:00:00Z",
+            "endDate": "2025-04-10T10:25:00Z",
+        }
+        request = self._build_request("health_connect", [record])
+        samples = import_service._build_statistic_bundles(request.data.records, request.provider, str(uuid4()))
+
+        assert len(samples) == 1
+        assert samples[0].series_type == SeriesType.exercise_time
+        assert samples[0].value == Decimal("25")
+
+    @pytest.mark.parametrize("end", ["2025-04-10T09:35:00Z", "2025-04-10T10:00:00Z"])
+    def test_health_connect_activity_intensity_without_minutes_is_dropped(self, end: str) -> None:
+        """A reversed or empty interval holds no minutes; the import reports it as dropped."""
+        intensity = self._record("ACTIVITY_INTENSITY_MODERATE", 999, unit="s") | {
+            "startDate": "2025-04-10T10:00:00Z",
+            "endDate": end,
+        }
+        raw = {
+            "provider": "health_connect",
+            "sdkVersion": "1.0.0",
+            "syncTimestamp": "2025-04-10T12:00:00Z",
+            "data": {"records": [intensity, self._record("STEPS", 100)]},
+        }
+
+        request, dropped = _parse_sync_request(raw)
+
+        assert [record.type for record in request.data.records] == ["STEPS"]
+        assert [(record["collection"], record["index"]) for record in dropped] == [("records", 0)]
+
+    def test_health_connect_moderate_and_vigorous_with_one_start_keep_one_sample(
+        self, db: Session, import_service: ImportService
+    ) -> None:
+        """Both intensities are exercise_time, so the later record from one source with the same start overwrites."""
+        user = UserFactory()
+        moderate = self._record("ACTIVITY_INTENSITY_MODERATE", 0) | {
+            "id": "moderate",
+            "startDate": "2025-04-10T10:00:00Z",
+            "endDate": "2025-04-10T10:30:00Z",
+        }
+        vigorous = self._record("ACTIVITY_INTENSITY_VIGOROUS", 0) | {
+            "id": "vigorous",
+            "startDate": "2025-04-10T10:00:00Z",
+            "endDate": "2025-04-10T10:10:00Z",
+        }
+        payload = {**SDK_ENVELOPE, "provider": "health_connect", "data": {"records": [moderate, vigorous]}}
+
+        import_service.import_data_from_request(db, json.dumps(payload), "application/json", str(user.id))
+
+        stored = db.query(SeriesSample).join(DataSource).filter(DataSource.user_id == user.id).one()
+        assert stored.series_type_definition_id == get_series_type_id(SeriesType.exercise_time)
+        assert (stored.external_id, stored.value) == ("vigorous", Decimal("10"))
 
     @pytest.mark.parametrize(
         ("unit", "expected"),

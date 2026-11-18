@@ -322,7 +322,7 @@ class Garmin247Data(Base247DataTemplate):
         self,
         raw_sleep: dict[str, Any],
         user_id: UUID,
-    ) -> tuple[dict[str, Any], HealthScoreCreate | None]:  # ty:ignore[invalid-method-override]
+    ) -> tuple[dict[str, Any], HealthScoreCreate | None]:  # ty:ignore[incompatible-method-override]
         """Normalize Garmin sleep data to internal schema."""
         start_ts = raw_sleep.get("startTimeInSeconds", 0)
         duration = raw_sleep.get("durationInSeconds", 0)
@@ -2079,10 +2079,10 @@ class Garmin247Data(Base247DataTemplate):
                 db, user_id, self.provider_name, [(r, details[r.id]) for r in all_records if r.id in details]
             )
             count += WriteCounts(len(created), len(updated))
-            inserted_ids = event_record_service.bulk_create(db, [r for r in all_records if r.id not in details])
+            stored = event_record_service.bulk_create(db, [r for r in all_records if r.id not in details])
             db.flush()
 
-            inserted_set = set(inserted_ids)
+            inserted_set = {record_id for record_id, stored_id in stored.items() if record_id == stored_id}
 
             # Bulk create sleep details for actually inserted records
             sleep_details = [d for d in all_sleep_details if d.record_id in inserted_set]
@@ -2094,7 +2094,7 @@ class Garmin247Data(Base247DataTemplate):
             if mct_details:
                 event_record_service.bulk_create_details(db, mct_details, detail_type=EventCategory.MENSTRUAL_CYCLE)  # ty:ignore[invalid-argument-type]
 
-            count += WriteCounts(len(inserted_ids), 0)
+            count += WriteCounts(len(inserted_set), 0)
 
         if night_scores:
             count += self._save_night_scores(db, user_id, night_scores)
@@ -2214,7 +2214,7 @@ class Garmin247Data(Base247DataTemplate):
         self,
         raw_stats: dict[str, Any],
         user_id: UUID,
-    ) -> tuple[dict[str, Any], list[HealthScoreCreate]]:  # ty:ignore[invalid-method-override]
+    ) -> tuple[dict[str, Any], list[HealthScoreCreate]]:  # ty:ignore[incompatible-method-override]
         """Delegate to normalize_dailies."""
         return self.normalize_dailies(raw_stats, user_id)
 
