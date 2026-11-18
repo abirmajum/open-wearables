@@ -5,18 +5,29 @@ Tests the full import flow for Apple HealthKit data via SDK.
 """
 
 import json
-from datetime import datetime, timezone
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 from unittest.mock import MagicMock, patch
 from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy import Engine, text
 from sqlalchemy.orm import Session
 
 from app.constants.celery_tasks import CeleryTask
 from app.constants.series_types.sdk import get_series_type_from_metric_type
-from app.models import DataSource, EventRecord, EventRecordAggregate, MealDetails, SeriesSample, WorkoutDetails
+from app.models import (
+    DataSource,
+    EventRecord,
+    EventRecordAggregate,
+    MealDetails,
+    ProviderPriority,
+    SeriesSample,
+    WorkoutDetails,
+)
 from app.schemas.enums import ProviderName, SeriesType, get_series_type_id
 from app.schemas.enums.series_types import get_series_type_from_id
 from app.schemas.model_crud.activities import EventRecordQueryParams, TimeSeriesQueryParams
@@ -446,7 +457,7 @@ class TestAppleSDKImport:
         payload = {**SDK_ENVELOPE, "data": {"workouts": [fixed_span]}}
         assert import_service.load_data(db, payload, str(user.id))["workouts_saved"] == 1
 
-        earlier_end = "2022-05-29T01:00:00Z"
+        earlier_end = (datetime.fromisoformat(fixed_span["endDate"]) - timedelta(minutes=1)).isoformat()
         latest = {
             **fixed_span,
             "id": "repeated-workout",
@@ -461,6 +472,64 @@ class TestAppleSDKImport:
         detail = db.get(WorkoutDetails, workout.id)
         assert detail is not None
         assert detail.distance == Decimal("6000")
+
+    def test_concurrent_workout_batches_do_not_duplicate_a_workout(
+        self, engine: Engine, import_service: ImportService, sample_sdk_payload: dict[str, Any]
+    ) -> None:
+        newest = sample_sdk_payload["data"]["workouts"][0]
+        earlier_end = (datetime.fromisoformat(newest["endDate"]) - timedelta(minutes=1)).isoformat()
+        earlier = {**newest, "endDate": earlier_end}
+        first_payload = {**SDK_ENVELOPE, "data": {"workouts": [newest]}}
+        second_payload = {**SDK_ENVELOPE, "data": {"workouts": [earlier, newest]}}
+        with Session(engine) as setup:
+            had_priority = (
+                setup.query(ProviderPriority).filter_by(provider=ProviderName.APPLE).one_or_none() is not None
+            )
+            user = UserFactory.build()
+            setup.add(user)
+            setup.flush()
+            user_id = user.id
+            setup.commit()
+
+        second_pid: Future[int] = Future()
+
+        def import_second() -> int:
+            with Session(engine) as session:
+                session.execute(text("SET LOCAL lock_timeout = '10s'"))
+                second_pid.set_result(session.execute(text("SELECT pg_backend_pid()")).scalar_one())
+                result = import_service.load_data(session, second_payload, str(user_id))
+                session.commit()
+                return result["workouts_saved"]
+
+        try:
+            with ThreadPoolExecutor(max_workers=1) as worker, Session(engine) as first, engine.connect() as monitor:
+                with patch.object(first, "commit"):
+                    assert import_service.load_data(first, first_payload, str(user_id))["workouts_saved"] == 1
+                second = worker.submit(import_second)
+                pid = second_pid.result(timeout=5)
+                deadline = time.monotonic() + 5
+                while not monitor.execute(
+                    text("SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = :pid AND NOT granted)"), {"pid": pid}
+                ).scalar_one():
+                    assert not second.done()
+                    assert time.monotonic() < deadline, "the second import did not wait on the uncommitted first import"
+                    time.sleep(0.01)
+                first.commit()
+                assert second.result(timeout=5) == 0
+
+            with Session(engine) as check:
+                records = (
+                    check.query(EventRecord)
+                    .join(DataSource)
+                    .filter(DataSource.user_id == user_id, EventRecord.external_id == newest["id"])
+                )
+                assert records.count() == 1
+        finally:
+            with Session(engine) as cleanup:
+                cleanup.execute(text('DELETE FROM "user" WHERE id = :id'), {"id": user_id})
+                if not had_priority:
+                    cleanup.query(ProviderPriority).filter_by(provider=ProviderName.APPLE).delete()
+                cleanup.commit()
 
     def test_raw_timeseries_flags_summable_readings_as_not_daily_totals(
         self,

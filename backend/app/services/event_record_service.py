@@ -531,6 +531,9 @@ class EventRecordService(
             },
         )
 
+    def lock_workouts(self, db_session: DbSession, user_id: UUID, provider: str, external_ids: Iterable[str]) -> None:
+        self.crud.lock_workouts(db_session, user_id, provider, external_ids)
+
     def lock_stored_workouts(
         self, db_session: DbSession, user_id: UUID, provider: str, external_ids: Iterable[str]
     ) -> dict[str, EventRecord]:
@@ -540,7 +543,7 @@ class EventRecordService(
         device first (see :meth:`_merge_workout_copies`).
         """
         ids = list(external_ids)
-        self.crud.lock_workouts(db_session, user_id, provider, ids)
+        self.lock_workouts(db_session, user_id, provider, ids)
         stored: dict[str, EventRecord] = {}
         for external_id, copies in self.crud.get_copies_by_external_ids(
             db_session, user_id, ids, provider, EventCategory.WORKOUT

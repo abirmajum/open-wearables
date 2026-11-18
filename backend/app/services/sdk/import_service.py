@@ -592,6 +592,14 @@ class ImportService:
         started = time.perf_counter()
         request, dropped = _parse_sync_request(raw)
         validation_ms = round((time.perf_counter() - started) * 1000, 1)
+        if request.data.workouts:
+            # Before any writes, so concurrent batches acquire workout locks before taking data-source locks.
+            self.event_record_service.lock_workouts(
+                db_session,
+                UUID(user_id),
+                request.provider,
+                (workout.id for workout in request.data.workouts if workout.id),
+            )
         workouts_saved = 0
         meals_saved = 0
         records_saved = 0

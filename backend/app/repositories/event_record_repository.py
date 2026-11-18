@@ -195,9 +195,8 @@ class EventRecordRepository(
     def lock_workouts(db_session: DbSession, user_id: UUID, provider: str, external_ids: Iterable[str]) -> None:
         """Hold these workout ids of the user until the transaction ends.
 
-        The pushes of one workout file it under different data sources (its FIT file under no device, its summaries
-        under the device), so no unique index stops two of them inserting it at once. Ids are taken in one order, so
-        two pushes sharing several ids cannot deadlock.
+        Deliveries can use different data sources or times, so the span constraint cannot protect external IDs.
+        Take the locks in a consistent order for batches that share several IDs.
         """
         for external_id in sorted({external_id for external_id in external_ids if external_id}):
             db_session.execute(
