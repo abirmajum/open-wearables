@@ -206,6 +206,8 @@ class Settings(BaseSettings):
     garmin_client_secret: SecretStr | None = None
     garmin_redirect_uri: str | None = None  # Deprecated: use API_BASE_URL
     garmin_default_scope: str = ""  # Scope is managed at app creation in Garmin Developer Portal
+    garmin_fit_retry_max_attempts: int = Field(3, ge=0)
+    garmin_fit_retry_base_delay_seconds: int = Field(300, gt=0)
 
     # POLAR OAUTH SETTINGS
     polar_client_id: str | None = None

@@ -31,6 +31,7 @@ from .garmin.backfill_timeout import (
 from .garmin.backfill_trigger import (
     trigger_backfill_for_type as trigger_garmin_backfill_for_type,
 )
+from .garmin_fit_retry_task import retry_garmin_fit_download
 from .periodic_sync_task import refresh_recent_cycles, sync_all_users
 from .process_aws_upload_task import complete_and_process_aws_upload, process_aws_upload
 from .process_sdk_upload_task import process_sdk_upload
@@ -82,6 +83,7 @@ __all__ = [
     "refresh_recent_cycles",
     "refresh_dashboard_total_data_points",
     "retry_strava_stream_ingest",
+    "retry_garmin_fit_download",
     "generate_seed_data",
     "send_invitation_email_task",
     "process_webhook_push",

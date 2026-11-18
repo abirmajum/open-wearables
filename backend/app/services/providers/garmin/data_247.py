@@ -7,11 +7,13 @@ from operator import itemgetter
 from typing import Any
 from uuid import UUID, uuid4
 
+from celery import current_app as celery_app
 from redis.exceptions import RedisError
 from sqlalchemy import text
 from sqlalchemy.exc import DataError, IntegrityError, SQLAlchemyError
 
 from app.config import settings
+from app.constants.celery_tasks import CeleryTask
 from app.constants.sleep import SleepStageType
 from app.constants.workout_types.garmin import get_unified_workout_type
 from app.database import DbSession
@@ -47,6 +49,7 @@ from app.services.providers.garmin.coverage import (
     SLEEP_SERIES,
 )
 from app.services.providers.garmin.workouts import activity_workout
+from app.services.providers.retry import is_transient_provider_error
 from app.services.providers.sync_247_result import Sync247Result
 from app.services.providers.templates.base_247_data import Base247DataTemplate
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
@@ -56,6 +59,19 @@ from app.utils.dates import offset_to_iso
 from app.utils.structured_logging import get_logger
 
 logger = get_logger(__name__)
+
+
+def schedule_fit_retry(user_id: str, activity_id: str, callback_url: str, attempt: int = 1) -> bool:
+    if attempt > settings.garmin_fit_retry_max_attempts:
+        return False
+    countdown = settings.garmin_fit_retry_base_delay_seconds * 3 ** (attempt - 1)
+    celery_app.send_task(
+        CeleryTask.RETRY_GARMIN_FIT_DOWNLOAD,
+        kwargs={"user_id": user_id, "activity_id": activity_id, "callback_url": callback_url, "attempt": attempt},
+        countdown=countdown,
+    )
+    return True
+
 
 # Series types to skip when parsing FIT files — already present from activityDetails.
 # Derived from ACTIVITY_SAMPLE_SERIES so additions to the map are automatically
@@ -1801,6 +1817,57 @@ class Garmin247Data(Base247DataTemplate):
         )
         return workout, EventRecordDetailCreate(record_id=workout.id, **fields)
 
+    def parse_fit_content(self, fit_bytes: bytes, user_id: UUID, activity_id: str) -> FitParseResult:
+        store_fit_file(provider=self.provider_name, fit_bytes=fit_bytes, user_id=str(user_id), activity_id=activity_id)
+        return parse_fit_file(fit_bytes, user_id, source=self.provider_name)
+
+    def apply_fit_result(
+        self,
+        db: DbSession,
+        user_id: UUID,
+        activity_id: str,
+        fit_result: FitParseResult,
+        records: list[EventRecordCreate],
+        details: list[EventRecordDetailCreate],
+    ) -> None:
+        if not activity_id or not (
+            fit_result.workout
+            or fit_result.segments
+            or fit_result.hr_zones
+            or fit_result.power_zones
+            or fit_result.session
+        ):
+            return
+        with db.begin_nested():
+            workout = self._save_fit_workout_fields(db, user_id, activity_id, fit_result)
+        if workout:
+            records.append(workout[0])
+            details.append(workout[1])
+
+    def fit_samples(self, fit_result: FitParseResult) -> list[TimeSeriesSampleCreate]:
+        if not settings.ingest_workout_samples:
+            return []
+        return [s for s in fit_result.samples if s.series_type not in _ACTIVITY_DETAILS_SERIES_TYPES]
+
+    def retry_fit_download(self, db: DbSession, user_id: UUID, activity_id: str, callback_url: str) -> None:
+        fit_bytes = download_binary_content(
+            db=db,
+            user_id=user_id,
+            connection_repo=self.connection_repo,
+            oauth=self.oauth,
+            provider_name=self.provider_name,
+            url=callback_url,
+            allowed_hosts=GARMIN_FILE_HOSTS,
+        )
+        fit_result = self.parse_fit_content(fit_bytes, user_id, activity_id)
+        records: list[EventRecordCreate] = []
+        details: list[EventRecordDetailCreate] = []
+        self.apply_fit_result(db, user_id, activity_id, fit_result, records, details)
+        if records:
+            event_record_service.save_workouts(db, user_id, self.provider_name, list(zip(records, details)))
+        if samples := self.fit_samples(fit_result):
+            self.data_point_repo.bulk_create(db, samples)
+
     # -------------------------------------------------------------------------
     # Batch Processing (for webhook handlers)
     # -------------------------------------------------------------------------
@@ -1934,8 +2001,13 @@ class Garmin247Data(Base247DataTemplate):
                                 allowed_hosts=GARMIN_FILE_HOSTS,
                             )
                         except Exception as e:
+                            retry = is_transient_provider_error(e) and schedule_fit_retry(
+                                str(user_id), activity_id, callback_url
+                            )
                             logger.warning(
                                 "Failed to download FIT file",
+                                retry=retry,
+                                attempt=1,
                                 provider="garmin",
                                 task="process_items_batch",
                                 user_id=str(user_id),
@@ -1943,14 +2015,8 @@ class Garmin247Data(Base247DataTemplate):
                                 error=str(e),
                             )
                             continue
-                        store_fit_file(
-                            provider=self.provider_name,
-                            fit_bytes=fit_bytes,
-                            user_id=str(user_id),
-                            activity_id=activity_id,
-                        )
                         try:
-                            fit_result = parse_fit_file(fit_bytes, user_id, source=self.provider_name)
+                            fit_result = self.parse_fit_content(fit_bytes, user_id, activity_id)
                         except Exception as e:
                             logger.warning(
                                 "Failed to parse FIT file",
@@ -1969,12 +2035,8 @@ class Garmin247Data(Base247DataTemplate):
                             or fit_result.session
                         ):
                             fit_workouts.append((activity_id, fit_result))
-                        fit_samples: list[TimeSeriesSampleCreate] = []
-                        if settings.ingest_workout_samples:
-                            fit_samples = [
-                                s for s in fit_result.samples if s.series_type not in _ACTIVITY_DETAILS_SERIES_TYPES
-                            ]
-                            all_samples.extend(fit_samples)
+                        fit_samples = self.fit_samples(fit_result)
+                        all_samples.extend(fit_samples)
                         logger.info(
                             "Parsed FIT file",
                             provider="garmin",
@@ -2009,8 +2071,7 @@ class Garmin247Data(Base247DataTemplate):
         # In activity id order, as each one locks its workout until the batch commits
         for activity_id, fit_result in sorted(fit_workouts, key=itemgetter(0)):
             try:
-                with db.begin_nested():
-                    workout = self._save_fit_workout_fields(db, user_id, activity_id, fit_result)
+                self.apply_fit_result(db, user_id, activity_id, fit_result, all_records, all_workout_details)
             except Exception as e:
                 # A value the database rejects is a fault of the file, like a bad file. Any other database error
                 # fails the push, so that its task retries it.
@@ -2025,9 +2086,6 @@ class Garmin247Data(Base247DataTemplate):
                     error=str(e),
                 )
                 continue
-            if workout:
-                all_records.append(workout[0])
-                all_workout_details.append(workout[1])
 
         if epoch_items:
             all_samples.extend(self._build_epochs_samples(user_id, self.normalize_epochs(epoch_items, user_id, db)))
