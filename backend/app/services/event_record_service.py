@@ -675,7 +675,16 @@ class EventRecordService(
         if not workouts:
             return [], []
         new, updated = self.update_stored_workouts(db_session, user_id, provider, workouts)
-        inserted = set(self.bulk_create(db_session, [record for record, _ in new]))
+        first_deliveries = []
+        seen: set[str] = set()
+        for record, _ in new:
+            if record.external_id:
+                if record.external_id in seen:
+                    continue
+                seen.add(record.external_id)
+            first_deliveries.append(record)
+        stored = self.bulk_create(db_session, first_deliveries)
+        inserted = {record_id for record_id, stored_id in stored.items() if record_id == stored_id}
         self.bulk_create_details(db_session, [detail for record, detail in new if record.id in inserted])
         # The same workout twice in one push: the first copy inserted it
         if repeated := [(record, detail) for record, detail in new if record.id not in inserted]:
@@ -1106,7 +1115,7 @@ class EventRecordService(
         self,
         db_session: DbSession,
         records: list[EventRecordCreate],
-    ) -> list[UUID]:
+    ) -> dict[UUID, UUID]:
         """Bulk create event records with batch data source resolution."""
         # Webhooks are not emitted for bulk-created records; they fire from
         # bulk_create_details() when the matching details are inserted.
@@ -1117,10 +1126,18 @@ class EventRecordService(
         db_session: DbSession,
         details: list[EventRecordDetailCreate],
         detail_type: DetailType = EventCategory.WORKOUT,
+        created: set[UUID] | None = None,
     ) -> None:
-        """Bulk create event record details and fire one webhook per detail on commit."""
+        """Bulk create event record details and fire one webhook per detail on commit.
+
+        With created given, only those records fire it; the rest are refreshes of stored records.
+        """
+        # Several deliveries of one workout in a batch resolve to one record; the last one's detail stands
+        details = list({d.record_id: d for d in details}.values())
         self.event_record_detail_repo.bulk_create(db_session, details, detail_type=detail_type)
 
+        if created is not None:
+            details = [d for d in details if d.record_id in created]
         if not details or not svix_service.is_enabled():
             return
 

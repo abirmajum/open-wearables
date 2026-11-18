@@ -11,7 +11,7 @@ from psycopg.errors import ForeignKeyViolation, NotNullViolation
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.models import EventRecord
+from app.models import EventRecord, WorkoutDetails
 from app.repositories.event_record_repository import EventRecordRepository
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.schemas.enums import EntrySource, SeriesType, WorkoutType
@@ -82,6 +82,26 @@ class TestGarminWorkouts:
             params = call_args[1]["params"]
             assert params["uploadStartTimeInSeconds"] == int(start_date.timestamp())
             assert params["uploadEndTimeInSeconds"] == int(end_date.timestamp())
+
+    def test_same_batch_workout_deliveries_keep_complementary_details(
+        self, garmin_workouts: GarminWorkouts, db: Session, sample_activity: dict[str, Any]
+    ) -> None:
+        user = UserFactory()
+        summary = GarminActivityJSON.model_validate(sample_activity)
+        revised = GarminActivityJSON.model_validate(
+            sample_activity | {"steps": None, "distanceInMeters": 10500, "durationInSeconds": 3700}
+        )
+
+        saved = garmin_workouts.process_push_activities(db, [summary, revised], user.id)
+
+        assert len(set(saved)) == 1
+        record = db.get(EventRecord, saved[0])
+        detail = db.get(WorkoutDetails, saved[0])
+        assert record is not None
+        assert record.duration_seconds == 3700
+        assert detail is not None
+        assert detail.steps_count == 8500
+        assert detail.distance_meters == 10500
 
     @pytest.mark.usefixtures("non_utc_process_timezone")
     def test_get_workouts_from_api_keeps_chunks_at_24h_across_dst_change(
