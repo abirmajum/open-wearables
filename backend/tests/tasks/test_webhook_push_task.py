@@ -9,6 +9,7 @@ deliveries with no resolvable user (or from self-reporting Garmin) are dropped.
 from __future__ import annotations
 
 import contextlib
+from decimal import Decimal
 from typing import Any
 from unittest.mock import ANY, MagicMock, patch
 from uuid import UUID, uuid4
@@ -16,13 +17,20 @@ from uuid import UUID, uuid4
 import pytest
 from celery.exceptions import Retry
 from psycopg.errors import CheckViolation, ForeignKeyViolation, NotNullViolation, UniqueViolation
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.orm import Session
 
 import app.integrations.celery.tasks.webhook_push_task as task
+from app.constants.celery_tasks import CeleryQueue, CeleryTask
+from app.models import DataSource, SeriesAggregate
 from app.repositories.data_point_series_repository import WriteCounts
 from app.schemas.sync_status import SyncStatus
+from app.services.providers.oura.data_247 import Oura247Data
+from app.services.providers.oura.strategy import OuraStrategy
 from app.utils.exceptions import (
     AppError,
+    ConfigurationError,
     NotFoundError,
     ProviderAuthRejectedError,
     ProviderError,
@@ -30,6 +38,7 @@ from app.utils.exceptions import (
     ProviderRateLimitError,
     ReauthRequiredError,
 )
+from tests.factories import UserConnectionFactory
 
 
 @pytest.fixture
@@ -179,6 +188,90 @@ def test_upstream_outages_are_retried(exc: ProviderError) -> None:
         _run_with_failing_handler(exc)
 
 
+@pytest.mark.parametrize("outage", ["database", "provider"])
+def test_webhook_persists_after_a_six_minute_outage(db: Session, outage: str) -> None:
+    provider_user_id = "oura-outage-test"
+    connection = UserConnectionFactory(provider="oura", provider_user_id=provider_user_id)
+    payload = {
+        "event_type": "create",
+        "data_type": "daily_spo2",
+        "user_id": provider_user_id,
+        "object_id": "spo2-1",
+    }
+    elapsed = 0
+    recovery_time = 6 * 60
+    db_connection = db.connection()
+
+    def open_session() -> Session:
+        if outage == "database" and elapsed < recovery_time:
+            raise OperationalError(None, None, OSError("database unavailable"))
+        return Session(bind=db_connection, join_transaction_mode="create_savepoint")
+
+    def fetch(*args: Any) -> dict[str, Any]:
+        if outage == "provider" and elapsed < recovery_time:
+            raise ProviderError("oura", upstream_status=503)
+        return {"id": "spo2-1", "day": "2026-01-15", "spo2_percentage": {"average": 97}}
+
+    handler = OuraStrategy().webhooks
+    job = task.process_webhook_push
+    task_id = "accepted-webhook"
+    with (
+        patch("app.services.providers.oura.webhook_handler.celery_app") as celery,
+        patch.object(job, "apply_async") as publish_retry,
+        patch.object(task, "SessionLocal", side_effect=open_session),
+        patch.object(Oura247Data, "_make_api_request", side_effect=fetch),
+        patch.object(task, "randint", side_effect=lambda lower, upper: lower),
+        patch.object(task.sync_status_service, "emit_webhook_delivered"),
+    ):
+        celery.send_task.return_value.id = task_id
+        assert handler.dispatch(db, payload) == {"status": "accepted"}
+        celery.send_task.assert_called_once_with(
+            CeleryTask.PROCESS_WEBHOOK_PUSH, args=["oura", payload, ANY], queue=CeleryQueue.WEBHOOK_SYNC
+        )
+        args = tuple(celery.send_task.call_args.kwargs["args"])
+        original_args = args
+        retries = 0
+        queue = CeleryQueue.WEBHOOK_SYNC
+        while True:
+            publish_retry.reset_mock()
+            job.push_request(
+                id=task_id,
+                args=args,
+                kwargs={},
+                retries=retries,
+                called_directly=False,
+                delivery_info={"exchange": "", "routing_key": queue},
+            )
+            try:
+                result = job.run(*args)
+            except Retry:
+                publish_retry.assert_called_once()
+                args, _ = publish_retry.call_args.args
+                options = publish_retry.call_args.kwargs
+                assert args == original_args
+                assert options["queue"] == CeleryQueue.WEBHOOK_SYNC
+                assert options["retries"] == retries + 1
+                assert 30 <= options["countdown"] <= 180
+                retries = options["retries"]
+                queue = options["queue"]
+                elapsed += options["countdown"]
+            else:
+                publish_retry.assert_not_called()
+                break
+            finally:
+                job.pop_request()
+
+    assert elapsed >= recovery_time
+    assert retries > 3
+    assert result["status"] == "processed"
+    stored = db.scalars(
+        select(SeriesAggregate.avg)
+        .join(DataSource, SeriesAggregate.data_source_id == DataSource.id)
+        .where(DataSource.user_id == connection.user_id, DataSource.provider == "oura")
+    ).one()
+    assert stored == Decimal("97")
+
+
 @pytest.mark.parametrize(("upstream_status", "alerted"), [(400, True), (422, True), (404, False), (410, False)])
 def test_only_a_request_the_provider_refused_alerts_when_skipped(upstream_status: int, alerted: bool) -> None:
     """A 400 or 422 is most likely our bug; a deleted object at the provider is not."""
@@ -197,7 +290,7 @@ def test_last_failed_attempt_reports_that_the_payload_is_lost(exc: ProviderError
     which before_send drops: the line alerts only on that, so nothing is reported twice."""
     task.process_webhook_push.push_request(retries=task.process_webhook_push.max_retries)
     try:
-        with patch.object(task, "logger") as logger, pytest.raises(Retry):
+        with patch.object(task, "logger") as logger, pytest.raises(type(exc)):
             _run_with_failing_handler(exc)
     finally:
         task.process_webhook_push.pop_request()
@@ -225,6 +318,11 @@ def test_unusable_connection_is_dropped_not_retried(exc: Exception) -> None:
     result = _run_with_failing_handler(exc)
 
     assert result == {"status": "skipped", "reason": "non_retriable", "error_type": type(exc).__name__}
+
+
+def test_configuration_error_fails_without_retry() -> None:
+    with pytest.raises(ConfigurationError):
+        _run_with_failing_handler(ConfigurationError("missing credentials"))
 
 
 @pytest.mark.parametrize(
@@ -293,7 +391,7 @@ def test_reauth_required_fails_delivery_without_retry(user_id: str) -> None:
     assert calls[0]["status"] == SyncStatus.FAILED
 
 
-@pytest.mark.parametrize(("retries", "expect_failed"), [(0, False), (3, True)])
+@pytest.mark.parametrize(("retries", "expect_failed"), [(3, False), (task.process_webhook_push.max_retries, True)])
 def test_failed_run_logged_only_when_retries_run_out(retries: int, expect_failed: bool, user_id: str) -> None:
     """A retriable error logs nothing until the last attempt, which is logged FAILED."""
     calls, fake = _capture()
@@ -304,20 +402,22 @@ def test_failed_run_logged_only_when_retries_run_out(retries: int, expect_failed
     with (
         patch.object(task, "SessionLocal"),
         patch.object(task, "ProviderFactory") as factory,
-        patch.object(task.process_webhook_push, "retry", side_effect=RuntimeError("retry")),
+        patch.object(task.process_webhook_push, "retry", side_effect=Retry()) as retry,
         patch.object(task.sync_status_service, "emit_webhook_delivered", side_effect=fake),
     ):
         factory.return_value.get_provider.return_value.webhooks = handler
         task.process_webhook_push.push_request(retries=retries)
         try:
-            with pytest.raises(RuntimeError, match="retry"):
+            with pytest.raises(RuntimeError if expect_failed else Retry):
                 task.process_webhook_push.run("strava", {}, "trace")
         finally:
             task.process_webhook_push.pop_request()
 
     if expect_failed:
+        retry.assert_not_called()
         handler.find_connection.assert_called_once_with(ANY, "athlete-1")
         assert calls[0]["status"] == SyncStatus.FAILED
         assert calls[0]["error"] == "RuntimeError"
     else:
+        retry.assert_called_once()
         assert calls == []

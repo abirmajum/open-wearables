@@ -1,12 +1,6 @@
-"""Celery task for processing full-payload (webhook_stream) provider push events.
+"""Process provider webhook payloads and notifications on their assigned Celery queues."""
 
-A single shared task handles all webhook_stream providers (Garmin, Suunto, …).
-The provider-specific logic lives in each provider's WebhookHandler.process_payload;
-this task is a thin async wrapper providing acks_late and retry guarantees.
-
-Queue and retry policy are configured per-provider at the call site (send_task with queue= kwarg).
-"""
-
+from random import randint
 from typing import Any
 from uuid import UUID
 
@@ -24,6 +18,7 @@ from app.utils.exceptions import (
     INTEGRITY_ERRORS,
     REAUTH_REQUIRED,
     AppError,
+    ConfigurationError,
     ProviderError,
     ReauthRequiredError,
     describe_integrity_error,
@@ -46,6 +41,15 @@ _SYNC_LOG_PROVIDERS = frozenset({"oura", "strava", "polar", "whoop", "suunto"})
 
 # process_payload "status" values that mean data was actually persisted.
 _SAVED_STATUSES = frozenset({"processed", "saved", "accepted", "deleted", "success"})
+
+_RETRY_BASE_SECONDS = 30
+_RETRY_CAP_SECONDS = 180
+
+
+def _retry_countdown(retries: int) -> int:
+    ceiling = min(_RETRY_BASE_SECONDS * 2**retries, _RETRY_CAP_SECONDS)
+    # Jitter spreads a burst of failed deliveries without exhausting retries during a short outage.
+    return randint(max(_RETRY_BASE_SECONDS, ceiling // 2), ceiling)
 
 
 def _extract_item_count(result: dict[str, Any]) -> int | None:
@@ -182,17 +186,14 @@ def _error_attributes(exc: Exception) -> dict[str, str]:
     bind=True,
     acks_late=True,
     reject_on_worker_lost=True,
-    max_retries=3,
-    default_retry_delay=30,
+    max_retries=8,
 )
 def process_webhook_push(
     self: Task, provider_name: str, payload: dict[str, Any], request_trace_id: str
 ) -> dict[str, Any]:
-    """Process a full-payload webhook push event for any webhook_stream provider.
+    """Process an accepted webhook using the provider's handler and a fresh DB session.
 
-    Uses ProviderFactory to resolve the provider's WebhookHandler, then calls
-    process_payload() with a fresh DB session. Retries up to 3 times on
-    unexpected infrastructure errors.
+    Celery reschedules the original payload on the same queue for retryable failures.
     """
     handler = None
     provider_user_id: str | None = None
@@ -209,8 +210,8 @@ def process_webhook_push(
             db.commit()
         _emit_webhook_sync_status(provider_name, result)
         return result
-    except ValueError as exc:
-        # Configuration error (unknown provider, missing handler) — retrying won't help.
+    except (ValueError, ConfigurationError) as exc:
+        # Unknown provider, missing handler or invalid settings won't recover on retry.
         logger.error(
             "Webhook push task aborted — configuration error",
             provider=provider_name,
@@ -267,18 +268,20 @@ def process_webhook_push(
                 attempt=self.request.retries,
             )
             _emit_final_failure(provider_name, handler, provider_user_id, exc)
-        else:
-            logger.warning(
-                "Webhook push task failed, scheduling retry",
-                provider=provider_name,
-                trace_id=request_trace_id,
-                provider_user_id=provider_user_id,
-                upstream_status=exc.upstream_status,
-                error=exc.detail,
-                attempt=self.request.retries,
-                max_retries=self.max_retries,
-            )
-        raise self.retry(exc=exc)
+            raise
+        countdown = _retry_countdown(self.request.retries)
+        logger.warning(
+            "Webhook push task failed, scheduling retry",
+            provider=provider_name,
+            trace_id=request_trace_id,
+            provider_user_id=provider_user_id,
+            upstream_status=exc.upstream_status,
+            error=exc.detail,
+            attempt=self.request.retries,
+            max_retries=self.max_retries,
+            retry_delay_seconds=countdown,
+        )
+        raise self.retry(exc=exc, countdown=countdown) from exc
     except Exception as exc:
         if _is_client_error(exc):
             logger.warning(
@@ -302,6 +305,18 @@ def process_webhook_push(
             )
             _emit_final_failure(provider_name, handler, provider_user_id, exc)
             raise
+        if self.request.retries >= self.max_retries:
+            logger.error(
+                "Webhook push task failed, giving up",
+                provider=provider_name,
+                trace_id=request_trace_id,
+                provider_user_id=provider_user_id,
+                **_error_attributes(exc),
+                attempt=self.request.retries,
+            )
+            _emit_final_failure(provider_name, handler, provider_user_id, exc)
+            raise
+        countdown = _retry_countdown(self.request.retries)
         logger.error(
             "Webhook push task failed, scheduling retry",
             provider=provider_name,
@@ -310,7 +325,6 @@ def process_webhook_push(
             **_error_attributes(exc),
             attempt=self.request.retries,
             max_retries=self.max_retries,
+            retry_delay_seconds=countdown,
         )
-        if self.request.retries >= self.max_retries:
-            _emit_final_failure(provider_name, handler, provider_user_id, exc)
-        raise self.retry(exc=exc)
+        raise self.retry(exc=exc, countdown=countdown) from exc
