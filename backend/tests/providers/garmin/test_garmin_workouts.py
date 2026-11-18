@@ -101,7 +101,7 @@ class TestGarminWorkouts:
         assert record.duration_seconds == 3700
         assert detail is not None
         assert detail.steps_count == 8500
-        assert detail.distance_meters == 10500
+        assert detail.distance == 10500
 
     @pytest.mark.usefixtures("non_utc_process_timezone")
     def test_get_workouts_from_api_keeps_chunks_at_24h_across_dst_change(

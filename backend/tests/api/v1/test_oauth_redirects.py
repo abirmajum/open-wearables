@@ -4,6 +4,7 @@ from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
+import pytest
 from fastapi.testclient import TestClient
 from httpx import Response
 from sqlalchemy.orm import Session
@@ -14,6 +15,8 @@ from app.services.sdk_token_service import create_sdk_user_token
 from app.utils.exceptions import InvalidInputError
 from tests.factories import ApiKeyFactory, DeveloperFactory, UserFactory
 from tests.utils import api_key_headers, developer_auth_headers
+
+pytestmark = pytest.mark.usefixtures("oauth_credentials")
 
 APP_CALLBACK = "openwearables://oauth/callback"
 

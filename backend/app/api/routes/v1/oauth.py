@@ -27,12 +27,15 @@ from app.utils.exceptions import (
     InvalidInputError,
     ProviderNotConfiguredError,
     UnsupportedProviderError,
+    UpstreamError,
     unknown_provider,
 )
 from app.utils.redirect_allowlist import is_allowed_redirect, with_result
+from app.utils.structured_logging import get_logger
 
 router = APIRouter()
 factory = ProviderFactory()
+logger = get_logger(__name__)
 
 
 def resolve_provider(slug: str) -> ProviderName:
@@ -171,6 +174,9 @@ def oauth_callback(
     try:
         oauth_state = strategy.oauth.handle_callback(db, code, state)
     except AppError as exc:
+        if not return_to and isinstance(exc, UpstreamError):
+            raise
+        logger.error("OAuth callback failed", provider=provider_name.value, exc_info=exc)
         return _error_redirect(return_to, provider_name, exc.detail)
 
     # Stamp last_synced_at=now so the first periodic sync uses the connection

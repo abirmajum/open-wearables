@@ -24,6 +24,8 @@ from app.utils.connect_token import create_connect_token
 from tests.factories import ApiKeyFactory, DeveloperFactory, UserFactory
 from tests.utils import api_key_headers, developer_auth_headers
 
+pytestmark = pytest.mark.usefixtures("oauth_credentials")
+
 
 @pytest.fixture
 def auth_headers(db: Session) -> dict[str, str]:
