@@ -675,21 +675,32 @@ class EventRecordService(
         if not workouts:
             return [], []
         new, updated = self.update_stored_workouts(db_session, user_id, provider, workouts)
-        first_deliveries = []
-        seen: set[str] = set()
-        for record, _ in new:
-            if record.external_id:
-                if record.external_id in seen:
-                    continue
-                seen.add(record.external_id)
-            first_deliveries.append(record)
-        stored = self.bulk_create(db_session, first_deliveries)
-        inserted = {record_id for record_id, stored_id in stored.items() if record_id == stored_id}
-        self.bulk_create_details(db_session, [detail for record, detail in new if record.id in inserted])
-        # The same workout twice in one push: the first copy inserted it
-        if repeated := [(record, detail) for record, detail in new if record.id not in inserted]:
+        first_inserted: set[UUID] = set()
+        fallback_inserted: set[UUID] = set()
+        candidates = [record for record, _ in new]
+        inserted_this_round = first_inserted
+        while candidates:
+            first_deliveries = []
+            later_deliveries = []
+            seen: set[str] = set()
+            for record in candidates:
+                if record.external_id:
+                    if record.external_id in seen:
+                        later_deliveries.append(record)
+                        continue
+                    seen.add(record.external_id)
+                first_deliveries.append(record)
+            stored = self.bulk_create(db_session, first_deliveries)
+            inserted_this_round.update(record_id for record_id, stored_id in stored.items() if record_id == stored_id)
+            stored_keys = {record.external_id for record in first_deliveries if record.id in stored}
+            candidates = [record for record in later_deliveries if record.external_id not in stored_keys]
+            inserted_this_round = fallback_inserted
+        inserted = first_inserted | fallback_inserted
+        self.bulk_create_details(db_session, [detail for record, detail in new if record.id in first_inserted])
+        # If an earlier span was occupied, replay details in delivery order onto the later insert.
+        if repeated := [(record, detail) for record, detail in new if record.id not in first_inserted]:
             dropped, again = self.update_stored_workouts(db_session, user_id, provider, repeated)
-            updated += again
+            updated.extend(record_id for record_id in again if record_id not in fallback_inserted)
             if dropped:
                 logger.warning(
                     "Workouts not stored, other records of their sources hold their spans",
@@ -697,6 +708,20 @@ class EventRecordService(
                     user_id=str(user_id),
                     held_by=self._span_holders(db_session, [record for record, _ in dropped]),
                 )
+        if fallback_inserted and svix_service.is_enabled():
+            self._queue_bulk_webhooks(
+                db_session,
+                [
+                    EventRecordDetailCreate.model_validate(detail, from_attributes=True)
+                    for record_id in fallback_inserted
+                    if (
+                        detail := self.event_record_detail_repo.get_by_record_id(
+                            db_session, record_id, EventCategory.WORKOUT
+                        )
+                    )
+                    is not None
+                ],
+            )
         return [record.id for record, _ in new if record.id in inserted], updated
 
     def _span_holders(self, db_session: DbSession, records: list[EventRecordCreate]) -> dict[str, str]:
@@ -1138,6 +1163,9 @@ class EventRecordService(
 
         if created is not None:
             details = [d for d in details if d.record_id in created]
+        self._queue_bulk_webhooks(db_session, details)
+
+    def _queue_bulk_webhooks(self, db_session: DbSession, details: list[EventRecordDetailCreate]) -> None:
         if not details or not svix_service.is_enabled():
             return
 
