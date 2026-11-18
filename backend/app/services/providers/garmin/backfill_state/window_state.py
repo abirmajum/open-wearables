@@ -23,6 +23,9 @@ def init_window_state(
 ) -> None:
     """Initialise multi-window backfill state in Redis. ``start`` floors every window's start."""
     uid = str(user_id)
+    for window in range(total_windows):
+        for data_type in BACKFILL_DATA_TYPES:
+            get_redis_client().delete(_get_key(uid, "w", str(window), data_type, "failure_count"))
     anchor = datetime.now(timezone.utc).isoformat()
     get_redis_client().setex(_get_key(uid, "window", "current"), REDIS_TTL, "0")
     get_redis_client().setex(_get_key(uid, "window", "total"), REDIS_TTL, str(total_windows))
@@ -99,7 +102,8 @@ def persist_window_results(user_id: str | UUID, window_idx: int) -> None:
     """Persist per-type results for a window to matrix keys.
 
     Maps orchestration status → matrix state:
-    - "success" / "failed" → "done"
+    - "success" → "done"
+    - "failed" → "failed"
     - "timed_out" → "timed_out"
     - everything else → "pending"
     """
@@ -107,7 +111,7 @@ def persist_window_results(user_id: str | UUID, window_idx: int) -> None:
     results: dict[str, str] = {}
     keys = [_get_key(uid, "types", dt, "status") for dt in BACKFILL_DATA_TYPES]
     all_flat_statuses = get_redis_client().mget(keys)
-    status_map = {"success": "done", "failed": "done", "timed_out": "timed_out"}
+    status_map = {"success": "done", "failed": "failed", "timed_out": "timed_out"}
 
     for data_type, flat_status in zip(BACKFILL_DATA_TYPES, all_flat_statuses):
         matrix_status = status_map.get(flat_status, "pending") if isinstance(flat_status, str) else "pending"

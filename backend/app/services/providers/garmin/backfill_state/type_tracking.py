@@ -6,6 +6,7 @@ from uuid import UUID
 from app.integrations.redis_client import get_redis_client
 from app.services.providers.garmin.backfill_config import (
     BACKFILL_DATA_TYPES,
+    MAX_BACKFILL_FAILURES,
     REDIS_TTL,
 )
 from app.services.providers.garmin.backfill_state.core import _get_key, get_trace_id
@@ -15,11 +16,26 @@ logger = get_logger(__name__)
 
 
 def get_pending_types(user_id: str | UUID) -> list[str]:
-    """Return data types whose status is pending (not yet triggered)."""
+    """Return untriggered types first, then failed types with retry budget left."""
     user_id_str = str(user_id)
     keys = [_get_key(user_id_str, "types", dt, "status") for dt in BACKFILL_DATA_TYPES]
     statuses = get_redis_client().mget(keys)
-    return [dt for dt, status in zip(BACKFILL_DATA_TYPES, statuses) if not status or status == "pending"]
+    pending = [dt for dt, status in zip(BACKFILL_DATA_TYPES, statuses) if not status or status == "pending"]
+    if pending:
+        return pending
+    return [
+        dt
+        for dt, status in zip(BACKFILL_DATA_TYPES, statuses)
+        if status == "failed"
+        and int(get_redis_client().get(_failure_count_key(user_id_str, dt)) or 0) < MAX_BACKFILL_FAILURES
+    ]
+
+
+def _failure_count_key(user_id: str, data_type: str) -> str:
+    window = get_redis_client().get(_get_key(user_id, "retry_current_window"))
+    if window is None:
+        window = get_redis_client().get(_get_key(user_id, "window", "current")) or "0"
+    return _get_key(user_id, "w", str(window), data_type, "failure_count")
 
 
 def mark_type_triggered(user_id: str | UUID, data_type: str) -> None:
@@ -69,6 +85,9 @@ def mark_type_success(user_id: str | UUID, data_type: str) -> bool:
 def mark_type_failed(user_id: str | UUID, data_type: str, error: str) -> None:
     """Mark a data type as failed."""
     user_id_str = str(user_id)
+    count_key = _failure_count_key(user_id_str, data_type)
+    get_redis_client().incr(count_key)
+    get_redis_client().expire(count_key, REDIS_TTL)
     get_redis_client().setex(_get_key(user_id_str, "types", data_type, "status"), REDIS_TTL, "failed")
     get_redis_client().setex(_get_key(user_id_str, "types", data_type, "error"), REDIS_TTL, error)
 

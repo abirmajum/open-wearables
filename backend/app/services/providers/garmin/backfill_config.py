@@ -26,6 +26,7 @@ DELAY_AFTER_RATE_LIMIT = GARMIN_RATE_LIMIT_WINDOW  # Wait for full window reset 
 # Timeout / retry
 # ---------------------------------------------------------------------------
 TRIGGERED_TIMEOUT_SECONDS = 300  # 5 min before skipping a triggered type
+MAX_BACKFILL_FAILURES = 3  # Per type/window, including the initial failed attempt
 
 # ---------------------------------------------------------------------------
 # Concurrency lock

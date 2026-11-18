@@ -37,7 +37,6 @@ from app.services.providers.garmin.backfill_state import (
     get_window_date_range_for_index,
     is_retry_phase,
     mark_type_failed,
-    mark_type_success,
     mark_type_triggered,
     set_type_trace_id,
 )
@@ -164,14 +163,6 @@ def trigger_backfill_for_type(user_id: str, data_type: str) -> dict[str, Any]:
                     else:
                         # Retry succeeded — skip the failure handling below
                         _record_accepted_window(user_id, trace_id, start_time_fallback, end_time)
-                        if data_type in retry_result.get("duplicate", []):
-                            mark_type_success(user_id, data_type)
-                            celery_app.send_task(
-                                CeleryTask.GARMIN_TRIGGER_NEXT_PENDING_TYPE,
-                                args=[user_id],
-                                countdown=DELAY_BETWEEN_TYPES,
-                            )
-                            return {"status": "duplicate_skipped", "data_type": data_type}
                         check_triggered_timeout.apply_async(
                             args=[user_id, data_type], countdown=TRIGGERED_TIMEOUT_SECONDS
                         )
@@ -215,26 +206,6 @@ def trigger_backfill_for_type(user_id: str, data_type: str) -> dict[str, Any]:
 
             # A 409 duplicate also means Garmin holds this range as requested.
             _record_accepted_window(user_id, trace_id, start_time, end_time)
-
-            if data_type in result.get("duplicate", []):
-                logger.info(
-                    "Skipping duplicate backfill, proceeding to next type",
-                    provider="garmin",
-                    trace_id=trace_id,
-                    type_trace_id=type_trace_id,
-                    data_type=data_type,
-                    user_id=user_id,
-                )
-                mark_type_success(user_id, data_type)
-                celery_app.send_task(
-                    CeleryTask.GARMIN_TRIGGER_NEXT_PENDING_TYPE, args=[user_id], countdown=DELAY_BETWEEN_TYPES
-                )
-                return {
-                    "status": "duplicate_skipped",
-                    "data_type": data_type,
-                    "start_date": start_time.isoformat(),
-                    "end_date": end_time.isoformat(),
-                }
 
             check_triggered_timeout.apply_async(args=[user_id, data_type], countdown=TRIGGERED_TIMEOUT_SECONDS)
 

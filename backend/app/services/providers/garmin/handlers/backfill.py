@@ -192,8 +192,7 @@ class GarminBackfillService:
 
             except (ProviderConnectionError, ProviderError) as e:
                 status_code, error = backfill_failure(e)
-                # 409 = duplicate backfill already processed for this timeframe.
-                # Garmin won't send another webhook, so caller should skip (not wait).
+                # A duplicate confirms the request, not delivery of its webhook data.
                 if status_code == 409:
                     logger.info(
                         "Backfill already requested (409 duplicate)",
