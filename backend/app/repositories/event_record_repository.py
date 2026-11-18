@@ -562,23 +562,43 @@ class EventRecordRepository(
         if not creators:
             return {}
 
-        # Several deliveries of one workout in a batch: the last stands for all, the earlier ones map to it
+        # Prefer the latest delivery, but keep earlier candidates in case its span is occupied.
         latest = {key: creator.id for creator in creators if (key := self._workout_key(creator))}
         copies = {
             creator.id: latest[key]
             for creator in creators
             if (key := self._workout_key(creator)) and latest[key] != creator.id
         }
-        creators = [creator for creator in creators if creator.id not in copies]
+        fallbacks: dict[UUID, list[EventRecordCreate]] = {}
+        latest_creators = []
+        for creator in creators:
+            if latest_id := copies.get(creator.id):
+                fallbacks.setdefault(latest_id, []).append(creator)
+            else:
+                latest_creators.append(creator)
 
         # Workouts already stored under their external_id take the newest delivery instead of inserting
-        creators_by_id = {creator.id: creator for creator in creators}
+        creators_by_id = {creator.id: creator for creator in latest_creators}
         stored = {
             creator_id: self._refresh_from(db_session, record, creators_by_id[creator_id]).id
-            for creator_id, record in self._fetch_workouts_by_external_id(db_session, creators).items()
+            for creator_id, record in self._fetch_workouts_by_external_id(db_session, latest_creators).items()
         }
-        values_list = self._resolve_values(db_session, [c for c in creators if c.id not in stored])
+        pending = [creator for creator in latest_creators if creator.id not in stored]
+        while pending:
+            inserted_ids = self._insert_new_records(db_session, pending)
+            retry = []
+            for creator in pending:
+                latest_id = copies.get(creator.id, creator.id)
+                if creator.id in inserted_ids:
+                    stored[latest_id] = creator.id
+                elif earlier := fallbacks.get(latest_id):
+                    retry.append(earlier.pop())
+            pending = retry
 
+        return stored | {copy: stored[last] for copy, last in copies.items() if last in stored}
+
+    def _insert_new_records(self, db_session: DbSession, creators: list[EventRecordCreate]) -> set[UUID]:
+        values_list = self._resolve_values(db_session, creators)
         inserted_ids: set[UUID] = set()
         for chunk in _param_chunks(values_list, len(values_list[0])) if values_list else ():
             stmt = (
@@ -606,10 +626,7 @@ class EventRecordRepository(
                 )
             ),
         )
-        # NOTE: Caller should commit - allows batching multiple operations
-
-        stored |= {record_id: record_id for record_id in inserted_ids}
-        return stored | {copy: stored[last] for copy, last in copies.items() if last in stored}
+        return inserted_ids
 
     @staticmethod
     def _record_coverage(db_session: DbSession, records: list[tuple[EventRecordCreate, ProviderName]]) -> None:

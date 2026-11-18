@@ -435,6 +435,33 @@ class TestAppleSDKImport:
 
         assert result["records_saved"] >= 0
 
+    def test_repeated_workout_uses_previous_span_if_latest_is_occupied(
+        self,
+        db: Session,
+        import_service: ImportService,
+        sample_sdk_payload: dict[str, Any],
+    ) -> None:
+        user = UserFactory()
+        fixed_span = sample_sdk_payload["data"]["workouts"][0]
+        payload = {**SDK_ENVELOPE, "data": {"workouts": [fixed_span]}}
+        assert import_service.load_data(db, payload, str(user.id))["workouts_saved"] == 1
+
+        earlier_end = "2022-05-29T01:00:00Z"
+        latest = {
+            **fixed_span,
+            "id": "repeated-workout",
+            "values": [{"type": "distance", "unit": "m", "value": 6000}],
+        }
+        earlier = {**latest, "endDate": earlier_end, "values": [{"type": "distance", "unit": "m", "value": 5000}]}
+        result = import_service.load_data(db, {**SDK_ENVELOPE, "data": {"workouts": [earlier, latest]}}, str(user.id))
+
+        assert result["workouts_saved"] == 1
+        workout = db.query(EventRecord).filter_by(external_id=latest["id"]).one()
+        assert workout.end_datetime == datetime.fromisoformat(earlier_end)
+        detail = db.get(WorkoutDetails, workout.id)
+        assert detail is not None
+        assert detail.distance == Decimal("6000")
+
     def test_raw_timeseries_flags_summable_readings_as_not_daily_totals(
         self,
         db: Session,
