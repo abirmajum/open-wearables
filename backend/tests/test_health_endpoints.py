@@ -3,6 +3,7 @@
 import inspect
 from unittest.mock import Mock, patch
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.main import readiness
@@ -27,6 +28,18 @@ def test_readiness_reports_ready_when_database_is_usable(mock_database_is_ready:
     assert response.status_code == 200
     assert response.json() == {"status": "ready"}
     mock_database_is_ready.assert_called_once_with()
+
+
+@pytest.mark.parametrize(("database", "services"), [(True, True), (False, True), (True, False)])
+def test_service_readiness_is_opaque(database: bool, services: bool, client: TestClient) -> None:
+    with (
+        patch("app.main.service_database_is_ready", return_value=database),
+        patch("app.main.services_are_ready", return_value=services),
+    ):
+        response = client.get("/services-readyz")
+    assert response.status_code == (200 if database and services else 503)
+    assert response.json() == {"status": "ready" if database and services else "not_ready"}
+    assert response.headers["cache-control"] == "no-store"
 
 
 @patch("app.main.database_is_ready", return_value=False)
