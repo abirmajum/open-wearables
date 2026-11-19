@@ -62,8 +62,6 @@ from app.utils.structured_logging import get_logger
 
 logger = get_logger(__name__)
 
-_PROCESS_PUSH_TASK = CeleryTask.PROCESS_WEBHOOK_PUSH
-
 
 class WhoopFanoutError(RuntimeError):
     def __init__(self, profiles: list[dict[str, Any]], errors: dict[str, Exception]) -> None:
@@ -167,7 +165,7 @@ class WhoopWebhookHandler(BaseWebhookHandler):
         store_raw_payload(source="webhook", provider="whoop", payload=payload, trace_id=request_trace_id)
 
         task = celery_app.send_task(
-            _PROCESS_PUSH_TASK, args=["whoop", payload, request_trace_id], queue=CeleryQueue.WEBHOOK_SYNC
+            CeleryTask.PROCESS_WEBHOOK_PUSH, args=["whoop", payload, request_trace_id], queue=CeleryQueue.WEBHOOK_SYNC
         )
         logger.info(
             "Enqueued Whoop webhook processing task",
@@ -195,7 +193,7 @@ class WhoopWebhookHandler(BaseWebhookHandler):
         One WHOOP account can be linked to several OW profiles. The resource is fetched
         once and saved for every active linked profile, so each profile gets its record
         and outgoing events immediately rather than on the next pull. Profiles are
-        processed independently; the task retries only when every profile failed.
+        processed independently; retries target only the profiles that failed.
         """
         try:
             notification = WhoopWebhookNotification(**payload)
@@ -286,13 +284,13 @@ class WhoopWebhookHandler(BaseWebhookHandler):
             except Exception as exc:
                 db.rollback()
                 errors[str(user_id)] = exc
-                logger.error(
+                logger.warning(
                     "Failed to process Whoop webhook for linked profile",
-                    exc_info=exc,
                     provider="whoop",
                     trace_id=trace_id,
                     user_id=str(user_id),
                     event_type=str(notification.type),
+                    error=error_code_of(exc),
                 )
                 result = {"status": "error", "event_type": notification.type, "error": error_code_of(exc)}
             result["user_id"] = str(user_id)
@@ -490,7 +488,7 @@ class WhoopWebhookHandler(BaseWebhookHandler):
     ) -> dict[str, Any]:
         """Delete the EventRecord matching external_id.
 
-        Recovery is stored as DataPointSeries (no external_id index), so
+        Recovery is stored as SeriesSample (no external_id index), so
         recovery.deleted is logged but not actioned.
         """
         if event_type == WhoopWebhookNotificationType.RECOVERY_DELETED:

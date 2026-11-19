@@ -23,6 +23,7 @@ def _committed(session: Session) -> None:
     transaction = session.get_nested_transaction() or session.get_transaction()
     callbacks = pending.pop(transaction, [])
     if transaction is not None and transaction.nested:
+        assert transaction.parent is not None
         pending.setdefault(transaction.parent, []).extend(callbacks)
     else:
         pending.clear()

@@ -129,9 +129,9 @@ def _records_for(db: Session, user_id: UUID, external_id: str) -> list[EventReco
 def _emitted(mock_webhook_dispatch: MagicMock, event_type: str) -> set[str]:
     """User IDs that received an outgoing event of the given type."""
     return {
-        call.args[1]["data"]["user_id"]
-        for call in mock_webhook_dispatch.delay.call_args_list
-        if call.args[0] == event_type
+        call.kwargs["args"][1]["data"]["user_id"]
+        for call in mock_webhook_dispatch.send_task.call_args_list
+        if call.kwargs["args"][0] == event_type
     }
 
 
@@ -208,10 +208,19 @@ def test_every_profile_failing_raises_for_retry(
         handler.process_payload(db, payload, TRACE_ID)
 
 
+@pytest.mark.parametrize(
+    "token_error",
+    [
+        ProviderNotConnectedError("whoop"),
+        ProviderError("whoop", upstream_status=401),
+        ProviderError("whoop", upstream_status=403),
+    ],
+)
 def test_fetch_falls_back_to_next_profile_token(
     db: Session,
     handler: WhoopWebhookHandler,
     connections: list[UserConnection],
+    token_error: Exception,
 ) -> None:
     """A stale profile's broken token must not stop the live profile from getting data."""
     stale, live = connections
@@ -222,7 +231,7 @@ def test_fetch_falls_back_to_next_profile_token(
 
     def fetch(db_: Session, user_id: UUID, resource_id: str) -> dict[str, Any]:
         if user_id == stale.user_id:
-            raise ProviderNotConnectedError("whoop")
+            raise token_error
         return workout_fixture(resource_id)
 
     with patch.object(handler.workouts, "get_workout_detail_from_api", side_effect=fetch) as fetch_mock:
@@ -372,8 +381,8 @@ def test_partial_write_retry_targets_only_failed_profile_without_duplicate_event
         assert [c.args[1]["user_id"] for c in sync_log.call_args_list] == [live_id, stale_id]
         created = [
             call
-            for call in mock_webhook_dispatch.delay.call_args_list
-            if call.args[0] == WebhookEventType.WORKOUT_CREATED
+            for call in mock_webhook_dispatch.send_task.call_args_list
+            if call.kwargs["args"][0] == WebhookEventType.WORKOUT_CREATED
         ]
         assert len(created) == 2
         assert _emitted(mock_webhook_dispatch, WebhookEventType.WORKOUT_CREATED) == {stale_id, live_id}
@@ -382,8 +391,8 @@ def test_partial_write_retry_targets_only_failed_profile_without_duplicate_event
             len(
                 [
                     call
-                    for call in mock_webhook_dispatch.delay.call_args_list
-                    if call.args[0] == WebhookEventType.WORKOUT_CREATED
+                    for call in mock_webhook_dispatch.send_task.call_args_list
+                    if call.kwargs["args"][0] == WebhookEventType.WORKOUT_CREATED
                 ]
             )
             == 2
@@ -428,3 +437,51 @@ def test_exhausted_profile_retries_report_each_failure(
         retry.assert_not_called()
         assert {c.args[1]["user_id"] for c in sync_log.call_args_list} == {str(c.user_id) for c in connections}
         assert all(c.args[1]["status"] == "error" for c in sync_log.call_args_list)
+
+
+@pytest.mark.parametrize("status", [404, 503])
+def test_shared_fetch_failure_sync_log_covers_every_target_profile(
+    db: Session, handler: WhoopWebhookHandler, connections: list[UserConnection], status: int
+) -> None:
+    payload = {"user_id": WHOOP_USER_ID, "id": str(uuid4()), "type": "workout.updated"}
+    with (
+        patch.object(task, "SessionLocal") as session_local,
+        patch.object(task, "ProviderFactory") as factory,
+        patch.object(task, "_emit_webhook_sync_status") as sync_log,
+        patch.object(
+            handler.workouts, "get_workout_detail_from_api", side_effect=ProviderError("whoop", upstream_status=status)
+        ),
+    ):
+        session_local.return_value.__enter__.return_value = db
+        factory.return_value.get_provider.return_value.webhooks = handler
+        task.process_webhook_push.push_request(retries=task.process_webhook_push.max_retries)
+        try:
+            if status == 503:
+                with pytest.raises(ProviderError):
+                    task.process_webhook_push.run("whoop", payload, TRACE_ID)
+            else:
+                task.process_webhook_push.run("whoop", payload, TRACE_ID)
+        finally:
+            task.process_webhook_push.pop_request()
+        assert {c.args[1]["user_id"] for c in sync_log.call_args_list} == {str(c.user_id) for c in connections}
+        assert all(c.args[1]["status"] == ("error" if status == 503 else "skipped") for c in sync_log.call_args_list)
+
+
+def test_deterministic_profile_failure_is_logged_without_retry(
+    db: Session, handler: WhoopWebhookHandler, connections: list[UserConnection]
+) -> None:
+    payload = {"user_id": WHOOP_USER_ID, "id": str(uuid4()), "type": "workout.updated"}
+    with (
+        patch.object(task, "SessionLocal") as session_local,
+        patch.object(task, "ProviderFactory") as factory,
+        patch.object(task, "_emit_webhook_sync_status") as sync_log,
+        patch.object(handler.workouts, "get_workout_detail_from_api", return_value=workout_fixture(payload["id"])),
+        patch.object(handler.workouts, "save_single_workout", side_effect=ProviderNotConnectedError("whoop")),
+        patch.object(task.process_webhook_push, "retry") as retry,
+    ):
+        session_local.return_value.__enter__.return_value = db
+        factory.return_value.get_provider.return_value.webhooks = handler
+        result = task.process_webhook_push.run("whoop", payload, TRACE_ID)
+        assert len(result["profiles"]) == 2
+        retry.assert_not_called()
+        assert {c.args[1]["user_id"] for c in sync_log.call_args_list} == {str(c.user_id) for c in connections}
