@@ -55,6 +55,10 @@ class WorkoutDetails(EventRecordDetail):
     elev_high: Mapped[numeric_10_3 | None]
     elev_low: Mapped[numeric_10_3 | None]
 
+    aerobic_training_effect: Mapped[numeric_5_2 | None]
+    anaerobic_training_effect: Mapped[numeric_5_2 | None]
+    training_load: Mapped[numeric_10_3 | None]
+
     segments: Mapped[json_binary | None]
     hr_zones: Mapped[json_binary | None]
     power_zones: Mapped[json_binary | None]

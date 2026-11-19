@@ -296,51 +296,6 @@ class TestUltrahumanSleepData:
         assert normalized["stage_timestamps"] == []
 
 
-class TestUltrahumanRecoveryData:
-    """Tests for Ultrahuman recovery data handling."""
-
-    def test_normalize_recovery_with_complete_data(self, db: Session) -> None:
-        """Test normalizing recovery data with all fields present."""
-        # Arrange
-        from app.models import User
-        from app.repositories.user_connection_repository import UserConnectionRepository
-        from app.repositories.user_repository import UserRepository
-
-        user = UserFactory()
-        user_repo = UserRepository(User)
-        connection_repo = UserConnectionRepository()
-        oauth = UltrahumanOAuth(
-            user_repo=user_repo,
-            connection_repo=connection_repo,
-            provider_name="ultrahuman",
-            api_base_url="https://partner.ultrahuman.com",
-        )
-
-        data_247 = Ultrahuman247Data(
-            provider_name="ultrahuman",
-            api_base_url="https://partner.ultrahuman.com",
-            oauth=oauth,
-        )
-
-        raw_recovery = {
-            "ultrahuman_date": "2025-01-14",
-            "recovery_index": {"value": 85},
-            "movement_index": {"value": 72},
-            "metabolic_score": {"value": 78},
-        }
-
-        # Act
-        normalized = data_247.normalize_recovery(raw_recovery, user.id)
-
-        # Assert
-        assert normalized["user_id"] == user.id
-        assert normalized["provider"] == "ultrahuman"
-        assert normalized["date"] == "2025-01-14"
-        assert normalized["recovery_index"] == 85
-        assert normalized["movement_index"] == 72
-        assert normalized["metabolic_score"] == 78
-
-
 class TestUltrahumanActivitySamples:
     """Tests for Ultrahuman activity samples handling."""
 
@@ -401,18 +356,12 @@ class TestUltrahumanActivitySamples:
         normalized = data_247.normalize_activity_samples(raw_samples, user.id)
 
         # Assert
-        assert "heart_rate" in normalized
-        assert "hrv" in normalized
-        assert "temperature" in normalized
-        assert "steps" in normalized
-        assert len(normalized["heart_rate"]) == 2
-        assert len(normalized["hrv"]) == 2
-        assert len(normalized["temperature"]) == 2
-        assert len(normalized["steps"]) == 1
-        assert normalized["heart_rate"][0]["value"] == 72
-        assert normalized["hrv"][0]["value"] == 45
-        assert normalized["temperature"][0]["value"] == 36.5
-        assert normalized["steps"][0]["value"] == 8500
+        assert {series: [r["value"] for r in readings] for series, readings in normalized.items()} == {
+            "heart_rate": [72, 75],
+            "heart_rate_variability_rmssd": [45, 50],
+            "skin_temperature": [36.5, 36.6],
+            "steps": [8500],
+        }
 
 
 class TestUltrahumanFetchFailures:

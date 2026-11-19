@@ -98,6 +98,7 @@ class Settings(BaseSettings):
     secret_key: str = ""
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 60
+    developer_refresh_token_expire_days: int = 30
     token_lifetime: int = 3600
 
     # VALIDATION SETTINGS
@@ -205,6 +206,8 @@ class Settings(BaseSettings):
     garmin_client_secret: SecretStr | None = None
     garmin_redirect_uri: str | None = None  # Deprecated: use API_BASE_URL
     garmin_default_scope: str = ""  # Scope is managed at app creation in Garmin Developer Portal
+    garmin_fit_retry_max_attempts: int = Field(3, ge=0)
+    garmin_fit_retry_base_delay_seconds: int = Field(300, gt=0)
 
     # POLAR OAUTH SETTINGS
     polar_client_id: str | None = None
@@ -307,6 +310,11 @@ class Settings(BaseSettings):
     user_invitation_code_redeem_window_seconds: int = 900
     user_invitation_code_redeem_ip_limit: int = 10
     user_invitation_code_redeem_global_limit: int = 1000
+
+    # Lifetime of the token a shareable pairing link carries.
+    connect_token_expire_days: int = 7
+    # Extra OAuth redirect_uri targets, comma-separated; FRONTEND_URL and CORS_ORIGINS are always allowed.
+    oauth_redirect_allowlist: str = "openwearables://oauth/callback"
 
     # AWS SETTINGS
     aws_bucket_name: str | None = None

@@ -68,6 +68,44 @@ class TestEventRecordRepository:
         assert db_event is not None
         assert db_event.data_source_id == mapping.id
 
+    def test_create_matches_workout_on_external_id(self, db: Session, event_repo: EventRecordRepository) -> None:
+        """A workout re-delivered with a slightly different end and a new device is matched by external_id (#1607)."""
+        user = UserFactory()
+        start = datetime(2026, 9, 9, 6, 42, 14, 550000, tzinfo=timezone.utc)
+
+        def workout(end_ms: int, device_model: str | None) -> EventRecordCreate:
+            return EventRecordCreate(
+                id=uuid4(),
+                user_id=user.id,
+                source="suunto",
+                provider="suunto",
+                device_model=device_model,
+                category="workout",
+                type="running",
+                source_name="Suunto",
+                duration_seconds=3426,
+                start_datetime=start,
+                end_datetime=start + timedelta(milliseconds=end_ms),
+                external_id="6aa10da139e69418a2fa8db1",
+            )
+
+        first = event_repo.create(db, workout(3426173, None))
+        second = event_repo.create(db, workout(3426080, "Suunto Race 2"))
+
+        assert second.id == first.id
+        assert second.end_datetime == start + timedelta(milliseconds=3426080)
+        assert db.query(EventRecord).filter(EventRecord.external_id == "6aa10da139e69418a2fa8db1").count() == 1
+
+        # Bulk: two more deliveries in one batch resolve to the same row, the last one's times winning
+        earlier, latest = workout(3426000, None), workout(3425900, None)
+        stored = event_repo.bulk_create(db, [earlier, latest])
+        db.commit()
+
+        assert stored == {earlier.id: first.id, latest.id: first.id}
+        db.refresh(first)
+        assert first.end_datetime == start + timedelta(milliseconds=3425900)
+        assert db.query(EventRecord).filter(EventRecord.external_id == "6aa10da139e69418a2fa8db1").count() == 1
+
     def test_create_auto_creates_mapping(self, db: Session, event_repo: EventRecordRepository) -> None:
         """Test that create automatically creates a mapping if it doesn't exist."""
         # Arrange
@@ -581,3 +619,30 @@ class TestFindAdjacentSleepRecord:
         oura = self._night(user, "com.ouraring.oura", hours_later=1)
 
         assert self._adjacent(db, user, None) == oura
+
+
+class TestBulkUpsertMeals:
+    def test_more_meals_than_one_statement_can_bind_are_all_stored(self, db: Session) -> None:
+        """A meal row binds 11 parameters, so 6,000 meals exceed PostgreSQL's 65,535 in one statement."""
+        user = UserFactory()
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        meals = [
+            EventRecordCreate(
+                id=uuid4(),
+                user_id=user.id,
+                source="apple",
+                category="meal",
+                type="meal",
+                source_name="Food Log",
+                external_id=f"meal-{i}",
+                start_datetime=start + timedelta(minutes=i),
+                end_datetime=start + timedelta(minutes=i),
+            )
+            for i in range(6_000)
+        ]
+
+        stored = EventRecordRepository(EventRecord).bulk_upsert_meals(db, meals)
+
+        assert len(stored) == 6_000
+        assert all(is_inserted for _, is_inserted in stored.values())
+        assert db.query(EventRecord).filter(EventRecord.category == "meal").count() == 6_000

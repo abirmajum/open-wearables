@@ -36,6 +36,10 @@ class EventRecordDetailBase(BaseModel):
     elev_high: Decimal | None = None
     elev_low: Decimal | None = None
 
+    aerobic_training_effect: Decimal | None = None
+    anaerobic_training_effect: Decimal | None = None
+    training_load: Decimal | None = None
+
     # Sleep-specific fields
     sleep_total_duration_minutes: int | None = None
     sleep_time_in_bed_minutes: int | None = None

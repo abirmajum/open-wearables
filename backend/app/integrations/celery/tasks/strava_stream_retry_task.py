@@ -9,21 +9,12 @@ from app.config import settings
 from app.constants.celery_tasks import CeleryTask
 from app.database import DbSession, SessionLocal
 from app.schemas.providers.strava import ActivityJSON as StravaActivityJSON
+from app.services.providers.retry import is_transient_provider_error as _is_transient
 from app.services.providers.strava.strategy import StravaStrategy
 from app.services.providers.strava.workouts import StravaWorkouts, schedule_stream_retry
-from app.utils.exceptions import ProviderConnectionError, ProviderError, is_provider_state_error
 from app.utils.structured_logging import get_logger
 
 logger = get_logger(__name__)
-
-
-def _is_transient(exc: Exception) -> bool:
-    """An outage or a database hiccup; not a deleted activity, a lost connection or a rejected request."""
-    if isinstance(exc, ProviderConnectionError):
-        return False
-    if isinstance(exc, ProviderError):
-        return not exc.request_rejected and not is_provider_state_error(exc)
-    return True
 
 
 @shared_task(name=CeleryTask.RETRY_STRAVA_STREAM_INGEST)

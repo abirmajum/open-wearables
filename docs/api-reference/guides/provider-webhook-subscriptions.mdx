@@ -27,6 +27,12 @@ Authorization: Bearer <token>
 
 Supported `{provider}` values: `polar`, `oura`, `strava`. Withings subscriptions are managed per connected user.
 
+### Processing accepted deliveries
+
+Once a delivery is queued, temporary database or provider failures are retried on the same queue. The worker makes up to eight retries, starting after 30 seconds and backing off to at most three minutes between attempts. This works without raw payload archival or periodic pulls. Permanent failures, such as revoked access or a deleted upstream record, do not wait out the retry window.
+
+This applies only to deliveries that reached the queue. It does not recover requests that could not be queued or replay deliveries after their retries are exhausted.
+
 ---
 
 ## Provider differences

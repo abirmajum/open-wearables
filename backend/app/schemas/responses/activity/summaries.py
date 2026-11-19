@@ -239,8 +239,8 @@ class RecoverySummary(BaseModel):
         deprecated=True,
         description=(
             "Deprecated and scheduled for removal in an upcoming release: 0-100 recovery "
-            "score. Among the supported providers only WHOOP reports a recovery score, and "
-            "Open Wearables does not compute its own, so this is null for every other "
+            "score. Only providers that report their own recovery score (e.g. WHOOP, Ultrahuman) "
+            "fill it; Open Wearables does not compute its own, so this is null for every other "
             "provider. Migrate to the health scores endpoint "
             "(GET /api/v1/users/{user_id}/health-scores), whose `components` array exposes "
             "the underlying metrics the score is derived from."

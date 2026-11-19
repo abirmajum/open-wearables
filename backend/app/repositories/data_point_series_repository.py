@@ -541,7 +541,7 @@ class DataPointSeriesRepository(
                         "period_end": creator.period.end,
                         "zone_offset": creator.period.zone_offset,
                         "computed_by": ComputedBy.PROVIDER,
-                        canonical: creator.value,
+                        creator.period.stat or canonical: creator.value,
                         "count": 1,
                     }
                 )

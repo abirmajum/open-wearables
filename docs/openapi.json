@@ -844,6 +844,91 @@
         }
       }
     },
+    "/api/v1/users/{user_id}/connect-token": {
+      "post": {
+        "tags": [
+          "External: Users"
+        ],
+        "summary": "Mint Connect Token",
+        "description": "Mint a token that lets an end user connect providers for this user only.\n\nSend it to `/oauth/{provider}/authorize` as `X-Open-Wearables-Connect-Token`, or share `pair_url`.",
+        "operationId": "mint_connect_token_api_v1_users__user_id__connect_token_post",
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "User Id"
+            }
+          },
+          {
+            "name": "X-Open-Wearables-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Open-Wearables-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectTokenResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationProblem"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "description": "Client error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "description": "Server error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/users/{user_id}/personal-record": {
       "get": {
         "tags": [
@@ -4053,6 +4138,216 @@
         }
       }
     },
+    "/api/v1/users/{user_id}/events/activities": {
+      "get": {
+        "tags": [
+          "External: Events"
+        ],
+        "summary": "List Activities",
+        "description": "Returns activities the device detected by itself outside a recorded workout, such as Garmin Move IQ.",
+        "operationId": "list_activities_api_v1_users__user_id__events_activities_get",
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "User Id"
+            }
+          },
+          {
+            "name": "start_date",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days.",
+              "examples": [
+                "2023-11-07T05:31:56Z",
+                "2023-11-07"
+              ],
+              "format": "date-time",
+              "title": "Start Date"
+            },
+            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days."
+          },
+          {
+            "name": "end_date",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days.",
+              "examples": [
+                "2023-11-07T05:31:56Z",
+                "2023-11-07"
+              ],
+              "format": "date-time",
+              "title": "End Date"
+            },
+            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days."
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 1000,
+              "minimum": 1,
+              "default": 50,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "provider",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/ProviderName"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Provider"
+            }
+          },
+          {
+            "name": "source",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Source"
+            }
+          },
+          {
+            "name": "device_model",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Device Model"
+            }
+          },
+          {
+            "name": "data_source_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Data Source Id"
+            }
+          },
+          {
+            "name": "X-Open-Wearables-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Open-Wearables-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PaginatedResponse_ActivityRecord_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationProblem"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "description": "Client error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "description": "Server error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/users/{user_id}/events/meals": {
       "get": {
         "tags": [
@@ -4805,8 +5100,13 @@
           "External: Providers"
         ],
         "summary": "Get Provider Authorization URL",
-        "description": "Initiate OAuth flow for a provider.\n\nReturns authorization URL where user should be redirected to log in.",
+        "description": "Initiate OAuth flow for a provider.\n\nReturns authorization URL where user should be redirected to log in.\n\nRequires an API key, a developer token, or a token scoped to `user_id`: an SDK user token\nor a connect token (`X-Open-Wearables-Connect-Token`, from `POST /users/{user_id}/connect-token`).\n`redirect_uri` must match `OAUTH_REDIRECT_ALLOWLIST` (default `openwearables://oauth/callback`),\nthe dashboard origin (`FRONTEND_URL`) or `CORS_ORIGINS`. After the sign-in the browser is sent\nthere with `provider`, `status` (`success` or `error`) and, on error, `message` in the query,\nreplacing any parameters of the same name.",
         "operationId": "authorize_provider_api_v1_oauth__provider__authorize_get",
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
         "parameters": [
           {
             "name": "provider",
@@ -4842,10 +5142,42 @@
                   "type": "null"
                 }
               ],
-              "description": "Optional application URL to redirect the user to after the provider callback completes",
+              "description": "Where to send the browser after the provider sign-in; must be on the allowlist",
               "title": "Redirect Uri"
             },
-            "description": "Optional application URL to redirect the user to after the provider callback completes"
+            "description": "Where to send the browser after the provider sign-in; must be on the allowlist"
+          },
+          {
+            "name": "X-Open-Wearables-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Open-Wearables-Api-Key"
+            }
+          },
+          {
+            "name": "X-Open-Wearables-Connect-Token",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Open-Wearables-Connect-Token"
+            }
           }
         ],
         "responses": {
@@ -4957,7 +5289,7 @@
           "System: OAuth"
         ],
         "summary": "Oauth Callback",
-        "description": "OAuth callback endpoint.\n\nProvider redirects here after user authorizes. Exchanges code for tokens.",
+        "description": "OAuth callback endpoint.\n\nProvider redirects here after user authorizes. Exchanges code for tokens. When the\nflow was started with a redirect_uri, the browser goes back there on success and on\nfailure, so an app's sign-in sheet never ends on a JSON page.",
         "operationId": "oauth_callback_api_v1_oauth__provider__callback_get",
         "parameters": [
           {
@@ -8144,6 +8476,8 @@
                                     "BASAL_METABOLIC_RATE",
                                     "HKQuantityTypeIdentifierAppleStandTime",
                                     "HKQuantityTypeIdentifierAppleExerciseTime",
+                                    "ACTIVITY_INTENSITY_MODERATE",
+                                    "ACTIVITY_INTENSITY_VIGOROUS",
                                     "HKQuantityTypeIdentifierFlightsClimbed",
                                     "FLOORS_CLIMBED",
                                     "DISTANCE",
@@ -8548,6 +8882,7 @@
                                   "type": "string"
                                 }
                               ],
+                              "description": "Ignored for ACTIVITY_INTENSITY_MODERATE and ACTIVITY_INTENSITY_VIGOROUS: their minutes are computed from startDate and endDate.",
                               "title": "Value"
                             },
                             "unit": {
@@ -8559,6 +8894,7 @@
                                   "type": "null"
                                 }
                               ],
+                              "description": "Ignored for ACTIVITY_INTENSITY_MODERATE and ACTIVITY_INTENSITY_VIGOROUS: their minutes are computed from startDate and endDate.",
                               "title": "Unit"
                             },
                             "count": {
@@ -11253,7 +11589,7 @@
           "Internal: Auth"
         ],
         "summary": "Logout",
-        "description": "Logout developer (token invalidation should be handled client-side).",
+        "description": "Logout developer. Revoke the refresh token with POST /api/v1/token/revoke.",
         "operationId": "logout_api_v1_auth_logout_post",
         "responses": {
           "200": {
@@ -14691,6 +15027,84 @@
   },
   "components": {
     "schemas": {
+      "ActivityRecord": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Id"
+          },
+          "type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Type",
+            "example": "moveiq_walking"
+          },
+          "subtype": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Subtype",
+            "description": "The device's finer kind of the type",
+            "example": "hurried"
+          },
+          "start_time": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Start Time"
+          },
+          "end_time": {
+            "type": "string",
+            "format": "date-time",
+            "title": "End Time"
+          },
+          "zone_offset": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Zone Offset"
+          },
+          "duration_seconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duration Seconds"
+          },
+          "source": {
+            "$ref": "#/components/schemas/SourceMetadata"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "start_time",
+          "end_time",
+          "source"
+        ],
+        "title": "ActivityRecord",
+        "description": "An activity the device detected by itself, outside a recorded workout (e.g. Garmin Move IQ)."
+      },
       "ActivitySummary": {
         "properties": {
           "date": {
@@ -15715,6 +16129,31 @@
         ],
         "title": "ConfigResponse",
         "description": "Instance feature flags for the admin panel. Additive-only: append new flags,\nnever remove or repurpose, so the frontend stays backward compatible."
+      },
+      "ConnectTokenResponse": {
+        "properties": {
+          "token": {
+            "type": "string",
+            "title": "Token"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Expires At"
+          },
+          "pair_url": {
+            "type": "string",
+            "title": "Pair Url"
+          }
+        },
+        "type": "object",
+        "required": [
+          "token",
+          "expires_at",
+          "pair_url"
+        ],
+        "title": "ConnectTokenResponse",
+        "description": "Token that lets an end user start provider OAuth for one user, plus the pairing link carrying it."
       },
       "ConnectionStatus": {
         "type": "string",
@@ -16958,10 +17397,13 @@
           "recovery",
           "readiness",
           "activity",
+          "previous_day_activity",
           "stress",
           "resilience",
           "body_battery",
-          "strain"
+          "strain",
+          "movement_index",
+          "metabolic"
         ],
         "title": "HealthScoreCategory"
       },
@@ -18310,6 +18752,30 @@
         ],
         "title": "OldPaginatedResponse[UserRead]"
       },
+      "PaginatedResponse_ActivityRecord_": {
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/ActivityRecord"
+            },
+            "type": "array",
+            "title": "Data"
+          },
+          "pagination": {
+            "$ref": "#/components/schemas/Pagination"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/TimeseriesMetadata"
+          }
+        },
+        "type": "object",
+        "required": [
+          "data",
+          "pagination",
+          "metadata"
+        ],
+        "title": "PaginatedResponse[ActivityRecord]"
+      },
       "PaginatedResponse_ActivitySummary_": {
         "properties": {
           "data": {
@@ -19379,7 +19845,7 @@
               }
             ],
             "title": "Recovery Score",
-            "description": "Deprecated and scheduled for removal in an upcoming release: 0-100 recovery score. Among the supported providers only WHOOP reports a recovery score, and Open Wearables does not compute its own, so this is null for every other provider. Migrate to the health scores endpoint (GET /api/v1/users/{user_id}/health-scores), whose `components` array exposes the underlying metrics the score is derived from.",
+            "description": "Deprecated and scheduled for removal in an upcoming release: 0-100 recovery score. Only providers that report their own recovery score (e.g. WHOOP, Ultrahuman) fill it; Open Wearables does not compute its own, so this is null for every other provider. Migrate to the health scores endpoint (GET /api/v1/users/{user_id}/health-scores), whose `components` array exposes the underlying metrics the score is derived from.",
             "deprecated": true
           }
         },
@@ -20053,6 +20519,9 @@
           "flights_climbed",
           "active_time",
           "total_energy",
+          "sedentary_time",
+          "moderate_intensity_time",
+          "vigorous_intensity_time",
           "distance_walking_running",
           "distance_cycling",
           "distance_swimming",
@@ -23778,6 +24247,45 @@
               }
             ],
             "title": "Elev Low"
+          },
+          "aerobic_training_effect": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Aerobic Training Effect",
+            "description": "The workout's aerobic training effect, 0.0 to 5.0, from its FIT file",
+            "example": 3.4
+          },
+          "anaerobic_training_effect": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Anaerobic Training Effect",
+            "description": "The workout's anaerobic training effect, 0.0 to 5.0, from its FIT file",
+            "example": 1.2
+          },
+          "training_load": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Training Load",
+            "description": "The workout's training load (EPOC-based), from its FIT file",
+            "example": 142.0
           },
           "hr_zones": {
             "anyOf": [

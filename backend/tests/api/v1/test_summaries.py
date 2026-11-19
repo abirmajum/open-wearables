@@ -1167,6 +1167,67 @@ class TestActivitySummaryEndpoint:
         # 1 vigorous minute (160)
         assert activity["intensity_minutes"]["vigorous"] == 1
 
+    def test_intensity_minutes_prefer_the_providers_moderate_and_vigorous(
+        self, client: TestClient, db: Session
+    ) -> None:
+        """Garmin reports its own intensity minutes; light stays from heart rate (max HR 190 at age 30)."""
+        from datetime import date
+
+        user = UserFactory()
+        PersonalRecordFactory(user=user, birth_date=date(1995, 1, 1))
+        mapping = DataSourceFactory(user=user, source=ProviderName.GARMIN)
+        hr_type = SeriesTypeDefinitionFactory.get_or_create_heart_rate()
+        base_time = datetime(2025, 12, 26, 9, 0, 0, tzinfo=timezone.utc)
+        for minute, bpm in enumerate((100, 130, 160)):
+            DataPointSeriesFactory(
+                mapping=mapping,
+                series_type=hr_type,
+                value=Decimal(bpm),
+                recorded_at=base_time + timedelta(minutes=minute),
+            )
+        roll_up_everything(db)
+        provider_day(db, mapping, SeriesType.moderate_intensity_time, base_time.date(), sum=Decimal("30"))
+        provider_day(db, mapping, SeriesType.vigorous_intensity_time, base_time.date(), sum=Decimal("15"))
+
+        response = client.get(
+            f"/api/v1/users/{user.id}/summaries/activity",
+            headers=api_key_headers(ApiKeyFactory().plain_key),
+            params={"start_date": "2025-12-25T00:00:00Z", "end_date": "2025-12-27T00:00:00Z"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["data"][0]["intensity_minutes"] == {"light": 1, "moderate": 30, "vigorous": 15}
+
+    def test_a_zone_the_provider_does_not_report_falls_back_to_heart_rate(
+        self, client: TestClient, db: Session
+    ) -> None:
+        """Garmin reports moderate minutes only; vigorous comes from heart rate (max HR 190 at age 30)."""
+        from datetime import date
+
+        user = UserFactory()
+        PersonalRecordFactory(user=user, birth_date=date(1995, 1, 1))
+        mapping = DataSourceFactory(user=user, source=ProviderName.GARMIN)
+        hr_type = SeriesTypeDefinitionFactory.get_or_create_heart_rate()
+        base_time = datetime(2025, 12, 26, 9, 0, 0, tzinfo=timezone.utc)
+        for minute, bpm in enumerate((100, 130, 160)):
+            DataPointSeriesFactory(
+                mapping=mapping,
+                series_type=hr_type,
+                value=Decimal(bpm),
+                recorded_at=base_time + timedelta(minutes=minute),
+            )
+        roll_up_everything(db)
+        provider_day(db, mapping, SeriesType.moderate_intensity_time, base_time.date(), sum=Decimal("30"))
+
+        response = client.get(
+            f"/api/v1/users/{user.id}/summaries/activity",
+            headers=api_key_headers(ApiKeyFactory().plain_key),
+            params={"start_date": "2025-12-25T00:00:00Z", "end_date": "2025-12-27T00:00:00Z"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["data"][0]["intensity_minutes"] == {"light": 1, "moderate": 30, "vigorous": 1}
+
     def test_get_activity_summary_intensity_without_birth_date(self, client: TestClient, db: Session) -> None:
         """Test activity summary uses default max HR when birth_date is not available.
 

@@ -553,15 +553,19 @@ _ACTIVITY_SUMS = {
     SeriesType.distance_walking_running: "distance_sum",
     SeriesType.flights_climbed: "flights_climbed_sum",
     SeriesType.active_time: "active_time_minutes",
+    SeriesType.moderate_intensity_time: "moderate_intensity_minutes",
+    SeriesType.vigorous_intensity_time: "vigorous_intensity_minutes",
 }
-_INT_SUMS = {"steps_sum", "flights_climbed_sum", "active_time_minutes"}
 _HEART_RATE_KEYS = ("hr_avg", "hr_max", "hr_min")
 _ENERGY_KEYS = ("active_energy_sum", "basal_energy_sum", "total_energy_sum")
+_INTENSITY_KEYS = ("moderate_intensity_minutes", "vigorous_intensity_minutes")
+_INT_SUMS = {"steps_sum", "flights_climbed_sum", "active_time_minutes", *_INTENSITY_KEYS}
 # An activity day's metrics, in the groups that come whole from one source: a total is not made of one source's
 # active and another's basal energy.
 ACTIVITY_METRIC_GROUPS: tuple[tuple[str, ...], ...] = (
-    *((key,) for key in _ACTIVITY_SUMS.values() if key not in _ENERGY_KEYS),
+    *((key,) for key in _ACTIVITY_SUMS.values() if key not in (*_ENERGY_KEYS, *_INTENSITY_KEYS)),
     _ENERGY_KEYS,
+    _INTENSITY_KEYS,
     _HEART_RATE_KEYS,
 )
 ACTIVITY_METRIC_KEYS = tuple(key for group in ACTIVITY_METRIC_GROUPS for key in group)

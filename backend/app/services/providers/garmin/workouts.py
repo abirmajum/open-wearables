@@ -1,5 +1,5 @@
-from datetime import datetime, timedelta
-from decimal import Decimal
+from collections.abc import Mapping
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 from uuid import UUID, uuid4
 
@@ -16,10 +16,77 @@ from app.schemas.providers.garmin import ActivityJSON as GarminActivityJSON
 from app.services.event_record_service import event_record_service
 from app.services.providers.garmin.coverage import WORKOUT_ENERGY_SERIES
 from app.services.providers.templates.base_workouts import BaseWorkoutsTemplate
-from app.utils.dates import offset_to_iso
+from app.utils.conversion import as_int, to_decimal
+from app.utils.dates import as_utc, offset_to_iso
 from app.utils.structured_logging import get_logger
 
 logger = get_logger(__name__)
+
+# The activity schema names the first; the push handler read the second before, and no real payload settles it
+_ELEVATION_FIELDS = ("totalElevationGainInMeters", "elevationGainInMeters")
+_CADENCE_FIELDS = (
+    "averageRunCadenceInStepsPerMinute",
+    "averageBikingCadenceInRevPerMinute",
+    "averageSwimCadenceInStrokesPerMinute",
+)
+
+
+def activity_metrics(summary: Mapping[str, Any]) -> EventRecordMetrics:
+    """The workout detail of a Garmin activity summary, as the activities push sends it and the activityDetails push
+    nests it under ``summary``."""
+    metrics: EventRecordMetrics = {
+        # Garmin activity payloads carry only average and max heart rate
+        "heart_rate_min": None,
+        "heart_rate_max": as_int(summary.get("maxHeartRateInBeatsPerMinute")),
+        "heart_rate_avg": to_decimal(summary.get("averageHeartRateInBeatsPerMinute")),
+        "steps_count": as_int(summary.get("steps")),
+        "energy_burned": to_decimal(summary.get("activeKilocalories")),
+        "energy_series": WORKOUT_ENERGY_SERIES,
+        "distance": to_decimal(summary.get("distanceInMeters")),
+        "average_speed": to_decimal(summary.get("averageSpeedInMetersPerSecond")),
+        "max_speed": to_decimal(summary.get("maxSpeedInMetersPerSecond")),
+        "total_elevation_gain": to_decimal(
+            next((e for f in _ELEVATION_FIELDS if (e := summary.get(f)) is not None), None)
+        ),
+        "average_cadence": to_decimal(next((c for f in _CADENCE_FIELDS if (c := summary.get(f))), None)),
+    }
+
+    entry_source = get_unified_garmin_entry_source(summary.get("manual"), summary.get("isWebUpload"))
+    if entry_source is not None:
+        metrics["entry_source"] = entry_source
+
+    if name := summary.get("activityName"):
+        metrics["label"] = name
+
+    return metrics
+
+
+def activity_workout(
+    summary: Mapping[str, Any], user_id: UUID
+) -> tuple[EventRecordCreate, EventRecordDetailCreate] | None:
+    """The workout of a Garmin activity summary, as the activities push sends it and the activityDetails push nests
+    it under ``summary``; None without the activity id or start time that identify it."""
+    activity_id, start = summary.get("activityId"), summary.get("startTimeInSeconds")
+    if not activity_id or not start:
+        return None
+    duration = summary.get("durationInSeconds") or 0
+    device = summary.get("deviceName")
+    activity_type = summary.get("activityType")
+    record = EventRecordCreate(
+        id=uuid4(),
+        category=EventCategory.WORKOUT,
+        type=get_unified_workout_type(activity_type).value if activity_type else None,
+        source_name=device or "Garmin",
+        device_model=device,
+        duration_seconds=duration,
+        start_datetime=datetime.fromtimestamp(start, tz=timezone.utc),
+        end_datetime=datetime.fromtimestamp(start + duration, tz=timezone.utc),
+        zone_offset=offset_to_iso(summary.get("startTimeOffsetInSeconds")),
+        external_id=str(activity_id),
+        source="garmin",
+        user_id=user_id,
+    )
+    return record, EventRecordDetailCreate(record_id=record.id, **activity_metrics(summary))
 
 
 class GarminWorkouts(BaseWorkoutsTemplate):
@@ -116,13 +183,12 @@ class GarminWorkouts(BaseWorkoutsTemplate):
 
         # Default to last 24 hours if no time range provided
         if not start_ts:
-            start_ts = int((datetime.now() - timedelta(hours=24)).timestamp())
+            start_ts = int((datetime.now(timezone.utc) - timedelta(hours=24)).timestamp())
         if not end_ts:
-            end_ts = int(datetime.now().timestamp())
+            end_ts = int(datetime.now(timezone.utc).timestamp())
 
-        # Convert to datetime for chunked fetching
-        start_dt = datetime.fromtimestamp(start_ts)
-        end_dt = datetime.fromtimestamp(end_ts)
+        start_dt = datetime.fromtimestamp(start_ts, tz=timezone.utc)
+        end_dt = datetime.fromtimestamp(end_ts, tz=timezone.utc)
 
         # Check if range exceeds 24 hours - if so, use chunked fetching
         if (end_dt - start_dt) > timedelta(hours=24):
@@ -154,59 +220,13 @@ class GarminWorkouts(BaseWorkoutsTemplate):
         except ValueError:
             pass
         try:
-            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            dt = as_utc(datetime.fromisoformat(value.replace("Z", "+00:00")))  # no offset in the string means UTC
             return int(dt.timestamp())
         except (ValueError, AttributeError):
             return None
 
-    def _extract_dates(self, start_timestamp: int, end_timestamp: int) -> tuple[datetime, datetime]:
-        """Extract start and end dates from timestamps."""
-        start_date = datetime.fromtimestamp(start_timestamp)
-        end_date = datetime.fromtimestamp(end_timestamp)
-        return start_date, end_date
-
     def _build_metrics(self, raw_workout: GarminActivityJSON) -> EventRecordMetrics:
-        heart_rate_avg = (
-            Decimal(str(raw_workout.averageHeartRateInBeatsPerMinute))
-            if raw_workout.averageHeartRateInBeatsPerMinute is not None
-            else None
-        )
-        heart_rate_max = (
-            Decimal(str(raw_workout.maxHeartRateInBeatsPerMinute))
-            if raw_workout.maxHeartRateInBeatsPerMinute is not None
-            else None
-        )
-
-        steps_count = int(raw_workout.steps) if raw_workout.steps is not None else None
-
-        energy_burned = (
-            Decimal(str(raw_workout.activeKilocalories)) if raw_workout.activeKilocalories is not None else None
-        )
-
-        distance = Decimal(str(raw_workout.distanceInMeters)) if raw_workout.distanceInMeters is not None else None
-
-        average_cadence = Decimal(str(raw_workout.averageCadence)) if raw_workout.averageCadence is not None else None
-
-        metrics: EventRecordMetrics = {
-            # Garmin activity payloads carry only average and max heart rate
-            "heart_rate_min": None,
-            "heart_rate_max": int(heart_rate_max) if heart_rate_max is not None else None,
-            "heart_rate_avg": heart_rate_avg,
-            "steps_count": steps_count,
-            "energy_burned": energy_burned,
-            "energy_series": WORKOUT_ENERGY_SERIES,
-            "distance": distance,
-            "average_cadence": average_cadence,
-        }
-
-        entry_source = get_unified_garmin_entry_source(raw_workout.manual, raw_workout.isWebUpload)
-        if entry_source is not None:
-            metrics["entry_source"] = entry_source
-
-        if raw_workout.activityName:
-            metrics["label"] = raw_workout.activityName
-
-        return metrics
+        return activity_metrics(raw_workout.model_dump())
 
     def _normalize_workout(
         self,
@@ -214,43 +234,10 @@ class GarminWorkouts(BaseWorkoutsTemplate):
         user_id: UUID,
     ) -> tuple[EventRecordCreate, EventRecordDetailCreate]:
         """Normalize Garmin activity to EventRecordCreate and EventRecordDetailCreate."""
-        workout_id = uuid4()
-
-        workout_type = get_unified_workout_type(raw_workout.activityType)
-
-        start_date, end_date = self._extract_dates(
-            raw_workout.startTimeInSeconds,
-            raw_workout.startTimeInSeconds + raw_workout.durationInSeconds,
-        )
-        duration_seconds = raw_workout.durationInSeconds
-
-        metrics = self._build_metrics(raw_workout)
-
-        device_name = raw_workout.deviceName or "Garmin"
-
-        zone_offset = offset_to_iso(raw_workout.startTimeOffsetInSeconds)
-
-        record = EventRecordCreate(
-            category=EventCategory.WORKOUT,
-            type=workout_type.value,
-            source_name=device_name,
-            device_model=raw_workout.deviceName,
-            duration_seconds=duration_seconds,
-            start_datetime=start_date,
-            end_datetime=end_date,
-            zone_offset=zone_offset,
-            id=workout_id,
-            external_id=str(raw_workout.activityId),  # Convert to str (push sends int)
-            source="garmin",
-            user_id=user_id,
-        )
-
-        detail = EventRecordDetailCreate(
-            record_id=workout_id,
-            **metrics,
-        )
-
-        return record, detail
+        workout = activity_workout(raw_workout.model_dump(), user_id)
+        if workout is None:
+            raise ValueError(f"Garmin activity {raw_workout.activityId} has no start time")
+        return workout
 
     def _build_bundles(
         self,
@@ -298,14 +285,10 @@ class GarminWorkouts(BaseWorkoutsTemplate):
             user_id: Internal user ID (already mapped from Garmin user ID)
 
         Returns:
-            List of created event record IDs
+            Ids of the event records saved, created or updated
         """
-        created_ids: list[UUID] = []
-
-        for record, detail in self._build_bundles(activities, user_id):
-            created_record = event_record_service.create(db, record)
-            detail_for_record = detail.model_copy(update={"record_id": created_record.id})
-            event_record_service.create_detail(db, detail_for_record)
-            created_ids.append(created_record.id)
-
-        return created_ids
+        created, updated = event_record_service.save_workouts(
+            db, user_id, "garmin", list(self._build_bundles(activities, user_id))
+        )
+        db.commit()
+        return created + updated

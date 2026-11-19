@@ -64,6 +64,7 @@ class EventRecordBase(BaseModel):
 
     category: EventCategory = Field(EventCategory.WORKOUT, description="High-level category such as workout or sleep")
     type: str | None = Field(None, description="Provider-specific subtype, e.g. running")
+    subtype: str | None = Field(None, description="The provider's finer kind of the type, e.g. hurried walking")
 
     source_name: str = Field(description="Source/app name")
     device_model: str | None = Field(

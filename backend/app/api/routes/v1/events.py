@@ -7,6 +7,7 @@ from app.database import DbSession
 from app.schemas.enums import EventCategory, ProviderName, SourceSelection, WorkoutType
 from app.schemas.model_crud.activities import EventRecordQueryParams, SleepInclude, WorkoutInclude
 from app.schemas.responses.activity import (
+    ActivityRecord,
     Meal,
     MenstrualCycleRecord,
     SleepSession,
@@ -227,6 +228,34 @@ def list_menstrual_cycles(
         data_source_id=data_source_id,
     )
     return event_record_service.get_menstrual_cycles(db, user_id, params)
+
+
+@router.get("/users/{user_id}/events/activities")
+def list_activities(
+    user_id: UUID,
+    start_date: DateTimeQueryParam,
+    end_date: DateTimeQueryParam,
+    db: DbSession,
+    _api_key: ApiKeyDep,
+    cursor: str | None = None,
+    limit: PageLimitQueryParam = DEFAULT_PAGE_SIZE,
+    provider: ProviderName | None = None,
+    source: str | None = None,
+    device_model: str | None = None,
+    data_source_id: UUID | None = None,
+) -> PaginatedResponse[ActivityRecord]:
+    """Returns activities the device detected by itself outside a recorded workout, such as Garmin Move IQ."""
+    params = EventRecordQueryParams(
+        start_datetime=parse_query_datetime(start_date),
+        end_datetime=parse_query_end_datetime(end_date),
+        cursor=cursor,
+        limit=limit,
+        provider=provider,
+        source=source,
+        device_model=device_model,
+        data_source_id=data_source_id,
+    )
+    return event_record_service.get_activities(db, user_id, params)
 
 
 @router.get("/users/{user_id}/events/meals")

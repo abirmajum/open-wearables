@@ -54,6 +54,9 @@ EXTRA_IMPL_FILES = {"apple": (Path("app/services/providers/apple/apple_xml/xml_s
 # Samsung has no `stepCount`/`recordingMethod` or laps/segments.
 SDK_UNREACHABLE_DETAIL_FIELDS = {"samsung": {"steps_count", "entry_source", "segments"}}
 
+# Payload keys a provider reads that share a detail field's name (Ultrahuman's sleep contributors carry a "title").
+RAW_KEYS_NAMED_LIKE_DETAIL_FIELDS = {"ultrahuman": {"title"}}
+
 # EventRecordDetail fields that are NOT part of the coverage matrix. provider_state is the sleep state as the provider
 # sent it, kept for is_final and never returned as data.
 STRUCTURAL_DETAIL_FIELDS = {"record_id", "energy_series", "provider_state"}
@@ -141,7 +144,12 @@ def test_set_detail_fields_are_declared(provider: str) -> None:
     declared = _workout_fields(cov) | _sleep_fields(cov) | _menstrual_cycle_fields(cov) | _meal_fields(cov)
 
     used = {field for field in TRACKED_DETAIL_FIELDS if re.search(rf"\b{field}=", source) or f'"{field}"' in source}
-    undeclared = used - declared - SDK_UNREACHABLE_DETAIL_FIELDS.get(provider, set())
+    undeclared = (
+        used
+        - declared
+        - SDK_UNREACHABLE_DETAIL_FIELDS.get(provider, set())
+        - RAW_KEYS_NAMED_LIKE_DETAIL_FIELDS.get(provider, set())
+    )
 
     assert not undeclared, f"{provider}: sets EventRecordDetail fields not declared in coverage: {sorted(undeclared)}"
 

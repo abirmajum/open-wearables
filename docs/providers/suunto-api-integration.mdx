@@ -225,6 +225,12 @@ SUUNTO_SUBSCRIPTION_KEY=private-subscription-id
   </Step>
 </Steps>
 
+## Upgrading an existing Suunto integration
+
+New deliveries identify workouts by Suunto's `workoutKey` and interpret Unix millisecond timestamps in UTC. The upgrade does not rekey or retime stored workouts: some older rows share a `workoutId` of `0`, and timestamps saved on a non-UTC host may be shifted. A historical sync can insert a second row if neither the key nor the exact time span matches.
+
+Leave existing history in place unless it needs repair. If repair is needed, back up the database and test reconciliation against the original Suunto payloads or a fresh provider export in staging. Match each row to a confirmed `workoutKey` and its original UTC timestamps before changing it; do not infer the key from a legacy ID or assume one timezone offset for the entire history.
+
 ## API Details
 
 | Detail | Value |
@@ -266,4 +272,3 @@ If you need more throughput, request a higher tier from Suunto through the API Z
 - Check [GitHub Discussions](https://github.com/the-momentum/open-wearables/discussions).
 - Check the [Suunto API Zone](https://apizone.suunto.com/) and the [How to start](https://apizone.suunto.com/how-to-start) guide.
 </Note>
-

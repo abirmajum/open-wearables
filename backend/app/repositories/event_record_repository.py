@@ -1,5 +1,5 @@
 import contextlib
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from uuid import UUID
@@ -60,6 +60,19 @@ from app.schemas.model_crud.activities import (
 from app.schemas.sync_status import DataTypeKind
 from app.utils.dates import local_date
 from app.utils.pagination import decode_cursor
+from app.utils.structured_logging import get_logger
+
+logger = get_logger(__name__)
+
+# PostgreSQL's limit on bind parameters in one statement
+_MAX_BIND_PARAMS = 65_535
+
+
+def _param_chunks[T](rows: list[T], columns: int) -> Iterator[list[T]]:
+    """``rows`` in slices whose ``columns`` bound parameters per row stay under PostgreSQL's limit."""
+    size = _MAX_BIND_PARAMS // columns
+    for i in range(0, len(rows), size):
+        yield rows[i : i + size]
 
 
 def _nap_condition(is_nap: bool) -> ColumnElement[bool]:
@@ -178,21 +191,208 @@ class EventRecordRepository(
             .one_or_none()
         )
 
+    @staticmethod
+    def lock_workouts(db_session: DbSession, user_id: UUID, provider: str, external_ids: Iterable[str]) -> None:
+        """Hold these workout ids of the user until the transaction ends.
+
+        Deliveries can use different data sources or times, so the span constraint cannot protect external IDs.
+        Take the locks in a consistent order for batches that share several IDs.
+        """
+        for external_id in sorted({external_id for external_id in external_ids if external_id}):
+            db_session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+                {"key": f"{provider}-workout:{user_id}:{external_id}"},
+            )
+
+    def _workout_key(self, creator: EventRecordCreate) -> tuple[UUID, str, str] | None:
+        """The user, provider and external_id that identify a workout across deliveries."""
+        if creator.category != EventCategory.WORKOUT or not creator.external_id or not creator.user_id:
+            return None
+        return creator.user_id, self.data_source_repo.provider_of(creator).value, creator.external_id
+
+    def _fetch_workouts_by_external_id(
+        self, db_session: DbSession, creators: list[EventRecordCreate]
+    ) -> dict[UUID, EventRecord]:
+        """Creator id -> newest stored workout of its user and provider with its external_id, in one query."""
+        keys = {key: creator.id for creator in creators if (key := self._workout_key(creator))}
+        if not keys:
+            return {}
+        source_ids = select(DataSource.id).where(
+            DataSource.user_id.in_({user_id for user_id, _, _ in keys}),
+            DataSource.provider.in_({provider for _, provider, _ in keys}),
+        )
+        rows = (
+            db_session.query(self.model, DataSource.user_id, DataSource.provider)
+            .join(DataSource, self.model.data_source_id == DataSource.id)
+            .filter(
+                self.model.data_source_id.in_(source_ids.scalar_subquery()),
+                self.model.category == EventCategory.WORKOUT,
+                self.model.external_id.in_({external_id for _, _, external_id in keys}),
+            )
+            .order_by(self.model.created_at.desc())
+        )
+        found: dict[UUID, EventRecord] = {}
+        for record, user_id, provider in rows:
+            if creator_id := keys.get((user_id, provider, record.external_id)):
+                found.setdefault(creator_id, record)
+        return found
+
+    def _refresh_from(self, db_session: DbSession, record: EventRecord, creator: EventRecordCreate) -> EventRecord:
+        """Update a stored workout to the newest delivery's times and type.
+
+        If another copy already holds those times, that copy is returned instead.
+        """
+        fields = ("type", "duration_seconds", "start_datetime", "end_datetime", "zone_offset")
+        updates = {field: value for field in fields if (value := getattr(creator, field)) is not None}
+        if all(getattr(record, field) == value for field, value in updates.items()):
+            return record
+        old_days = local_days(record.data_source_id, record.start_datetime, record.end_datetime, record.zone_offset)
+        nested = db_session.begin_nested()
+        try:
+            for field, value in updates.items():
+                setattr(record, field, value)
+            db_session.flush()
+            nested.commit()
+        except IntegrityError:
+            nested.rollback()
+            db_session.refresh(record)
+            holder = db_session.query(self.model).filter(
+                self.model.data_source_id == record.data_source_id,
+                self.model.category != EventCategory.MEAL,
+                self.model.start_datetime == creator.start_datetime,
+                self.model.end_datetime == creator.end_datetime,
+                self.model.external_id == record.external_id,
+            )
+            return holder.one_or_none() or record
+        self._record_coverage(db_session, [(creator, self.data_source_repo.provider_of(creator))])
+        mark_dirty_days(
+            db_session,
+            [
+                *old_days,
+                *local_days(record.data_source_id, record.start_datetime, record.end_datetime, record.zone_offset),
+            ],
+        )
+        return record
+
     def get_by_external_ids(
-        self, db_session: DbSession, user_id: UUID, external_ids: Iterable[str], provider: str | None = None
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        external_ids: Iterable[str],
+        provider: str | None = None,
+        category: EventCategory | None = None,
     ) -> dict[str, EventRecord]:
-        """The user's records carrying these provider ids, in one query, by external id."""
+        """The user's records carrying these provider ids, in one query, by external id; of an id stored more than
+        once, the copy that :meth:`get_copies_by_external_ids` lists first."""
+        copies = self.get_copies_by_external_ids(db_session, user_id, external_ids, provider, category)
+        if repeated := {
+            external_id: [str(record.id) for record, _ in records]
+            for external_id, records in copies.items()
+            if len(records) > 1
+        }:
+            logger.warning(
+                "Records stored more than once under one id, using the first",
+                provider=provider,
+                user_id=str(user_id),
+                record_ids=repeated,
+            )
+        return {external_id: records[0][0] for external_id, records in copies.items()}
+
+    def get_copies_by_external_ids(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        external_ids: Iterable[str],
+        provider: str | None = None,
+        category: EventCategory | None = None,
+    ) -> dict[str, list[tuple[EventRecord, str | None]]]:
+        """Every record of the user under each of these provider ids, with its source's device model: the copy
+        under a device first, then by start and id, so every lookup takes the same one."""
         ids = list({external_id for external_id in external_ids if external_id})
         if not ids:
             return {}
         query = (
-            db_session.query(self.model)
+            db_session.query(self.model, DataSource.device_model)
             .join(DataSource, self.model.data_source_id == DataSource.id)
             .filter(DataSource.user_id == user_id, self.model.external_id.in_(ids))
+            .order_by(DataSource.device_model.is_(None), self.model.start_datetime, self.model.id)
         )
         if provider is not None:
             query = query.filter(DataSource.provider == provider)
-        return {record.external_id: record for record in query if record.external_id}
+        if category is not None:
+            query = query.filter(self.model.category == category)
+        copies: dict[str, list[tuple[EventRecord, str | None]]] = {}
+        for record, device_model in query:
+            if record.external_id:
+                copies.setdefault(record.external_id, []).append((record, device_model))
+        return copies
+
+    def get_main_sleeps_by_external_ids(
+        self, db_session: DbSession, user_id: UUID, external_ids: Iterable[str], provider: str
+    ) -> dict[str, list[EventRecord]]:
+        """The user's main sleeps of this provider under each id, latest end first; naps sent under a night's id
+        are left out."""
+        ids = list({external_id for external_id in external_ids if external_id})
+        if not ids:
+            return {}
+        rows = (
+            db_session.query(self.model)
+            .join(DataSource, self.model.data_source_id == DataSource.id)
+            .filter(
+                DataSource.user_id == user_id,
+                DataSource.provider == provider,
+                self.model.category == EventCategory.SLEEP,
+                self.model.external_id.in_(ids),
+                _nap_condition(False),
+            )
+            .order_by(self.model.end_datetime.desc(), self.model.id)
+        )
+        nights: dict[str, list[EventRecord]] = {}
+        for record in rows:
+            if record.external_id:
+                nights.setdefault(record.external_id, []).append(record)
+        return nights
+
+    def get_ids_by_external_span(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        spans: Iterable[tuple[str | None, datetime, datetime]],
+        provider: str,
+    ) -> dict[tuple[str | None, datetime, datetime], UUID]:
+        """The user's records of this provider by (external id, start, end): a night and the naps sent under its id
+        stay apart."""
+        keys = list({span for span in spans if span[0]})
+        if not keys:
+            return {}
+        rows = (
+            db_session.query(self.model.id, self.model.external_id, self.model.start_datetime, self.model.end_datetime)
+            .join(DataSource, self.model.data_source_id == DataSource.id)
+            .filter(
+                DataSource.user_id == user_id,
+                DataSource.provider == provider,
+                tuple_(self.model.external_id, self.model.start_datetime, self.model.end_datetime).in_(keys),
+            )
+        )
+        return {(external_id, start, end): record_id for record_id, external_id, start, end in rows}
+
+    def sleep_windows(
+        self, db_session: DbSession, user_id: UUID, start: datetime, end: datetime, provider: str
+    ) -> list[tuple[datetime, datetime]]:
+        """Start and end of the user's sleep sessions from this provider that overlap [start, end]."""
+        rows = (
+            db_session.query(self.model.start_datetime, self.model.end_datetime)
+            .join(DataSource, self.model.data_source_id == DataSource.id)
+            .filter(
+                DataSource.user_id == user_id,
+                DataSource.provider == provider,
+                self.model.category == EventCategory.SLEEP,
+                self.model.start_datetime < end,
+                self.model.end_datetime > start,
+            )
+            .all()
+        )
+        return [(row.start_datetime, row.end_datetime) for row in rows]
 
     def main_sleep_ended_before(
         self, db_session: DbSession, user_id: UUID, at: datetime, within: timedelta, provider: str
@@ -275,6 +475,10 @@ class EventRecordRepository(
         return len(deleted)
 
     def create(self, db_session: DbSession, creator: EventRecordCreate) -> EventRecord:
+        if existing := self._fetch_workouts_by_external_id(db_session, [creator]).get(creator.id):
+            record = self._refresh_from(db_session, existing, creator)
+            db_session.commit()
+            return record
         data_source_id, provider, creation = self._build_creation(db_session, creator)
         try:
             db_session.add(creation)
@@ -288,7 +492,9 @@ class EventRecordRepository(
             return creation
         except IntegrityError:
             db_session.rollback()
-            if existing := self._fetch_existing(db_session, data_source_id, creation):
+            if existing := self._fetch_workouts_by_external_id(db_session, [creator]).get(
+                creator.id
+            ) or self._fetch_existing(db_session, data_source_id, creation):
                 return existing
             raise
 
@@ -333,6 +539,7 @@ class EventRecordRepository(
                     "data_source_id": source_id,
                     "category": creator.category,
                     "type": creator.type,
+                    "subtype": creator.subtype,
                     "source_name": creator.source_name,
                     "duration_seconds": creator.duration_seconds,
                     "start_datetime": creator.start_datetime,
@@ -346,21 +553,53 @@ class EventRecordRepository(
         self,
         db_session: DbSession,
         creators: list[EventRecordCreate],
-    ) -> list[UUID]:
-        """Insert non-meal records, skipping existing ones. Meals go through bulk_upsert_meals."""
+    ) -> dict[UUID, UUID]:
+        """Insert non-meal records, skipping existing ones. Meals go through bulk_upsert_meals.
+
+        Returns creator id -> stored record id, for the records inserted and the workouts matched on external_id.
+        """
         if not creators:
-            return []
+            return {}
 
+        # Prefer the latest delivery, but keep earlier candidates in case its span is occupied.
+        latest = {key: creator.id for creator in creators if (key := self._workout_key(creator))}
+        copies = {
+            creator.id: latest[key]
+            for creator in creators
+            if (key := self._workout_key(creator)) and latest[key] != creator.id
+        }
+        fallbacks: dict[UUID, list[EventRecordCreate]] = {}
+        latest_creators = []
+        for creator in creators:
+            if latest_id := copies.get(creator.id):
+                fallbacks.setdefault(latest_id, []).append(creator)
+            else:
+                latest_creators.append(creator)
+
+        # Workouts already stored under their external_id take the newest delivery instead of inserting
+        creators_by_id = {creator.id: creator for creator in latest_creators}
+        stored = {
+            creator_id: self._refresh_from(db_session, record, creators_by_id[creator_id]).id
+            for creator_id, record in self._fetch_workouts_by_external_id(db_session, latest_creators).items()
+        }
+        pending = [creator for creator in latest_creators if creator.id not in stored]
+        while pending:
+            inserted_ids = self._insert_new_records(db_session, pending)
+            retry = []
+            for creator in pending:
+                latest_id = copies.get(creator.id, creator.id)
+                if creator.id in inserted_ids:
+                    stored[latest_id] = creator.id
+                elif earlier := fallbacks.get(latest_id):
+                    retry.append(earlier.pop())
+            pending = retry
+
+        return stored | {copy: stored[last] for copy, last in copies.items() if last in stored}
+
+    def _insert_new_records(self, db_session: DbSession, creators: list[EventRecordCreate]) -> set[UUID]:
         values_list = self._resolve_values(db_session, creators)
-        if not values_list:
-            return []
-
-        # Batch insert with ON CONFLICT DO NOTHING
-        # Chunk to stay under PostgreSQL's 65535 parameter limit (10 params/row → max ~6553 rows)
-        chunk_size = 6_500
         inserted_ids: set[UUID] = set()
-        for i in range(0, len(values_list), chunk_size):
-            chunk = values_list[i : i + chunk_size]
+        for chunk in _param_chunks(values_list, len(values_list[0])) if values_list else ():
             stmt = (
                 insert(self.model)
                 .values(chunk)
@@ -386,9 +625,7 @@ class EventRecordRepository(
                 )
             ),
         )
-        # NOTE: Caller should commit - allows batching multiple operations
-
-        return list(inserted_ids)
+        return inserted_ids
 
     @staticmethod
     def _record_coverage(db_session: DbSession, records: list[tuple[EventRecordCreate, ProviderName]]) -> None:
@@ -425,9 +662,7 @@ class EventRecordRepository(
 
         result: dict[UUID, tuple[UUID, bool]] = {}
         entries = list(values_by_key.values())
-        chunk_size = 6_500
-        for i in range(0, len(entries), chunk_size):
-            chunk = entries[i : i + chunk_size]
+        for chunk in _param_chunks(entries, len(entries[0][1])):
             stmt = insert(self.model).values([values for _, values in chunk])
             stmt = stmt.on_conflict_do_update(
                 index_elements=["data_source_id", "external_id"],
@@ -600,7 +835,7 @@ class EventRecordRepository(
         if not query_params.cursor and query_params.offset:
             query = query.offset(query_params.offset)
 
-        return query.limit(limit + 1).all(), total_count  # ty:ignore[invalid-return-type]
+        return query.limit(limit + 1).all(), total_count  # ty:ignore[invalid-explicit-return]
 
     def get_workout_totals(
         self,
@@ -1285,7 +1520,7 @@ class EventRecordRepository(
         local_end = cast(
             func.timezone("UTC", EventRecord.end_datetime)
             + cast(func.coalesce(EventRecord.zone_offset, "+00:00"), Interval),
-            Date,
+            Date(),
         )
         rows = (
             db_session.query(

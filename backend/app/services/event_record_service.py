@@ -1,9 +1,12 @@
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
+from typing import cast
 from uuid import UUID, uuid4
 
+from sqlalchemy import Column, Table, and_, delete, exists, func, select, tuple_
 from sqlalchemy import event as sa_event
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Query
 
 from app.config import settings
@@ -31,6 +34,7 @@ from app.repositories import (
     HealthScoreRepository,
 )
 from app.repositories.data_point_series_repository import WorkoutWindow
+from app.repositories.data_source_repository import DataSourceIdentity
 from app.repositories.data_type_coverage_repository import data_type_coverage_repository
 from app.repositories.event_record_repository import local_days
 from app.schemas.data_type_coverage import CoverageSpan
@@ -49,6 +53,7 @@ from app.schemas.model_crud.activities import (
 from app.schemas.model_crud.activities.sleep import SleepStage
 from app.schemas.model_crud.activities.zones import HRZones, PowerZones
 from app.schemas.responses.activity import (
+    ActivityRecord,
     Macros,
     Meal,
     MenstrualCycleRecord,
@@ -124,6 +129,22 @@ def pace_sec_per_km(distance_meters: float | None, seconds: int | None) -> float
 def _first_number(*values: Decimal | None) -> float | None:
     """The first value that is set, so a provider's 0 kcal is kept rather than skipped."""
     return next((float(value) for value in values if value is not None), None)
+
+
+def _fill_nulls(db_session: DbSession, key: Column, target: UUID, source: UUID, columns: Iterable[str]) -> None:
+    """Each of these columns of the ``target`` row that is null takes the ``source`` row's value."""
+    table = key.table
+    other = table.alias("other")
+    db_session.execute(
+        table.update()
+        .where(key == target)
+        .values(
+            {
+                c: func.coalesce(table.c[c], select(other.c[c]).where(other.c[key.key] == source).scalar_subquery())
+                for c in columns
+            }
+        )
+    )
 
 
 class EventRecordService(
@@ -229,8 +250,8 @@ class EventRecordService(
         """Return the local calendar date of a sleep session start."""
         return cls._to_local(start_datetime, zone_offset).date()
 
-    def _widen_sleep_coverage(self, db_session: DbSession, session: EventRecord) -> None:
-        """Widen the provider's sleep coverage to a session re-sent over a longer window.
+    def _widen_coverage(self, db_session: DbSession, session: EventRecord) -> None:
+        """Widen the provider's coverage of the session's category to a session re-sent over a longer window.
 
         A shorter one is not narrowed here: that recount takes the global coverage lock, too much for every webhook.
         """
@@ -240,7 +261,7 @@ class EventRecordService(
         span = CoverageSpan(
             data_source.user_id,
             data_source.provider,
-            EventCategory.SLEEP.value,
+            session.category,
             DataTypeKind.EVENT,
             session.start_datetime,
             session.end_datetime,
@@ -464,6 +485,303 @@ class EventRecordService(
             )
         return result
 
+    def refresh_sleep(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        stored: EventRecord,
+        record: EventRecordCreate,
+        detail: EventRecordDetailCreate,
+    ) -> None:
+        """A session the provider sent again under its id: the stored one takes the new span and detail.
+
+        Caller is responsible for commit.
+        """
+        old_start, old_end, old_zone = stored.start_datetime, stored.end_datetime, stored.zone_offset
+        for field in ("start_datetime", "end_datetime", "zone_offset"):
+            new_val = getattr(record, field, None)
+            if new_val is not None:
+                setattr(stored, field, new_val)
+        stored.duration_seconds = int((stored.end_datetime - stored.start_datetime).total_seconds())
+        if stored.end_datetime != old_end:
+            # Its provider score sits at the old end, which a shortened night leaves outside its window.
+            self.health_score_repo.drop_provider_sleep_score(db_session, stored.data_source_id, old_end)
+        db_session.flush()
+        self._widen_coverage(db_session, stored)
+        # Its session rows are rolled up over the window it has now, on the days it left and joined.
+        mark_dirty_days(
+            db_session,
+            [
+                *local_days(stored.data_source_id, old_start, old_end, old_zone),
+                *local_days(stored.data_source_id, stored.start_datetime, stored.end_datetime, stored.zone_offset),
+            ],
+        )
+        self.event_record_detail_repo.delete_by_record_id(db_session, stored.id, EventCategory.SLEEP)
+        self.event_record_detail_repo.create_and_flush(
+            db_session,
+            detail.model_copy(update={"record_id": stored.id}),
+            detail_type=EventCategory.SLEEP,
+        )
+        self._recompute_sleep_scores(
+            db_session,
+            user_id,
+            {
+                self._local_sleep_date(old_start, old_zone),
+                self._local_sleep_date(stored.start_datetime, stored.zone_offset),
+            },
+        )
+
+    def lock_workouts(self, db_session: DbSession, user_id: UUID, provider: str, external_ids: Iterable[str]) -> None:
+        self.crud.lock_workouts(db_session, user_id, provider, external_ids)
+
+    def lock_stored_workouts(
+        self, db_session: DbSession, user_id: UUID, provider: str, external_ids: Iterable[str]
+    ) -> dict[str, EventRecord]:
+        """Lock these workout ids of the user until the transaction ends, and return the stored workout of each.
+
+        A workout stored twice, as two concurrent pushes could before the lock, is merged into its copy under the
+        device first (see :meth:`_merge_workout_copies`).
+        """
+        ids = list(external_ids)
+        self.lock_workouts(db_session, user_id, provider, ids)
+        stored: dict[str, EventRecord] = {}
+        for external_id, copies in self.crud.get_copies_by_external_ids(
+            db_session, user_id, ids, provider, EventCategory.WORKOUT
+        ).items():
+            stored[external_id] = self._merge_workout_copies(db_session, user_id, provider, copies)
+        return stored
+
+    def _merge_workout_copies(
+        self, db_session: DbSession, user_id: UUID, provider: str, copies: list[tuple[EventRecord, str | None]]
+    ) -> EventRecord:
+        """The one workout these copies of an id are: each copy under no device is merged into the one copy under a
+        device, a value either holds kept and the device's kept where both do, and then deleted. A statistic both hold
+        keeps the larger count.
+
+        Copies under two devices, or under none, are no copy of a FIT file and its summary, so all are kept and the
+        first stands for the workout. Coverage is not recounted, as when a push shortens a stored workout. The recount
+        would wait on the global coverage lock that WHOOP syncs take, with this workout still locked.
+        """
+        target = copies[0][0]
+        if len(copies) == 1:
+            return target
+        record_ids = [str(record.id) for record, _ in copies]
+        devices = [record for record, device_model in copies if device_model is not None]
+        if len(devices) != 1:
+            logger.warning(
+                "Workout stored more than once, copies not merged",
+                provider=provider,
+                user_id=str(user_id),
+                external_id=target.external_id,
+                record_ids=record_ids,
+            )
+            return target
+        db_session.flush()
+        records = cast(Table, EventRecord.__table__)
+        details = cast(Table, WorkoutDetails.__table__)
+        stats = cast(Table, EventRecordAggregate.__table__)
+        days = local_days(target.data_source_id, target.start_datetime, target.end_datetime, target.zone_offset)
+        for copy, _ in copies[1:]:
+            _fill_nulls(db_session, records.c.id, target.id, copy.id, ("type", "subtype", "zone_offset"))
+            other_details = details.alias("other_details")
+            db_session.execute(
+                details.update()
+                .where(details.c.record_id == copy.id, ~exists().where(other_details.c.record_id == target.id))
+                .values(record_id=target.id)
+            )
+            _fill_nulls(
+                db_session,
+                details.c.record_id,
+                target.id,
+                copy.id,
+                [c.key for c in details.columns if c.key not in ("record_id", "created_at")],
+            )
+            other_stats = stats.alias("other_stats")
+            same_series = and_(
+                other_stats.c.series_type_definition_id == stats.c.series_type_definition_id,
+                other_stats.c.computed_by == stats.c.computed_by,
+            )
+            db_session.execute(
+                stats.update()
+                .where(stats.c.record_id == target.id, other_stats.c.record_id == copy.id, same_series)
+                .values(
+                    {c: func.coalesce(stats.c[c], other_stats.c[c]) for c in ("sum", "avg", "min", "max", "last")}
+                    | {"count": func.greatest(stats.c.count, other_stats.c.count)}
+                )
+            )
+            db_session.execute(
+                stats.update()
+                .where(stats.c.record_id == copy.id, ~exists().where(other_stats.c.record_id == target.id, same_series))
+                .values(record_id=target.id)
+            )
+            days += local_days(copy.data_source_id, copy.start_datetime, copy.end_datetime, copy.zone_offset)
+            db_session.execute(delete(EventRecord).where(EventRecord.id == copy.id))
+            logger.warning(
+                "Workout stored twice, merged into its device's copy and the other copy removed",
+                provider=provider,
+                user_id=str(user_id),
+                external_id=target.external_id,
+                record_id=str(target.id),
+                removed_record_id=str(copy.id),
+            )
+        db_session.expire(target)
+        mark_dirty_days(db_session, days)
+        return target
+
+    def update_stored_workouts(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        provider: str,
+        workouts: Sequence[tuple[EventRecordCreate, EventRecordDetailCreate]],
+    ) -> tuple[list[tuple[EventRecordCreate, EventRecordDetailCreate]], list[UUID]]:
+        """Update the user's stored workouts that these pushes send again under their id.
+
+        A provider can send one workout in several pushes, in any order, each with some of its fields. The stored
+        workout takes the device, type and span a push names, and its detail the values the push carries; what a
+        push leaves out keeps its stored value. Caller is responsible for commit; the workouts' ids stay locked until
+        then, so a concurrent push of one of them waits and finds what this one stores.
+
+        Returns:
+            The workouts not stored yet, and the ids of the stored ones updated.
+        """
+        stored = self.lock_stored_workouts(
+            db_session, user_id, provider, (record.external_id or "" for record, _ in workouts)
+        )
+        new: list[tuple[EventRecordCreate, EventRecordDetailCreate]] = []
+        updated: list[UUID] = []
+        for record, detail in workouts:
+            if (target := stored.get(record.external_id or "")) is None:
+                new.append((record, detail))
+                continue
+            self._refresh_workout(db_session, target, record)
+            # One upsert per detail: a batch carrying the same workout twice would update one row twice
+            self.event_record_detail_repo.bulk_create(
+                db_session, [detail.model_copy(update={"record_id": target.id})], detail_type=EventCategory.WORKOUT
+            )
+            updated.append(target.id)
+        return new, updated
+
+    def save_workouts(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        provider: str,
+        workouts: Sequence[tuple[EventRecordCreate, EventRecordDetailCreate]],
+    ) -> tuple[list[UUID], list[UUID]]:
+        """Store these workouts of the user: one stored under its id takes what the push carries, the rest are
+        inserted. Caller is responsible for commit, which sends the new workouts' webhooks.
+
+        Returns:
+            The ids of the workouts inserted, and of the stored ones updated.
+        """
+        if not workouts:
+            return [], []
+        new, updated = self.update_stored_workouts(db_session, user_id, provider, workouts)
+        first_inserted: set[UUID] = set()
+        fallback_inserted: set[UUID] = set()
+        candidates = [record for record, _ in new]
+        inserted_this_round = first_inserted
+        while candidates:
+            first_deliveries = []
+            later_deliveries = []
+            seen: set[str] = set()
+            for record in candidates:
+                if record.external_id:
+                    if record.external_id in seen:
+                        later_deliveries.append(record)
+                        continue
+                    seen.add(record.external_id)
+                first_deliveries.append(record)
+            stored = self.bulk_create(db_session, first_deliveries)
+            inserted_this_round.update(record_id for record_id, stored_id in stored.items() if record_id == stored_id)
+            stored_keys = {record.external_id for record in first_deliveries if record.id in stored}
+            candidates = [record for record in later_deliveries if record.external_id not in stored_keys]
+            inserted_this_round = fallback_inserted
+        inserted = first_inserted | fallback_inserted
+        self.bulk_create_details(db_session, [detail for record, detail in new if record.id in first_inserted])
+        # If an earlier span was occupied, replay details in delivery order onto the later insert.
+        if repeated := [(record, detail) for record, detail in new if record.id not in first_inserted]:
+            dropped, again = self.update_stored_workouts(db_session, user_id, provider, repeated)
+            updated.extend(record_id for record_id in again if record_id not in fallback_inserted)
+            if dropped:
+                logger.warning(
+                    "Workouts not stored, other records of their sources hold their spans",
+                    provider=provider,
+                    user_id=str(user_id),
+                    held_by=self._span_holders(db_session, [record for record, _ in dropped]),
+                )
+        if fallback_inserted and svix_service.is_enabled():
+            self._queue_bulk_webhooks(
+                db_session,
+                [
+                    EventRecordDetailCreate.model_validate(detail, from_attributes=True)
+                    for record_id in fallback_inserted
+                    if (
+                        detail := self.event_record_detail_repo.get_by_record_id(
+                            db_session, record_id, EventCategory.WORKOUT
+                        )
+                    )
+                    is not None
+                ],
+            )
+        return [record.id for record, _ in new if record.id in inserted], updated
+
+    def _span_holders(self, db_session: DbSession, records: list[EventRecordCreate]) -> dict[str, str]:
+        """The id of the stored record holding each record's span in its data source, by the record's external id."""
+        sources = self.data_source_repo.resolve_creators(db_session, records)
+        spans = {
+            (sources.get(DataSourceIdentity.of(record)), record.start_datetime, record.end_datetime): str(
+                record.external_id
+            )
+            for record in records
+        }
+        held = db_session.execute(
+            select(EventRecord.id, EventRecord.data_source_id, EventRecord.start_datetime, EventRecord.end_datetime)
+            .where(tuple_(EventRecord.data_source_id, EventRecord.start_datetime, EventRecord.end_datetime).in_(spans))
+            .where(EventRecord.category != EventCategory.MEAL)
+        )
+        return {spans[(source_id, start, end)]: str(record_id) for record_id, source_id, start, end in held}
+
+    def _refresh_workout(self, db_session: DbSession, stored: EventRecord, record: EventRecordCreate) -> None:
+        """The stored workout takes the device, type and span the push names."""
+        old_source, old_start, old_end, old_zone = (
+            stored.data_source_id,
+            stored.start_datetime,
+            stored.end_datetime,
+            stored.zone_offset,
+        )
+        changes = {
+            field: value
+            for field in ("type", "duration_seconds", "start_datetime", "end_datetime", "zone_offset")
+            if (value := getattr(record, field)) is not None
+        }
+        if record.device_model is not None and (
+            source_id := self.data_source_repo.resolve_creators(db_session, [record]).get(DataSourceIdentity.of(record))
+        ):
+            changes |= {"data_source_id": source_id, "source_name": record.source_name}
+        try:
+            with db_session.begin_nested():
+                for field, value in changes.items():
+                    setattr(stored, field, value)
+                db_session.flush()
+        except IntegrityError as e:
+            logger.warning(
+                "Re-sent workout not moved, another record holds its source and span",
+                record_id=str(stored.id),
+                external_id=stored.external_id,
+                error=str(e),
+            )
+            return
+        self._widen_coverage(db_session, stored)
+        mark_dirty_days(
+            db_session,
+            [
+                *local_days(old_source, old_start, old_end, old_zone),
+                *local_days(stored.data_source_id, stored.start_datetime, stored.end_datetime, stored.zone_offset),
+            ],
+        )
+
     def _create_or_merge_sleep_inner(
         self,
         db_session: DbSession,
@@ -503,44 +821,7 @@ class EventRecordService(
             # retry, score update).  Replace the detail with fresh values instead
             # of accumulating them on top of the existing ones.
             if record.external_id is not None and adjacent.external_id == record.external_id:
-                old_start, old_end, old_zone = adjacent.start_datetime, adjacent.end_datetime, adjacent.zone_offset
-                for field in ("start_datetime", "end_datetime", "zone_offset"):
-                    new_val = getattr(record, field, None)
-                    if new_val is not None:
-                        setattr(adjacent, field, new_val)
-                adjacent.duration_seconds = int((adjacent.end_datetime - adjacent.start_datetime).total_seconds())
-                if adjacent.end_datetime != old_end:
-                    # Its provider score sits at the old end, which a shortened night leaves outside its window.
-                    self.health_score_repo.drop_provider_sleep_score(db_session, adjacent.data_source_id, old_end)
-                db_session.flush()
-                self._widen_sleep_coverage(db_session, adjacent)
-                # Its session rows are rolled up over the window it has now, on the days it left and joined.
-                mark_dirty_days(
-                    db_session,
-                    [
-                        *local_days(adjacent.data_source_id, old_start, old_end, old_zone),
-                        *local_days(
-                            adjacent.data_source_id,
-                            adjacent.start_datetime,
-                            adjacent.end_datetime,
-                            adjacent.zone_offset,
-                        ),
-                    ],
-                )
-                self.event_record_detail_repo.delete_by_record_id(db_session, adjacent.id, EventCategory.SLEEP)
-                self.event_record_detail_repo.create_and_flush(
-                    db_session,
-                    detail.model_copy(update={"record_id": adjacent.id}),
-                    detail_type=EventCategory.SLEEP,
-                )
-                self._recompute_sleep_scores(
-                    db_session,
-                    user_id,
-                    {
-                        self._local_sleep_date(old_start, old_zone),
-                        self._local_sleep_date(adjacent.start_datetime, adjacent.zone_offset),
-                    },
-                )
+                self.refresh_sleep(db_session, user_id, adjacent, record, detail)
                 db_session.commit()
                 return adjacent, False, detail
 
@@ -862,7 +1143,7 @@ class EventRecordService(
         self,
         db_session: DbSession,
         records: list[EventRecordCreate],
-    ) -> list[UUID]:
+    ) -> dict[UUID, UUID]:
         """Bulk create event records with batch data source resolution."""
         # Webhooks are not emitted for bulk-created records; they fire from
         # bulk_create_details() when the matching details are inserted.
@@ -873,10 +1154,21 @@ class EventRecordService(
         db_session: DbSession,
         details: list[EventRecordDetailCreate],
         detail_type: DetailType = EventCategory.WORKOUT,
+        created: set[UUID] | None = None,
     ) -> None:
-        """Bulk create event record details and fire one webhook per detail on commit."""
+        """Bulk create event record details and fire one webhook per detail on commit.
+
+        With created given, only those records fire it; the rest are refreshes of stored records.
+        """
+        # Several deliveries of one workout in a batch resolve to one record; the last one's detail stands
+        details = list({d.record_id: d for d in details}.values())
         self.event_record_detail_repo.bulk_create(db_session, details, detail_type=detail_type)
 
+        if created is not None:
+            details = [d for d in details if d.record_id in created]
+        self._queue_bulk_webhooks(db_session, details)
+
+    def _queue_bulk_webhooks(self, db_session: DbSession, details: list[EventRecordDetailCreate]) -> None:
         if not details or not svix_service.is_enabled():
             return
 
@@ -935,6 +1227,30 @@ class EventRecordService(
         logger.debug("Retrieved event records", user_id=user_id, count=len(records), total_count=total_count)
 
         return records, total_count
+
+    @staticmethod
+    def _page(
+        records: list[tuple[EventRecord, DataSource]], params: EventRecordQueryParams
+    ) -> tuple[list[tuple[EventRecord, DataSource]], bool, str | None, str | None]:
+        """The page of records fetched one past the limit, whether more follow, and its next and previous cursors.
+
+        A backward page keeps the records nearest its cursor and has a previous cursor only while more precede it.
+        """
+        limit = params.limit or 20
+        has_more = len(records) > limit
+        is_backward = bool(params.cursor and params.cursor.startswith("prev_"))
+        if has_more:
+            records = records[-limit:] if is_backward else records[:limit]
+        if not records:
+            return records, has_more, None, None
+        first, last = records[0][0], records[-1][0]
+        next_cursor = encode_cursor(last.start_datetime, last.id, "next") if has_more else None
+        previous_cursor = (
+            encode_cursor(first.start_datetime, first.id, "prev")
+            if params.cursor and (has_more or not is_backward)
+            else None
+        )
+        return records, has_more, next_cursor, previous_cursor
 
     def get_records_response(
         self,
@@ -999,39 +1315,7 @@ class EventRecordService(
         # Ensure total_count is always an int (not None)
         total_count = total_count if total_count is not None else 0
 
-        limit = params.limit or 20
-        has_more = len(records) > limit
-
-        # Check if this is backward pagination
-        is_backward = params.cursor and params.cursor.startswith("prev_")
-
-        # Trim to limit
-        if has_more:
-            records = records[-limit:] if is_backward else records[:limit]
-
-        # Generate cursors
-        next_cursor = None
-        previous_cursor = None
-
-        if records:
-            # Always generate next_cursor if has_more
-            if has_more:
-                last_record, _ = records[-1]
-                next_cursor = encode_cursor(last_record.start_datetime, last_record.id, "next")
-
-            # Generate previous_cursor only if:
-            # 1. We used a cursor to get here (not the first page)
-            # 2. There are more items before (for backward) OR we're doing forward navigation
-            if params.cursor:
-                # For backward navigation: only set previous_cursor if has_more
-                # For forward navigation: always set previous_cursor
-                if is_backward:
-                    if has_more:
-                        first_record, _ = records[0]
-                        previous_cursor = encode_cursor(first_record.start_datetime, first_record.id, "prev")
-                else:
-                    first_record, _ = records[0]
-                    previous_cursor = encode_cursor(first_record.start_datetime, first_record.id, "prev")
+        records, has_more, next_cursor, previous_cursor = self._page(records, params)
 
         statistics = self.crud.get_workout_statistics(db_session, [r.id for r, _ in records])
         computed_hr = self._resolve_avg_hr(db_session, [r for r, _ in records], statistics)
@@ -1076,6 +1360,9 @@ class EventRecordService(
                 moving_time_seconds=details.moving_time_seconds if details else None,
                 elev_high=as_float(stats.get("elev_high")),
                 elev_low=as_float(stats.get("elev_low")),
+                aerobic_training_effect=as_float(details.aerobic_training_effect) if details else None,
+                anaerobic_training_effect=as_float(details.anaerobic_training_effect) if details else None,
+                training_load=as_float(details.training_load) if details else None,
                 hr_zones=as_model(HRZones, details.hr_zones) if details and with_zones else None,
                 power_zones=as_model(PowerZones, details.power_zones) if details and with_zones else None,
                 segments=as_dict_list(details.segments) if details and with_segments else None,
@@ -1153,39 +1440,7 @@ class EventRecordService(
         # Ensure total_count is always an int (not None)
         total_count = total_count if total_count is not None else 0
 
-        limit = params.limit or 20
-        has_more = len(records) > limit
-
-        # Check if this is backward pagination
-        is_backward = params.cursor and params.cursor.startswith("prev_")
-
-        # Trim to limit
-        if has_more:
-            records = records[-limit:] if is_backward else records[:limit]
-
-        # Generate cursors
-        next_cursor = None
-        previous_cursor = None
-
-        if records:
-            # Always generate next_cursor if has_more
-            if has_more:
-                last_record, _ = records[-1]
-                next_cursor = encode_cursor(last_record.start_datetime, last_record.id, "next")
-
-            # Generate previous_cursor only if:
-            # 1. We used a cursor to get here (not the first page)
-            # 2. There are more items before (for backward) OR we're doing forward navigation
-            if params.cursor:
-                # For backward navigation: only set previous_cursor if has_more
-                # For forward navigation: always set previous_cursor
-                if is_backward:
-                    if has_more:
-                        first_record, _ = records[0]
-                        previous_cursor = encode_cursor(first_record.start_datetime, first_record.id, "prev")
-                else:
-                    first_record, _ = records[0]
-                    previous_cursor = encode_cursor(first_record.start_datetime, first_record.id, "prev")
+        records, has_more, next_cursor, previous_cursor = self._page(records, params)
 
         final_ids = final_record_ids(db_session, user_id, records, datetime.now(timezone.utc))
         data = []
@@ -1246,28 +1501,7 @@ class EventRecordService(
         records, total_count = self._get_records_with_filters(db_session, params, str(user_id))
         total_count = total_count if total_count is not None else 0
 
-        limit = params.limit or 20
-        has_more = len(records) > limit
-        is_backward = params.cursor and params.cursor.startswith("prev_")
-
-        if has_more:
-            records = records[-limit:] if is_backward else records[:limit]
-
-        next_cursor = None
-        previous_cursor = None
-
-        if records:
-            if has_more:
-                last_record, _ = records[-1]
-                next_cursor = encode_cursor(last_record.start_datetime, last_record.id, "next")
-            if params.cursor:
-                if is_backward:
-                    if has_more:
-                        first_record, _ = records[0]
-                        previous_cursor = encode_cursor(first_record.start_datetime, first_record.id, "prev")
-                else:
-                    first_record, _ = records[0]
-                    previous_cursor = encode_cursor(first_record.start_datetime, first_record.id, "prev")
+        records, has_more, next_cursor, previous_cursor = self._page(records, params)
 
         data = []
         for record, data_source in records:
@@ -1312,6 +1546,46 @@ class EventRecordService(
             ),
         )
 
+    def get_activities(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        params: EventRecordQueryParams,
+    ) -> PaginatedResponse[ActivityRecord]:
+        params.category = EventCategory.ACTIVITY
+        records, total_count = self._get_records_with_filters(db_session, params, str(user_id))
+
+        records, has_more, next_cursor, previous_cursor = self._page(records, params)
+
+        data = [
+            ActivityRecord(
+                id=record.id,
+                type=record.type,
+                subtype=record.subtype,
+                start_time=record.start_datetime,
+                end_time=record.end_datetime,
+                zone_offset=record.zone_offset,
+                duration_seconds=record.duration_seconds,
+                source=self._map_source(data_source),
+            )
+            for record, data_source in records
+        ]
+
+        return PaginatedResponse(
+            data=data,
+            pagination=Pagination(
+                has_more=has_more,
+                next_cursor=next_cursor,
+                previous_cursor=previous_cursor,
+                total_count=total_count,
+            ),
+            metadata=TimeseriesMetadata(
+                sample_count=len(data),
+                start_time=params.start_datetime,
+                end_time=params.end_datetime,
+            ),
+        )
+
     def get_meals(
         self,
         db_session: DbSession,
@@ -1321,28 +1595,7 @@ class EventRecordService(
         params.category = EventCategory.MEAL
         records, total_count = self._get_records_with_filters(db_session, params, str(user_id))
 
-        limit = params.limit or 20
-        has_more = len(records) > limit
-        is_backward = params.cursor and params.cursor.startswith("prev_")
-
-        if has_more:
-            records = records[-limit:] if is_backward else records[:limit]
-
-        next_cursor = None
-        previous_cursor = None
-
-        if records:
-            if has_more:
-                last_record, _ = records[-1]
-                next_cursor = encode_cursor(last_record.start_datetime, last_record.id, "next")
-            if params.cursor:
-                if is_backward:
-                    if has_more:
-                        first_record, _ = records[0]
-                        previous_cursor = encode_cursor(first_record.start_datetime, first_record.id, "prev")
-                else:
-                    first_record, _ = records[0]
-                    previous_cursor = encode_cursor(first_record.start_datetime, first_record.id, "prev")
+        records, has_more, next_cursor, previous_cursor = self._page(records, params)
 
         data = []
         for record, data_source in records:

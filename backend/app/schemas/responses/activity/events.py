@@ -63,6 +63,15 @@ class Workout(BaseModel):
     moving_time_seconds: int | None = None
     elev_high: float | None = None
     elev_low: float | None = None
+    aerobic_training_effect: float | None = Field(
+        None, description="The workout's aerobic training effect, 0.0 to 5.0, from its FIT file", example=3.4
+    )
+    anaerobic_training_effect: float | None = Field(
+        None, description="The workout's anaerobic training effect, 0.0 to 5.0, from its FIT file", example=1.2
+    )
+    training_load: float | None = Field(
+        None, description="The workout's training load (EPOC-based), from its FIT file", example=142.0
+    )
     hr_zones: HRZones | None = None
     power_zones: PowerZones | None = None
     segments: list[dict] | None = None
@@ -153,6 +162,19 @@ class SleepSession(BaseModel):
         description="Whether no more data is expected for this session; until then the provider may still extend it",
         example=True,
     )
+
+
+class ActivityRecord(BaseModel):
+    """An activity the device detected by itself, outside a recorded workout (e.g. Garmin Move IQ)."""
+
+    id: UUID
+    type: str | None = Field(None, example="moveiq_walking")
+    subtype: str | None = Field(None, description="The device's finer kind of the type", example="hurried")
+    start_time: datetime
+    end_time: datetime
+    zone_offset: str | None = None
+    duration_seconds: int | None = None
+    source: SourceMetadata
 
 
 class MenstrualCycleRecord(BaseModel):
