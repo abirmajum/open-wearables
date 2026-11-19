@@ -12,6 +12,8 @@ import httpx
 import redis
 from redis.backoff import NoBackoff
 from redis.retry import Retry
+from sqlalchemy import Engine, create_engine, text
+from sqlalchemy.pool import NullPool
 
 from app.config import settings
 from app.constants.celery_tasks import CeleryQueue
@@ -19,6 +21,28 @@ from app.constants.celery_tasks import CeleryQueue
 HEARTBEAT_TTL_SECONDS = 120
 HEARTBEAT_INTERVAL_SECONDS = 30
 HEARTBEAT_KEY_PREFIX = "ow:service-health:queue:"
+
+
+@lru_cache
+def health_database() -> Engine:
+    return create_engine(
+        settings.db_uri,
+        poolclass=NullPool,
+        connect_args={
+            "connect_timeout": 2,
+            "options": "-c statement_timeout=2000",
+            "tcp_user_timeout": 2000,
+        },
+    )
+
+
+def service_database_is_ready() -> bool:
+    try:
+        with health_database().connect() as connection:
+            connection.execute(text("SELECT 1"))
+    except Exception:
+        return False
+    return True
 
 
 @lru_cache
@@ -44,9 +68,9 @@ def services_are_ready() -> bool:
         if not all(value == "ok" for value in values):
             return False
         if settings.outgoing_webhooks_enabled:
-            response = httpx.get(f"{settings.svix_server_url.rstrip('/')}/api/v1/health", timeout=2)
-            if response.status_code != 200:
-                return False
+            with httpx.stream("GET", f"{settings.svix_server_url.rstrip('/')}/api/v1/health", timeout=2) as response:
+                if response.status_code != 200:
+                    return False
     except Exception:
         return False
     return True
