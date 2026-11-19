@@ -166,6 +166,20 @@ class WhoopWorkouts(BaseWorkoutsTemplate):
             )
             return 0
 
+    def save_single_workout(self, db: DbSession, user_id: UUID, raw: dict[str, Any]) -> int:
+        workout = WhoopWorkoutJSON(**raw)
+        if workout.score_state != "SCORED" and workout.score is None:
+            return 0
+        record, detail, health_score = self._normalize_workout(workout, user_id)
+        inserted, updated = event_record_service.save_workouts(db, user_id, "whoop", [(record, detail)])
+        if not inserted and not updated:
+            return 0
+        if health_score:
+            health_score_service.upsert_event_score(
+                db, health_score.model_copy(update={"event_record_id": (inserted or updated)[0]})
+            )
+        return 1
+
     def _extract_dates(self, start_timestamp: str, end_timestamp: str) -> tuple[datetime, datetime]:
         """Extract start and end dates from ISO 8601 strings."""
         # Parse ISO 8601 strings, handling timezone info

@@ -392,6 +392,25 @@ This change does not initiate a backfill or repair gaps from earlier cursor move
 those require a separately requested historical sync.
 
 
+## Webhooks for linked profiles
+
+When one WHOOP account is linked to several active Open Wearables profiles, each
+webhook updates or deletes the resource for every linked profile. Updates fetch
+the resource once; a rejected or unavailable token falls back to another linked
+connection. Missing resources, rate limits and provider outages are not fetched
+again with every token.
+
+Each profile commits independently and receives its own sync-log outcome. Temporary
+write failures retry only the failed profiles, not those that already succeeded.
+Non-retryable errors and exhausted retries are reported as failed for the affected
+profiles. The normal webhook task retry policy and commit-after-handler safeguard
+still apply. Replayed workouts and sleeps update existing records without sending
+another creation event.
+
+Sleep webhooks also refresh the recent cycles once and save the same snapshots for
+each linked profile. Cycle refresh is best effort; scheduled pulls repair failures.
+Open cycles remain canonical cycle snapshots, not provisional daily measurements.
+
 ## Ongoing physiological cycles
 
 `GET /api/v1/users/{user_id}/summaries/cycles` returns the latest stored revision of
