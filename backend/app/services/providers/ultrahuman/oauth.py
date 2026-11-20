@@ -44,6 +44,18 @@ def provider_user_info(profile_data: Any, user_id: str) -> dict[str, str | None]
     }
 
 
+def fetch_provider_user_info(api_base_url: str, access_token: str, user_id: str) -> dict[str, str | None]:
+    """GET /user_data/user_info with a token, outside the authenticated request path: a refusal here neither
+    refreshes the token nor counts against the grant. Raises ``httpx.HTTPError`` when the call fails."""
+    response = httpx.get(
+        f"{api_base_url}/user_data/user_info",
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=30.0,
+    )
+    response.raise_for_status()
+    return provider_user_info(response.json(), user_id)
+
+
 class UltrahumanOAuth(BaseOAuthTemplate):
     """Ultrahuman Partnership API OAuth 2.0 implementation.
 
@@ -94,13 +106,7 @@ class UltrahumanOAuth(BaseOAuthTemplate):
         later sync fills it in (``Ultrahuman247Data._fill_provider_user_id``).
         """
         try:
-            profile_response = httpx.get(
-                f"{self.api_base_url}/user_data/user_info",
-                headers={"Authorization": f"Bearer {token_response.access_token}"},
-                timeout=30.0,
-            )
-            profile_response.raise_for_status()
-            return provider_user_info(profile_response.json(), user_id)
+            return fetch_provider_user_info(self.api_base_url, token_response.access_token, user_id)
         except httpx.HTTPError as e:
             logger.warning(
                 "Ultrahuman user profile not fetched at connect; retried on a later sync",

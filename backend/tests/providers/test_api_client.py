@@ -131,8 +131,11 @@ class TestMakeAuthenticatedRequest:
     @pytest.mark.parametrize(
         ("retry_after", "delays"),
         [
-            ("7", [7.0, 7.0, 7.0]),  # honoured
-            ("3600", [120.0, 120.0, 120.0]),  # capped: the wait blocks the worker
+            ("7", [7.0, 7.5, 15.0]),  # honoured, never under a quarter of the backoff
+            ("0", [3.75, 7.5, 15.0]),  # floored: a "0" must not spend every retry in seconds
+            ("-5", [3.75, 7.5, 15.0]),
+            ("3600", [120.0, 60.0]),  # capped per wait, then by the request's total of 180s
+            ("inf", [120.0, 60.0]),
             ("soon", [15.0, 30.0, 60.0]),  # unreadable: the exponential backoff
             (None, [15.0, 30.0, 60.0]),
         ],
@@ -153,6 +156,17 @@ class TestMakeAuthenticatedRequest:
             api_client.make_authenticated_request(**_request_args())
 
         assert [c.args[0] for c in mock_sleep.call_args_list] == delays
+
+    @patch("app.services.providers.api_client.time.sleep")
+    def test_a_retry_after_date_in_the_past_waits_the_floor(
+        self, mock_sleep: MagicMock, mock_client: MagicMock, mock_token: MagicMock
+    ) -> None:
+        retry_at = format_datetime(datetime.now(timezone.utc) - timedelta(minutes=5), usegmt=True)
+        self._answer(mock_client, _response(429, headers={"Retry-After": retry_at}), _response(200, json={}))
+
+        assert api_client.make_authenticated_request(**_request_args()) == {}
+
+        assert [c.args[0] for c in mock_sleep.call_args_list] == [3.75]
 
     @patch("app.services.providers.api_client.time.sleep")
     def test_throttle_waits_until_a_retry_after_date(

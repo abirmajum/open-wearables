@@ -636,7 +636,8 @@ class SummariesService:
             if active_mins is None:
                 active_mins = activity_data.get("active_minutes")
             # Sedentary minutes: the provider-reported daily sedentary time (Ultrahuman inactive time),
-            # else the step-threshold heuristic.
+            # else the step-threshold heuristic. Exercise and sedentary time are never filled in from
+            # another source, so they apply only when the day's winning row is Ultrahuman's own.
             sedentary_mins = result.get("sedentary_time_minutes")
             if sedentary_mins is None:
                 sedentary_mins = activity_data.get("sedentary_minutes")

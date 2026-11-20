@@ -912,6 +912,52 @@ class TestActivitySummaryEndpoint:
         assert activity["source"]["provider"] == provider.value
         assert activity["active_minutes"] == active_minutes
 
+    @pytest.mark.parametrize(
+        ("winner", "active_time", "active_minutes"),
+        [
+            (ProviderName.APPLE, None, 2),  # the winner's step-threshold count
+            (ProviderName.GARMIN, Decimal("312"), 312),  # the winner's own active time
+        ],
+    )
+    def test_ultrahuman_minutes_never_reach_another_providers_day(
+        self,
+        client: TestClient,
+        db: Session,
+        winner: ProviderName,
+        active_time: Decimal | None,
+        active_minutes: int,
+    ) -> None:
+        """A second device's Ultrahuman exercise and sedentary time are not filled into the winner's day."""
+        priority_repo = ProviderPriorityRepository(ProviderPriority)
+        priority_repo.upsert(db, winner, 1)
+        priority_repo.upsert(db, ProviderName.ULTRAHUMAN, 13)
+        user = UserFactory()
+        base_time = datetime(2025, 12, 26, 8, 0, 0, tzinfo=timezone.utc)
+        steps_type = SeriesTypeDefinitionFactory.get_or_create_steps()
+        winning = DataSourceFactory(user=user, provider=winner, source=winner.value)
+        # Two distinct minute buckets, each >= 30 steps: 2 active and 0 sedentary minutes by the step threshold.
+        DataPointSeriesFactory(mapping=winning, series_type=steps_type, value=Decimal("100"), recorded_at=base_time)
+        DataPointSeriesFactory(
+            mapping=winning, series_type=steps_type, value=Decimal("200"), recorded_at=base_time + timedelta(minutes=5)
+        )
+        ring = DataSourceFactory(user=user, provider=ProviderName.ULTRAHUMAN, source="ultrahuman")
+        roll_up_everything(db)
+        if active_time is not None:
+            provider_day(db, winning, SeriesType.active_time, base_time.date(), sum=active_time)
+        provider_day(db, ring, SeriesType.exercise_time, base_time.date(), sum=Decimal("45"))
+        provider_day(db, ring, SeriesType.sedentary_time, base_time.date(), sum=Decimal("210"))
+
+        response = client.get(
+            f"/api/v1/users/{user.id}/summaries/activity",
+            headers=api_key_headers(ApiKeyFactory().plain_key),
+            params={"start_date": "2025-12-25T00:00:00Z", "end_date": "2025-12-27T00:00:00Z"},
+        )
+
+        assert response.status_code == 200
+        [activity] = response.json()["data"]
+        assert activity["source"]["provider"] == winner.value
+        assert (activity["active_minutes"], activity["sedentary_minutes"]) == (active_minutes, 0)
+
     def test_get_activity_summary_multiple_days(self, client: TestClient, db: Session) -> None:
         """Test activity summary returns data grouped by day."""
         user = UserFactory()

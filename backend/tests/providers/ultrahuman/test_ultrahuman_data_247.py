@@ -5,27 +5,33 @@ Tests the Ultrahuman247Data class for sleep, recovery, and activity data handlin
 """
 
 from collections.abc import Iterator
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
+import httpx
 import pytest
 from sqlalchemy.orm import Session
 
 from app.models import User
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.repositories.user_repository import UserRepository
-from app.schemas.sync_status import SyncStatus
-from app.services.providers.ultrahuman.data_247 import Ultrahuman247Data
+from app.schemas.sync_status import SyncRunContext, SyncScope, SyncSource, SyncStatus
+from app.services.providers.sync_247_result import Sync247Result
+from app.services.providers.ultrahuman.data_247 import Ultrahuman247Data, _profile_attempt_allowed
 from app.services.providers.ultrahuman.oauth import UltrahumanOAuth
+from app.utils.context import sync_run_context
 from app.utils.exceptions import (
     ProviderAuthRejectedError,
     ProviderError,
     ProviderNotConnectedError,
     ProviderRateLimitError,
+    ReauthRequiredError,
 )
 from tests.factories import UserFactory
+
+MODULE = "app.services.providers.ultrahuman.data_247"
 
 
 class TestUltrahuman247Data:
@@ -368,26 +374,42 @@ class TestUltrahumanActivitySamples:
 
 
 class TestUltrahumanFetchFailures:
-    """Which failed fetches end the whole run and which only skip a day."""
+    """Which failed fetches end the run, fail a day, or read as a day without data."""
 
     WINDOW = {
         "start_time": datetime(2026, 1, 1, tzinfo=timezone.utc),
         "end_time": datetime(2026, 1, 2, tzinfo=timezone.utc),
     }
+    EMPTY_DAY = {"data": {"metric_data": []}, "error": None, "status": 200}
 
     @pytest.fixture
     def data_247(self) -> Iterator[Ultrahuman247Data]:
         data_247 = Ultrahuman247Data(
             provider_name="ultrahuman", api_base_url="https://partner.ultrahuman.com", oauth=MagicMock()
         )
-        with patch.object(data_247, "_save_daily_activity", return_value=0):
+        known = MagicMock(provider_user_id="uh-1")  # the account id is known: no profile lookup
+        with (
+            patch.object(data_247, "_save_daily_activity", return_value=0),
+            patch.object(data_247.connection_repo, "get_by_user_and_provider", return_value=known),
+            # The window's days are young enough to be retried.
+            patch(f"{MODULE}._utc_today", return_value=date(2026, 1, 2)),
+        ):
             yield data_247
+
+    def _run(self, data_247: Ultrahuman247Data, *answers: Any) -> tuple[Sync247Result, MagicMock, MagicMock]:
+        with (
+            patch(f"{MODULE}.logger") as mock_logger,
+            patch.object(data_247, "_make_api_request", side_effect=answers) as mock_request,
+        ):
+            result = data_247.load_and_save_all(MagicMock(), uuid4(), **self.WINDOW)
+        return result, mock_request, mock_logger
 
     @pytest.mark.parametrize(
         "error",
         [
             ProviderAuthRejectedError("ultrahuman"),
             ProviderNotConnectedError("ultrahuman"),
+            ReauthRequiredError("ultrahuman", uuid4(), "rejected for a day"),
             ProviderError("ultrahuman", upstream_status=403),
         ],
     )
@@ -402,70 +424,137 @@ class TestUltrahumanFetchFailures:
         mock_request.assert_called_once()
 
     @pytest.mark.parametrize(
-        ("error", "error_code"),
+        ("error", "error_code", "alert"),
         [
-            (ProviderError("ultrahuman", upstream_status=500), "http_500"),
-            (ProviderError("ultrahuman"), "provider_error"),  # no response
+            (ProviderError("ultrahuman", upstream_status=500), "http_500", True),  # an outage is reported
+            (ProviderError("ultrahuman"), "provider_error", False),  # no response: not on every pull
         ],
     )
     def test_a_failed_day_fails_the_run_and_the_walk_goes_on(
-        self, data_247: Ultrahuman247Data, error: Exception, error_code: str
+        self, data_247: Ultrahuman247Data, error: Exception, error_code: str, alert: bool
     ) -> None:
         """A failed day is never read as a day without data: the run is not a success, so the cursor stays."""
-        with patch.object(data_247, "_make_api_request", side_effect=error) as mock_request:
-            result = data_247.load_and_save_all(MagicMock(), uuid4(), **self.WINDOW)
+        result, mock_request, mock_logger = self._run(data_247, error, error)
 
         assert mock_request.call_count == 2
         assert result.outcomes["daily_metrics"].error_codes == (error_code, error_code)
         assert result.summary().status is SyncStatus.FAILED
+        # one line per day, the date on it
+        warnings = mock_logger.warning.call_args_list
+        assert [w.kwargs["date"] for w in warnings] == ["2026-01-01", "2026-01-02"]
+        assert {w.kwargs["alert"] for w in warnings} == {alert}
 
     def test_one_failed_day_makes_the_run_partial(self, data_247: Ultrahuman247Data) -> None:
-        with (
-            patch.object(data_247, "_save_daily_activity", return_value=3),
-            patch.object(
-                data_247,
-                "_make_api_request",
-                side_effect=[ProviderError("ultrahuman", upstream_status=502), {"data": {"metric_data": []}}],
-            ),
-        ):
-            result = data_247.load_and_save_all(MagicMock(), uuid4(), **self.WINDOW)
+        with patch.object(data_247, "_save_daily_activity", return_value=3):
+            result, _, _ = self._run(data_247, ProviderError("ultrahuman", upstream_status=502), self.EMPTY_DAY)
 
         assert result.failures == {"daily_metrics": "http_502"}
         assert result.summary().status is SyncStatus.PARTIAL
 
     def test_a_throttle_that_outlasts_the_backoff_stops_the_walk(self, data_247: Ultrahuman247Data) -> None:
-        with patch.object(
-            data_247, "_make_api_request", side_effect=ProviderRateLimitError("ultrahuman", upstream_status=429)
-        ) as mock_request:
-            result = data_247.load_and_save_all(MagicMock(), uuid4(), **self.WINDOW)
+        result, mock_request, mock_logger = self._run(
+            data_247, ProviderRateLimitError("ultrahuman", upstream_status=429)
+        )
 
         mock_request.assert_called_once()
         assert result.failures == {"daily_metrics": "http_429"}
         assert result.summary().status is SyncStatus.FAILED
+        assert mock_logger.warning.call_args.kwargs["alert"] is False
 
     def test_a_day_without_data_is_empty_not_failed(self, data_247: Ultrahuman247Data) -> None:
-        with patch.object(data_247, "_make_api_request", return_value={"data": {"metric_data": []}}):
-            result = data_247.load_and_save_all(MagicMock(), uuid4(), **self.WINDOW)
+        result, _, _ = self._run(data_247, self.EMPTY_DAY, self.EMPTY_DAY)
+
+        assert not result.failures
+        assert "daily_metrics" not in result.outcomes
+        assert result.summary().status is SyncStatus.SKIPPED
+
+    @pytest.mark.parametrize(
+        "not_found",
+        [
+            ProviderError("ultrahuman", upstream_status=404),
+            {"data": None, "error": "no data for this date", "status": 404},
+            {"data": None, "error": "no data for this date", "status": "404"},
+        ],
+    )
+    def test_a_404_for_a_day_is_an_empty_day(self, data_247: Ultrahuman247Data, not_found: Any) -> None:
+        """Undocumented for a day: a 404, in the status or in the envelope, must not hold the live cursor forever."""
+        result, mock_request, mock_logger = self._run(data_247, not_found, self.EMPTY_DAY)
+
+        assert mock_request.call_count == 2
+        assert not result.failures
+        assert result.summary().status is SyncStatus.SKIPPED
+        assert mock_logger.info.call_args_list[0].kwargs["date"] == "2026-01-01"
+        mock_logger.warning.assert_not_called()
+
+    def test_an_outage_in_the_envelope_fails_the_day(self, data_247: Ultrahuman247Data) -> None:
+        result, _, _ = self._run(data_247, {"data": None, "error": "internal error", "status": 503}, self.EMPTY_DAY)
+
+        assert result.failures == {"daily_metrics": "http_503"}
+        assert result.summary().status is SyncStatus.FAILED
+
+    @pytest.mark.parametrize(
+        "unusable",
+        [
+            ProviderError("ultrahuman", upstream_status=400),
+            ProviderError("ultrahuman", upstream_status=422),
+            ProviderError("ultrahuman", upstream_status=200),  # a 200 that is not JSON
+            {"data": None, "error": "invalid date", "status": 400},
+            {"data": None, "error": "something went wrong"},  # an error without a status
+            {"data": None, "error": None, "status": 401},
+        ],
+    )
+    def test_an_answer_that_fails_every_time_skips_the_day(self, data_247: Ultrahuman247Data, unusable: Any) -> None:
+        """Retrying would fail the same way every run and stall the cursor: the day is skipped and reported."""
+        result, mock_request, mock_logger = self._run(data_247, unusable, self.EMPTY_DAY)
+
+        assert mock_request.call_count == 2
+        assert not result.failures
+        assert result.outcomes["daily_metrics"].skipped == 1
+        assert result.summary().status is SyncStatus.SKIPPED
+        [warning] = mock_logger.warning.call_args_list
+        assert (warning.kwargs["date"], warning.kwargs["alert"]) == ("2026-01-01", True)
+
+    def test_an_answer_our_code_cannot_read_skips_the_day(self, data_247: Ultrahuman247Data) -> None:
+        with patch.object(data_247, "_items_by_type", side_effect=[ValueError("unexpected shape"), {}]):
+            result, _, mock_logger = self._run(data_247, self.EMPTY_DAY, self.EMPTY_DAY)
+
+        assert not result.failures
+        assert result.outcomes["daily_metrics"].skipped == 1
+        assert mock_logger.warning.call_args.kwargs["alert"] is True
+
+    def test_an_absurd_day_start_does_not_fail_the_day(self, data_247: Ultrahuman247Data) -> None:
+        day = {
+            "data": {
+                "metric_data": [
+                    {"type": "active_minutes", "object": {"value": 42, "day_start_timestamp": 1e300}},
+                    {"type": "recovery_index", "object": {"value": 80, "day_start_timestamp": -1e300}},
+                ]
+            }
+        }
+        # The real save: nothing in the day is a representable instant, so nothing reaches the database.
+        with patch.object(data_247, "_save_daily_activity", Ultrahuman247Data._save_daily_activity.__get__(data_247)):
+            result, _, _ = self._run(data_247, day, self.EMPTY_DAY)
 
         assert not result.failures
         assert "daily_metrics" not in result.outcomes
 
-    def test_a_404_for_a_day_is_an_empty_day(self, data_247: Ultrahuman247Data) -> None:
-        """Undocumented for a day: a 404 must not hold the live cursor forever."""
-        with (
-            patch("app.services.providers.ultrahuman.data_247.logger") as mock_logger,
-            patch.object(
+    def test_a_day_failing_past_the_retry_window_is_given_up(self, data_247: Ultrahuman247Data) -> None:
+        with patch(f"{MODULE}._utc_today", return_value=date(2026, 1, 9)):  # Jan 1 is 8 days old, Jan 2 seven
+            result, _, _ = self._run(
                 data_247,
-                "_make_api_request",
-                side_effect=[ProviderError("ultrahuman", upstream_status=404), {"data": {"metric_data": []}}],
-            ) as mock_request,
-        ):
-            result = data_247.load_and_save_all(MagicMock(), uuid4(), **self.WINDOW)
+                ProviderError("ultrahuman", upstream_status=500),
+                ProviderError("ultrahuman", upstream_status=500),
+            )
 
-        assert mock_request.call_count == 2
-        assert not result.failures
-        assert result.summary().status is not SyncStatus.FAILED
-        assert mock_logger.info.call_args_list[0].kwargs["date"] == "2026-01-01"
+        assert result.outcomes["daily_metrics"].error_codes == ("http_500",)  # only Jan 2 still fails
+        assert result.outcomes["daily_metrics"].skipped == 1
+
+    def test_a_backfill_keeps_reporting_an_old_failing_day(self, data_247: Ultrahuman247Data) -> None:
+        historical = SyncRunContext(run_id="run-1", source=SyncSource.BACKFILL, scope=SyncScope.HISTORICAL)
+        with sync_run_context(historical), patch(f"{MODULE}._utc_today", return_value=date(2026, 3, 1)):
+            result, _, _ = self._run(data_247, ProviderError("ultrahuman", upstream_status=500), self.EMPTY_DAY)
+
+        assert result.failures == {"daily_metrics": "http_500"}
 
     def test_unknown_metric_types_and_malformed_items_are_ignored(self, data_247: Ultrahuman247Data) -> None:
         """The workout scope adds workouts to the day's metrics, in a shape Ultrahuman does not document."""
@@ -473,70 +562,98 @@ class TestUltrahumanFetchFailures:
             "data": {
                 "metric_data": [
                     "not an object",
+                    {"type": ["not", "a", "name"], "object": {}},
                     {"type": "workout", "object": [{"start": 1, "end": 2}]},
                     {"type": "calories_burned", "object": {"value": 2100, "day_start_timestamp": 1767225600}},
                 ]
             }
         }
-        with patch.object(data_247, "_make_api_request", return_value=day):
-            result = data_247.load_and_save_all(MagicMock(), uuid4(), **self.WINDOW)
+        result, _, _ = self._run(data_247, day, day)
 
         assert not result.failures
+        assert "daily_metrics" not in result.outcomes
 
 
 class TestUltrahumanProviderUserId:
-    """The account id a connect could not read is filled in on a later sync."""
+    """The account id a connect could not read is filled in on a later sync, without risking the connection."""
 
     DAY = datetime(2026, 1, 1, tzinfo=timezone.utc)
     EMPTY_DAY = {"data": {"metric_data": []}}
-
-    @staticmethod
-    def _data_247() -> Ultrahuman247Data:
-        return Ultrahuman247Data(
-            provider_name="ultrahuman", api_base_url="https://partner.ultrahuman.com", oauth=MagicMock()
-        )
+    PROFILE = {"user_id": "uh-42", "username": "ring@example.com"}
 
     @staticmethod
     def _connection(provider_user_id: str | None, scope: str | None = "ring_data profile") -> MagicMock:
         return MagicMock(provider_user_id=provider_user_id, provider_username=None, scope=scope)
 
-    def _sync(self, connection: MagicMock, *answers: Any) -> MagicMock:
-        data_247 = self._data_247()
+    def _sync(
+        self,
+        connection: MagicMock,
+        *,
+        profile: Any = PROFILE,
+        token: Any = "token",
+        allowed: bool = True,
+    ) -> tuple[MagicMock, MagicMock]:
+        data_247 = Ultrahuman247Data(
+            provider_name="ultrahuman", api_base_url="https://partner.ultrahuman.com", oauth=MagicMock()
+        )
         with (
             patch.object(data_247.connection_repo, "get_by_user_and_provider", return_value=connection),
-            patch.object(data_247, "_make_api_request", side_effect=answers) as mock_request,
+            patch.object(data_247, "_make_api_request", return_value=self.EMPTY_DAY) as mock_request,
+            patch(f"{MODULE}._profile_attempt_allowed", return_value=allowed),
+            patch(f"{MODULE}.get_valid_token", side_effect=[token]),
+            patch(f"{MODULE}.fetch_provider_user_info", side_effect=[profile]) as mock_profile,
         ):
             data_247.load_and_save_all(MagicMock(), uuid4(), start_time=self.DAY, end_time=self.DAY)
-        return mock_request
+        # The profile never goes through the authenticated path, which refreshes and revokes on a 401.
+        assert [c.args[2] for c in mock_request.call_args_list] == ["/user_data/metrics"]
+        return mock_request, mock_profile
 
-    @pytest.mark.parametrize(
-        "profile",
-        [
-            {"user_id": "uh-42", "email": "ring@example.com"},
-            {"data": {"user_id": "uh-42", "email": "ring@example.com"}, "error": None, "status": 200},
-        ],
-    )
-    def test_a_missing_id_is_filled_in(self, profile: dict[str, Any]) -> None:
+    def test_a_missing_id_is_filled_in(self) -> None:
         connection = self._connection(None)
 
-        mock_request = self._sync(connection, profile, self.EMPTY_DAY)
+        self._sync(connection)
 
-        assert mock_request.call_args_list[0].args[2] == "/user_data/user_info"
         assert (connection.provider_user_id, connection.provider_username) == ("uh-42", "ring@example.com")
 
-    def test_a_failed_profile_fetch_does_not_fail_the_sync(self) -> None:
+    @pytest.mark.parametrize(
+        ("profile", "token"),
+        [
+            (httpx.HTTPStatusError("401", request=MagicMock(), response=MagicMock(status_code=401)), "token"),
+            (PROFILE, ReauthRequiredError("ultrahuman", uuid4(), "refresh token rejected")),
+            (PROFILE, ProviderNotConnectedError("ultrahuman")),
+        ],
+    )
+    def test_a_failed_lookup_does_not_fail_the_sync(self, profile: Any, token: Any) -> None:
         connection = self._connection(None)
 
-        mock_request = self._sync(connection, ProviderError("ultrahuman", upstream_status=500), self.EMPTY_DAY)
+        self._sync(connection, profile=profile, token=token)
 
-        assert mock_request.call_count == 2
         assert connection.provider_user_id is None
 
     @pytest.mark.parametrize(
-        ("provider_user_id", "scope"),
-        [("uh-42", "ring_data profile"), (None, "ring_data ring_extended_data")],
+        ("provider_user_id", "scope", "allowed"),
+        [
+            ("uh-42", "ring_data profile", True),  # known
+            (None, "ring_data ring_extended_data", True),  # no profile scope
+            (None, "ring_data,ring_extended_data", True),
+            (None, "ring_data profile", False),  # tried within the day
+        ],
     )
-    def test_no_profile_fetch_when_known_or_not_granted(self, provider_user_id: str | None, scope: str) -> None:
-        mock_request = self._sync(self._connection(provider_user_id, scope), self.EMPTY_DAY)
+    def test_no_lookup(self, provider_user_id: str | None, scope: str, allowed: bool) -> None:
+        _, mock_profile = self._sync(self._connection(provider_user_id, scope), allowed=allowed)
 
-        mock_request.assert_called_once()
+        mock_profile.assert_not_called()
+
+    def test_a_comma_separated_scope_is_read(self) -> None:
+        connection = self._connection(None, scope="ring_data,profile")
+
+        self._sync(connection)
+
+        assert connection.provider_user_id == "uh-42"
+
+    def test_one_lookup_a_day_per_connection(self) -> None:
+        connection_id = uuid4()
+
+        assert _profile_attempt_allowed(connection_id) is True
+        assert _profile_attempt_allowed(connection_id) is False
+        assert _profile_attempt_allowed(uuid4()) is True
