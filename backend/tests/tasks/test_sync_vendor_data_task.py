@@ -9,6 +9,8 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 from uuid import UUID
 
+import pytest
+from redis.exceptions import LockError
 from sqlalchemy.orm import Session
 
 from app.integrations.celery.tasks.sync_vendor_data_task import sync_vendor_data
@@ -504,12 +506,20 @@ class TestSyncVendorDataLinkedSkip:
 class TestUltrahumanLiveCursor:
     """A day Ultrahuman fails to serve holds the live cursor, but only until it is too old to retry."""
 
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            ProviderError("ultrahuman", upstream_status=500),
+            LockError("Unable to acquire lock"),  # the token refresh lock timed out: transient, not a skipped day
+        ],
+    )
     @patch("app.integrations.celery.tasks.sync_vendor_data_task.SessionLocal")
     def test_a_failing_day_holds_the_cursor_until_it_ages_out(
         self,
         mock_session_local: MagicMock,
         db: Session,
         mock_celery_app: MagicMock,
+        failure: Exception,
     ) -> None:
         user = UserFactory()
         last_synced_at = datetime.now(timezone.utc) - timedelta(days=3)
@@ -525,7 +535,7 @@ class TestUltrahumanLiveCursor:
             assert endpoint == "/user_data/metrics"
             fetched.append(params["date"])
             if params["date"] == failing_day.isoformat():
-                raise ProviderError("ultrahuman", upstream_status=500)
+                raise failure
             day_start = datetime.fromisoformat(params["date"]).replace(tzinfo=timezone.utc).timestamp()
             hr = {"type": "hr", "object": {"values": [{"timestamp": day_start + 3600, "value": 60}]}}
             return {"data": {"metric_data": [hr]}, "error": None, "status": 200}

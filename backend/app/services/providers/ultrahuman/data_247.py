@@ -8,6 +8,7 @@ from enum import Enum
 from typing import Any, TypeIs
 from uuid import UUID, uuid4
 
+from redis.exceptions import RedisError
 from sqlalchemy.exc import DataError, IntegrityError
 
 from app.config import settings
@@ -65,6 +66,10 @@ _WESTMOST, _EASTMOST = timedelta(hours=-12), timedelta(hours=14)
 # given up and read as empty, so a day Ultrahuman never serves cannot hold the live cursor, and widen every later
 # pull's window, for good. Backfills keep reporting such a day as failed: they do not move the cursor.
 MAX_RETRIED_DAY_AGE = timedelta(days=7)
+
+# What reading a day's answer raises when its shape is not what our code expects (a JSON or pydantic error is a
+# ValueError): the same answer fails the same way every run, so the day is skipped rather than retried.
+_ANSWER_READING_ERRORS = (LookupError, TypeError, ValueError, AttributeError, ArithmeticError)
 
 
 class UltrahumanBodyError(ProviderError):
@@ -744,10 +749,19 @@ class Ultrahuman247Data(Base247DataTemplate):
         if isinstance(error, ProviderConnectionError):
             return DayFailure.FATAL
         if not isinstance(error, ProviderError):
-            return DayFailure.SKIP  # our own reading of the answer failed: it would fail the same way every run
+            # Our own reading of the answer failed: it would fail the same way every run. Anything else (Redis, the
+            # token refresh lock, the database) is transient, so the day fails and is fetched again. Redis errors are
+            # excluded by name: its LockError is a ValueError too.
+            if isinstance(error, _ANSWER_READING_ERRORS) and not isinstance(error, RedisError):
+                return DayFailure.SKIP
+            return DayFailure.FAIL
         status = error.upstream_status
         if isinstance(error, UltrahumanBodyError):
-            return DayFailure.FAIL if status is not None and status >= 500 else DayFailure.SKIP
+            if status == 429:
+                return DayFailure.THROTTLED
+            if status is None or status == 408 or status >= 500:
+                return DayFailure.FAIL
+            return DayFailure.SKIP  # a 4xx the body names (its 404 is an empty day, read in _fetch_daily_metrics)
         if status in (401, 403):
             return DayFailure.FATAL
         if status == 404:
@@ -772,11 +786,14 @@ class Ultrahuman247Data(Base247DataTemplate):
 
         - a lost grant (connection error, 401/403) is raised: every remaining day would get it too;
         - a 404, in the status or in the body's envelope, is a day without data;
-        - an outage (5xx, no response) fails the day, so a live sync keeps its cursor and fetches it again; once
-          the day is older than ``MAX_RETRIED_DAY_AGE`` a live sync gives it up and reads it as empty;
-        - a throttle that outlasted the client's backoff fails the day and is raised, to end the walk;
-        - anything else (a request Ultrahuman refused, an answer that is not JSON or that our code could not
-          read) would fail the same way every run: the day is skipped as empty, logged and reported.
+        - an outage (5xx, no response, a 408 or an error without a status in the body) or a transient failure of
+          our own (Redis, the token refresh lock, the database) fails the day, so a live sync keeps its cursor and
+          fetches it again; once the day is older than ``MAX_RETRIED_DAY_AGE`` a live sync gives it up and reads it
+          as empty;
+        - a throttle that outlasted the client's backoff, or a 429 in the body, fails the day and is raised as
+          ``ProviderRateLimitError``, to end the walk;
+        - a request Ultrahuman refused (400/422, another 4xx in the body), an answer that is not JSON or one our
+          code could not read would fail the same way every run: the day is skipped as empty, logged and reported.
         """
         date_str = day.strftime("%Y-%m-%d")
         try:
@@ -831,7 +848,10 @@ class Ultrahuman247Data(Base247DataTemplate):
             )
             run.result.fail("daily_metrics", e)
             if failure is DayFailure.THROTTLED:
-                raise
+                if isinstance(e, ProviderRateLimitError):
+                    raise
+                # A throttle named in the body: raised as the client's own, so the walk ends the same way.
+                raise ProviderRateLimitError(self.provider_name, upstream_status=429) from e
             return None
 
     @staticmethod

@@ -12,6 +12,8 @@ from uuid import uuid4
 
 import httpx
 import pytest
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import LockError
 from sqlalchemy.orm import Session
 
 from app.models import User
@@ -428,10 +430,15 @@ class TestUltrahumanFetchFailures:
         [
             (ProviderError("ultrahuman", upstream_status=500), "http_500", True),  # an outage is reported
             (ProviderError("ultrahuman"), "provider_error", False),  # no response: not on every pull
+            # transient failures of our own, such as the token refresh lock or Redis: never read as a skipped day
+            (LockError("Unable to acquire lock"), "LockError", False),
+            (RedisConnectionError("refused"), "ConnectionError", False),
+            ({"data": None, "error": "something went wrong"}, "provider_error", False),  # no status in the body
+            ({"data": None, "error": "request timeout", "status": 408}, "http_408", False),
         ],
     )
     def test_a_failed_day_fails_the_run_and_the_walk_goes_on(
-        self, data_247: Ultrahuman247Data, error: Exception, error_code: str, alert: bool
+        self, data_247: Ultrahuman247Data, error: Any, error_code: str, alert: bool
     ) -> None:
         """A failed day is never read as a day without data: the run is not a success, so the cursor stays."""
         result, mock_request, mock_logger = self._run(data_247, error, error)
@@ -451,10 +458,17 @@ class TestUltrahumanFetchFailures:
         assert result.failures == {"daily_metrics": "http_502"}
         assert result.summary().status is SyncStatus.PARTIAL
 
-    def test_a_throttle_that_outlasts_the_backoff_stops_the_walk(self, data_247: Ultrahuman247Data) -> None:
-        result, mock_request, mock_logger = self._run(
-            data_247, ProviderRateLimitError("ultrahuman", upstream_status=429)
-        )
+    @pytest.mark.parametrize(
+        "throttle",
+        [
+            ProviderRateLimitError("ultrahuman", upstream_status=429),
+            {"data": None, "error": "too many requests", "status": 429},  # a throttle named in the body
+        ],
+    )
+    def test_a_throttle_that_outlasts_the_backoff_stops_the_walk(
+        self, data_247: Ultrahuman247Data, throttle: Any
+    ) -> None:
+        result, mock_request, mock_logger = self._run(data_247, throttle, self.EMPTY_DAY)
 
         mock_request.assert_called_once()
         assert result.failures == {"daily_metrics": "http_429"}
@@ -499,7 +513,6 @@ class TestUltrahumanFetchFailures:
             ProviderError("ultrahuman", upstream_status=422),
             ProviderError("ultrahuman", upstream_status=200),  # a 200 that is not JSON
             {"data": None, "error": "invalid date", "status": 400},
-            {"data": None, "error": "something went wrong"},  # an error without a status
             {"data": None, "error": None, "status": 401},
         ],
     )

@@ -1,6 +1,6 @@
 """Tests for summaries endpoints."""
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
@@ -957,6 +957,33 @@ class TestActivitySummaryEndpoint:
         [activity] = response.json()["data"]
         assert activity["source"]["provider"] == winner.value
         assert (activity["active_minutes"], activity["sedentary_minutes"]) == (active_minutes, 0)
+
+    def test_another_providers_exercise_time_alone_does_not_win_the_day(self, client: TestClient, db: Session) -> None:
+        """Exercise and sedentary time count only as Ultrahuman's own: a higher-ranked source with nothing else that
+        day makes no day of its own, so it can't blank Ultrahuman's minutes."""
+        priority_repo = ProviderPriorityRepository(ProviderPriority)
+        priority_repo.upsert(db, ProviderName.APPLE, 1)
+        priority_repo.upsert(db, ProviderName.ULTRAHUMAN, 13)
+        user = UserFactory()
+        day = date(2025, 12, 26)
+        phone = DataSourceFactory(user=user, provider=ProviderName.APPLE, source=ProviderName.APPLE.value)
+        ring = DataSourceFactory(user=user, provider=ProviderName.ULTRAHUMAN, source="ultrahuman")
+        provider_day(db, phone, SeriesType.exercise_time, day, sum=Decimal("20"))
+        provider_day(db, phone, SeriesType.sedentary_time, day, sum=Decimal("600"))
+        provider_day(db, ring, SeriesType.steps, day, sum=Decimal("8000"))
+        provider_day(db, ring, SeriesType.exercise_time, day, sum=Decimal("45"))
+        provider_day(db, ring, SeriesType.sedentary_time, day, sum=Decimal("210"))
+
+        response = client.get(
+            f"/api/v1/users/{user.id}/summaries/activity",
+            headers=api_key_headers(ApiKeyFactory().plain_key),
+            params={"start_date": "2025-12-25T00:00:00Z", "end_date": "2025-12-27T00:00:00Z"},
+        )
+
+        assert response.status_code == 200
+        [activity] = response.json()["data"]
+        assert activity["source"]["provider"] == ProviderName.ULTRAHUMAN.value
+        assert (activity["steps"], activity["active_minutes"], activity["sedentary_minutes"]) == (8000, 45, 210)
 
     def test_get_activity_summary_multiple_days(self, client: TestClient, db: Session) -> None:
         """Test activity summary returns data grouped by day."""

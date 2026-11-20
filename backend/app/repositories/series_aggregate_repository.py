@@ -601,13 +601,19 @@ def daily_activity(
     sources = {
         s.id: s for s in db_session.query(DataSource).filter(DataSource.id.in_({r.data_source_id for r, _ in rows}))
     }
+    own_day_keys = {get_series_type_id(series_type): key for series_type, key in _OWN_DAY_MINUTES.items()}
     days: dict[tuple, list[SeriesAggregate | SampleDay]] = {}
     for row, day in rows:
         source = sources[row.data_source_id]
+        # The own-day minutes count only as the provider's own day values: any other such row is dropped before it
+        # can make a day of its own, which could win the day over the source that has its activity.
+        if row.series_type_definition_id in own_day_keys and (
+            source.provider not in _PROVIDER_DAY_ACTIVITY_MINUTES or row.computed_by != ComputedBy.PROVIDER
+        ):
+            continue
         days.setdefault((day, source.provider, source.source, source.device_model, source.device_type), []).append(row)
 
     heart_rate_id = get_series_type_id(SeriesType.heart_rate)
-    own_day_keys = {get_series_type_id(series_type): key for series_type, key in _OWN_DAY_MINUTES.items()}
     sum_keys = {get_series_type_id(series_type): key for series_type, key in _ACTIVITY_SUMS.items()}
     results: list[ActivityAggregateResult] = []
     for (day, provider, source, device_model, device_type), day_rows in days.items():
@@ -623,17 +629,10 @@ def daily_activity(
             sums = [float(r.sum) for r in day_rows if r.series_type_definition_id == type_id and r.sum is not None]
             if sums:
                 result[key] = round(sum(sums)) if key in _INT_SUMS else sum(sums)
-        if provider in _PROVIDER_DAY_ACTIVITY_MINUTES:
-            for type_id, key in own_day_keys.items():
-                minutes = [
-                    float(r.sum)
-                    for r in day_rows
-                    if r.series_type_definition_id == type_id
-                    and r.computed_by == ComputedBy.PROVIDER
-                    and r.sum is not None
-                ]
-                if minutes:
-                    result[key] = round(sum(minutes))
+        for type_id, key in own_day_keys.items():
+            minutes = [float(r.sum) for r in day_rows if r.series_type_definition_id == type_id and r.sum is not None]
+            if minutes:
+                result[key] = round(sum(minutes))
         heart_rate = [r for r in day_rows if r.series_type_definition_id == heart_rate_id]
         # Each source's day counts once: a provider's row (count 1) and ours (one per sample) weigh the same.
         if averages := [float(r.avg) for r in heart_rate if r.avg is not None]:
