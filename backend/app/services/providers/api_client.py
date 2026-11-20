@@ -1,8 +1,10 @@
 """Simple API client for making authenticated requests to provider APIs."""
 
+import math
 import time
 from collections.abc import Collection
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.parse import urljoin, urlsplit
 from uuid import UUID
@@ -30,6 +32,10 @@ logger = get_logger(__name__)
 # Rate limiting configuration (Garmin: 100 req / 60s window)
 MAX_RETRIES = 3
 RETRY_BASE_DELAY = 15.0  # Base delay for exponential backoff (seconds): 15s, 30s, 60s
+# A 429's Retry-After is honoured up to this long; the wait blocks the worker, so a longer one is cut to it.
+MAX_RETRY_AFTER = 120.0
+# All the 429 waits of one request together; the plain backoff (15+30+60s) stays under it.
+MAX_TOTAL_RETRY_WAIT = 180.0
 
 # Redirects followed by download_binary_content; every hop is checked against its allowed hosts.
 MAX_DOWNLOAD_REDIRECTS = 5
@@ -50,6 +56,36 @@ DEAD_GRANT_AFTER = timedelta(days=1)
 
 # Session.info key of the grants this session has already seen succeed.
 _AUTH_OK_KEY = "provider_auth_ok"
+
+
+def _retry_delay(response: httpx.Response, attempt: int, waited: float) -> float | None:
+    """How long to wait before retrying a 429, or None when the request has waited its whole budget.
+
+    The provider's ``Retry-After`` (seconds or an HTTP date) when it sends a readable one, never less than a quarter
+    of this attempt's exponential backoff or 1s (a "0" would spend every retry in seconds) and never more than
+    ``MAX_RETRY_AFTER``; else the exponential backoff. All waits of one request add up to ``MAX_TOTAL_RETRY_WAIT``.
+    """
+    backoff = RETRY_BASE_DELAY * (2**attempt)
+    header = response.headers.get("Retry-After", "").strip()
+    delay: float | None = None
+    if header:
+        try:
+            delay = float(header)
+        except ValueError:
+            try:
+                retry_at = parsedate_to_datetime(header)
+            except (TypeError, ValueError):
+                retry_at = None
+            if retry_at is not None:
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                delay = (retry_at - datetime.now(timezone.utc)).total_seconds()
+    remaining = MAX_TOTAL_RETRY_WAIT - waited
+    if remaining <= 0:
+        return None
+    if delay is None or math.isnan(delay):
+        return min(backoff, remaining)
+    return min(max(delay, backoff / 4, 1.0), MAX_RETRY_AFTER, remaining)
 
 
 def _token_cache(db: DbSession) -> dict[tuple[UUID, str], tuple[str, datetime | None, float]]:
@@ -303,6 +339,7 @@ def make_authenticated_request(
     url = f"{api_base_url}{endpoint}"
     token_reloaded = False
 
+    waited = 0.0  # seconds slept on 429s so far
     for attempt in range(MAX_RETRIES + 1):
         try:
             with httpx.Client(http2=http2) as client:
@@ -318,8 +355,7 @@ def make_authenticated_request(
 
             # Handle 429 rate limiting with retry
             if response.status_code == 429:
-                if attempt < MAX_RETRIES:
-                    backoff_delay = RETRY_BASE_DELAY * (2**attempt)  # 1s, 2s, 4s
+                if attempt < MAX_RETRIES and (backoff_delay := _retry_delay(response, attempt, waited)) is not None:
                     logger.warning(
                         "Rate limited (429), retrying",
                         provider_name=provider_name,
@@ -328,6 +364,7 @@ def make_authenticated_request(
                         backoff_delay=backoff_delay,
                     )
                     time.sleep(backoff_delay)
+                    waited += backoff_delay
                     continue
                 # Max retries exceeded
                 logger.error(
@@ -379,8 +416,11 @@ def make_authenticated_request(
 
         except httpx.HTTPStatusError as e:
             # Handle 429 from raise_for_status (shouldn't happen due to early check, but just in case)
-            if e.response.status_code == 429 and attempt < MAX_RETRIES:
-                backoff_delay = RETRY_BASE_DELAY * (2**attempt)
+            if (
+                e.response.status_code == 429
+                and attempt < MAX_RETRIES
+                and (backoff_delay := _retry_delay(e.response, attempt, waited)) is not None
+            ):
                 logger.warning(
                     "Rate limited (429), retrying",
                     provider_name=provider_name,
@@ -389,6 +429,7 @@ def make_authenticated_request(
                     backoff_delay=backoff_delay,
                 )
                 time.sleep(backoff_delay)
+                waited += backoff_delay
                 continue
 
             if e.response.status_code == 401 and not token_reloaded and attempt < MAX_RETRIES:
@@ -463,7 +504,7 @@ def download_binary_content(
     The URL may contain additional auth params (e.g. token=...) alongside the Bearer header.
     The URL, and every redirect, must be https on one of ``allowed_hosts``: it comes from a
     webhook payload and is sent the user's token.
-    Retries up to MAX_RETRIES times on 429 with exponential backoff.
+    Retries up to MAX_RETRIES times on 429, after the provider's Retry-After or with exponential backoff.
     """
     _require_allowed_download_url(url, allowed_hosts, provider_name)
     access_token = get_valid_token(db, user_id, provider_name, connection_repo, oauth)
@@ -471,6 +512,7 @@ def download_binary_content(
     token_reloaded = False
     redirects = 0
     attempt = 0
+    waited = 0.0  # seconds slept on 429s so far
 
     while attempt <= MAX_RETRIES:
         try:
@@ -495,8 +537,11 @@ def download_binary_content(
                 access_token = new_token
                 headers["Authorization"] = f"Bearer {access_token}"
                 continue
-        if response.status_code == 429 and attempt < MAX_RETRIES:
-            backoff_delay = RETRY_BASE_DELAY * (2**attempt)
+        if (
+            response.status_code == 429
+            and attempt < MAX_RETRIES
+            and (backoff_delay := _retry_delay(response, attempt, waited)) is not None
+        ):
             logger.warning(
                 "Rate limited (429) on binary download, retrying",
                 provider_name=provider_name,
@@ -505,6 +550,7 @@ def download_binary_content(
                 backoff_delay=backoff_delay,
             )
             time.sleep(backoff_delay)
+            waited += backoff_delay
             attempt += 1
             continue
         if response.status_code in (401, 403):

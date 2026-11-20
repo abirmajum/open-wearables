@@ -70,7 +70,8 @@ TIMESERIES: frozenset[SeriesType] = frozenset(
     }
 )
 
-# Ultrahuman has no workout support.
+# Workouts arrive inside /user_data/metrics with the ``workout`` scope, but Ultrahuman documents no payload for
+# them, so they are not mapped yet: the metric is received and ignored.
 WORKOUT_FIELDS: frozenset[str] = frozenset()
 
 # EventRecordDetail fields populated by data_247.py (sleep records)

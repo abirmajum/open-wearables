@@ -481,7 +481,7 @@ class SummariesService:
         - Elevation (from workouts total_elevation_gain)
         - Floors (from flights_climbed time-series OR elevation)
         - Heart rate stats (avg, max, min)
-        - Active/sedentary minutes (based on step threshold)
+        - Active/sedentary minutes (provider-reported daily values, else based on step threshold)
         - Intensity minutes (HR zones using max HR = 220 - age):
           light 50-63%, moderate 64-76%, vigorous 77-93%; the provider's own moderate and vigorous
           minutes (Garmin's intensity minutes) where it reports them
@@ -626,13 +626,21 @@ class SummariesService:
                 total_cal = active_cal + basal_cal
 
             # Active minutes: prefer the provider-reported daily active time (Garmin
-            # activeTimeInSeconds, Oura high+medium+low activity time, Polar active_duration).
-            # Fall back to the step-threshold heuristic only when the provider doesn't report it.
-            # Sedentary stays on the step-threshold path (no cross-provider source yet).
+            # activeTimeInSeconds, Oura high+medium+low activity time, Polar active_duration), then,
+            # for a provider whose exercise time is its active time (Ultrahuman active minutes), that
+            # daily exercise time. Fall back to the step-threshold heuristic, which assumes per-minute
+            # step samples, only when the provider reports neither.
             active_mins = result.get("active_time_minutes")
             if active_mins is None:
+                active_mins = result.get("exercise_time_minutes")
+            if active_mins is None:
                 active_mins = activity_data.get("active_minutes")
-            sedentary_mins = activity_data.get("sedentary_minutes")
+            # Sedentary minutes: the provider-reported daily sedentary time (Ultrahuman inactive time),
+            # else the step-threshold heuristic. Exercise and sedentary time are never filled in from
+            # another source, so they apply only when the day's winning row is Ultrahuman's own.
+            sedentary_mins = result.get("sedentary_time_minutes")
+            if sedentary_mins is None:
+                sedentary_mins = activity_data.get("sedentary_minutes")
 
             # Intensity minutes from HR data, moderate and vigorous as the provider counts them where it reports them
             intensity_mins = None

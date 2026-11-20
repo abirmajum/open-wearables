@@ -5,6 +5,7 @@ as a bad API key), and a failed call keeps the provider's status and body out of
 """
 
 from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 from typing import Any
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
@@ -126,6 +127,58 @@ class TestMakeAuthenticatedRequest:
 
         assert (exc_info.value.status_code, exc_info.value.upstream_status) == (503, 429)
         assert request.call_count == 4
+
+    @pytest.mark.parametrize(
+        ("retry_after", "delays"),
+        [
+            ("7", [7.0, 7.5, 15.0]),  # honoured, never under a quarter of the backoff
+            ("0", [3.75, 7.5, 15.0]),  # floored: a "0" must not spend every retry in seconds
+            ("-5", [3.75, 7.5, 15.0]),
+            ("3600", [120.0, 60.0]),  # capped per wait, then by the request's total of 180s
+            ("inf", [120.0, 60.0]),
+            ("soon", [15.0, 30.0, 60.0]),  # unreadable: the exponential backoff
+            (None, [15.0, 30.0, 60.0]),
+        ],
+    )
+    @patch("app.services.providers.api_client.time.sleep")
+    def test_throttle_waits_for_retry_after(
+        self,
+        mock_sleep: MagicMock,
+        mock_client: MagicMock,
+        mock_token: MagicMock,
+        retry_after: str | None,
+        delays: list[float],
+    ) -> None:
+        headers = {"Retry-After": retry_after} if retry_after is not None else {}
+        self._answer(mock_client, *[_response(429, headers=headers) for _ in range(4)])
+
+        with pytest.raises(ProviderRateLimitError):
+            api_client.make_authenticated_request(**_request_args())
+
+        assert [c.args[0] for c in mock_sleep.call_args_list] == delays
+
+    @patch("app.services.providers.api_client.time.sleep")
+    def test_a_retry_after_date_in_the_past_waits_the_floor(
+        self, mock_sleep: MagicMock, mock_client: MagicMock, mock_token: MagicMock
+    ) -> None:
+        retry_at = format_datetime(datetime.now(timezone.utc) - timedelta(minutes=5), usegmt=True)
+        self._answer(mock_client, _response(429, headers={"Retry-After": retry_at}), _response(200, json={}))
+
+        assert api_client.make_authenticated_request(**_request_args()) == {}
+
+        assert [c.args[0] for c in mock_sleep.call_args_list] == [3.75]
+
+    @patch("app.services.providers.api_client.time.sleep")
+    def test_throttle_waits_until_a_retry_after_date(
+        self, mock_sleep: MagicMock, mock_client: MagicMock, mock_token: MagicMock
+    ) -> None:
+        retry_at = format_datetime(datetime.now(timezone.utc) + timedelta(seconds=30), usegmt=True)
+        self._answer(mock_client, _response(429, headers={"Retry-After": retry_at}), _response(200, json={}))
+
+        assert api_client.make_authenticated_request(**_request_args()) == {}
+
+        [wait] = [c.args[0] for c in mock_sleep.call_args_list]
+        assert 25 <= wait <= 30
 
     def test_no_response(self, mock_client: MagicMock, mock_token: MagicMock) -> None:
         self._answer(mock_client, httpx.ConnectTimeout("timed out"))

@@ -1,6 +1,6 @@
 """Tests for summaries endpoints."""
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
@@ -876,6 +876,114 @@ class TestActivitySummaryEndpoint:
         assert response.status_code == 200
         activity = response.json()["data"][0]
         assert activity["active_minutes"] == 2
+
+    @pytest.mark.parametrize(
+        ("provider", "active_minutes"),
+        [
+            (ProviderName.WITHINGS, 2),  # its exercise time is intensity minutes: the step-threshold count stays
+            (ProviderName.GOOGLE_HEALTH, 2),
+            (ProviderName.ULTRAHUMAN, 45),  # its active minutes are stored as exercise time
+        ],
+    )
+    def test_provider_exercise_time_is_active_minutes_only_where_it_means_that(
+        self, client: TestClient, db: Session, provider: ProviderName, active_minutes: int
+    ) -> None:
+        user = UserFactory()
+        mapping = DataSourceFactory(user=user, provider=provider, source=provider.value)
+        steps_type = SeriesTypeDefinitionFactory.get_or_create_steps()
+
+        base_time = datetime(2025, 12, 26, 8, 0, 0, tzinfo=timezone.utc)
+        # Two distinct minute buckets, each >= 30 steps -> 2 active minutes via the step threshold.
+        DataPointSeriesFactory(mapping=mapping, series_type=steps_type, value=Decimal("100"), recorded_at=base_time)
+        DataPointSeriesFactory(
+            mapping=mapping, series_type=steps_type, value=Decimal("200"), recorded_at=base_time + timedelta(minutes=5)
+        )
+        roll_up_everything(db)
+        provider_day(db, mapping, SeriesType.exercise_time, base_time.date(), sum=Decimal("45"))
+
+        response = client.get(
+            f"/api/v1/users/{user.id}/summaries/activity",
+            headers=api_key_headers(ApiKeyFactory().plain_key),
+            params={"start_date": "2025-12-25T00:00:00Z", "end_date": "2025-12-27T00:00:00Z"},
+        )
+
+        assert response.status_code == 200
+        activity = response.json()["data"][0]
+        assert activity["source"]["provider"] == provider.value
+        assert activity["active_minutes"] == active_minutes
+
+    @pytest.mark.parametrize(
+        ("winner", "active_time", "active_minutes"),
+        [
+            (ProviderName.APPLE, None, 2),  # the winner's step-threshold count
+            (ProviderName.GARMIN, Decimal("312"), 312),  # the winner's own active time
+        ],
+    )
+    def test_ultrahuman_minutes_never_reach_another_providers_day(
+        self,
+        client: TestClient,
+        db: Session,
+        winner: ProviderName,
+        active_time: Decimal | None,
+        active_minutes: int,
+    ) -> None:
+        """A second device's Ultrahuman exercise and sedentary time are not filled into the winner's day."""
+        priority_repo = ProviderPriorityRepository(ProviderPriority)
+        priority_repo.upsert(db, winner, 1)
+        priority_repo.upsert(db, ProviderName.ULTRAHUMAN, 13)
+        user = UserFactory()
+        base_time = datetime(2025, 12, 26, 8, 0, 0, tzinfo=timezone.utc)
+        steps_type = SeriesTypeDefinitionFactory.get_or_create_steps()
+        winning = DataSourceFactory(user=user, provider=winner, source=winner.value)
+        # Two distinct minute buckets, each >= 30 steps: 2 active and 0 sedentary minutes by the step threshold.
+        DataPointSeriesFactory(mapping=winning, series_type=steps_type, value=Decimal("100"), recorded_at=base_time)
+        DataPointSeriesFactory(
+            mapping=winning, series_type=steps_type, value=Decimal("200"), recorded_at=base_time + timedelta(minutes=5)
+        )
+        ring = DataSourceFactory(user=user, provider=ProviderName.ULTRAHUMAN, source="ultrahuman")
+        roll_up_everything(db)
+        if active_time is not None:
+            provider_day(db, winning, SeriesType.active_time, base_time.date(), sum=active_time)
+        provider_day(db, ring, SeriesType.exercise_time, base_time.date(), sum=Decimal("45"))
+        provider_day(db, ring, SeriesType.sedentary_time, base_time.date(), sum=Decimal("210"))
+
+        response = client.get(
+            f"/api/v1/users/{user.id}/summaries/activity",
+            headers=api_key_headers(ApiKeyFactory().plain_key),
+            params={"start_date": "2025-12-25T00:00:00Z", "end_date": "2025-12-27T00:00:00Z"},
+        )
+
+        assert response.status_code == 200
+        [activity] = response.json()["data"]
+        assert activity["source"]["provider"] == winner.value
+        assert (activity["active_minutes"], activity["sedentary_minutes"]) == (active_minutes, 0)
+
+    def test_another_providers_exercise_time_alone_does_not_win_the_day(self, client: TestClient, db: Session) -> None:
+        """Exercise and sedentary time count only as Ultrahuman's own: a higher-ranked source with nothing else that
+        day makes no day of its own, so it can't blank Ultrahuman's minutes."""
+        priority_repo = ProviderPriorityRepository(ProviderPriority)
+        priority_repo.upsert(db, ProviderName.APPLE, 1)
+        priority_repo.upsert(db, ProviderName.ULTRAHUMAN, 13)
+        user = UserFactory()
+        day = date(2025, 12, 26)
+        phone = DataSourceFactory(user=user, provider=ProviderName.APPLE, source=ProviderName.APPLE.value)
+        ring = DataSourceFactory(user=user, provider=ProviderName.ULTRAHUMAN, source="ultrahuman")
+        provider_day(db, phone, SeriesType.exercise_time, day, sum=Decimal("20"))
+        provider_day(db, phone, SeriesType.sedentary_time, day, sum=Decimal("600"))
+        provider_day(db, ring, SeriesType.steps, day, sum=Decimal("8000"))
+        provider_day(db, ring, SeriesType.exercise_time, day, sum=Decimal("45"))
+        provider_day(db, ring, SeriesType.sedentary_time, day, sum=Decimal("210"))
+
+        response = client.get(
+            f"/api/v1/users/{user.id}/summaries/activity",
+            headers=api_key_headers(ApiKeyFactory().plain_key),
+            params={"start_date": "2025-12-25T00:00:00Z", "end_date": "2025-12-27T00:00:00Z"},
+        )
+
+        assert response.status_code == 200
+        [activity] = response.json()["data"]
+        assert activity["source"]["provider"] == ProviderName.ULTRAHUMAN.value
+        assert (activity["steps"], activity["active_minutes"], activity["sedentary_minutes"]) == (8000, 45, 210)
 
     def test_get_activity_summary_multiple_days(self, client: TestClient, db: Session) -> None:
         """Test activity summary returns data grouped by day."""

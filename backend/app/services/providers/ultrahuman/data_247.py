@@ -3,15 +3,18 @@
 import math
 import re
 from datetime import date, datetime, time, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
+from enum import Enum
 from typing import Any, TypeIs
 from uuid import UUID, uuid4
 
+from redis.exceptions import RedisError
 from sqlalchemy.exc import DataError, IntegrityError
 
 from app.config import settings
 from app.constants.sleep import SleepStageType
 from app.database import DbSession
+from app.integrations.redis_client import get_redis_client
 from app.models import EventRecord
 from app.repositories import EventRecordRepository, UserConnectionRepository
 from app.repositories.data_point_series_repository import WriteCounts
@@ -21,10 +24,11 @@ from app.schemas.model_crud.activities.event_record import EventRecordCreate
 from app.schemas.model_crud.activities.event_record_detail import EventRecordDetailCreate
 from app.schemas.model_crud.activities.health_score import HealthScoreCreate, ScoreComponent
 from app.schemas.model_crud.activities.sleep import SleepStage
+from app.schemas.sync_status import SyncScope
 from app.services.event_record_service import event_record_service
 from app.services.health_score_service import health_score_service
-from app.services.providers.api_client import make_authenticated_request
-from app.services.providers.sync_247_result import Sync247Result, Sync247Run
+from app.services.providers.api_client import get_valid_token, make_authenticated_request
+from app.services.providers.sync_247_result import Sync247Result, Sync247Run, error_code_of
 from app.services.providers.templates.base_247_data import Base247DataTemplate
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.services.providers.ultrahuman.coverage import (
@@ -35,11 +39,13 @@ from app.services.providers.ultrahuman.coverage import (
     SCORE_COMPONENTS,
     SLEEP_SCORE_LOCATIONS,
 )
+from app.services.providers.ultrahuman.oauth import fetch_provider_user_info
 from app.services.raw_payload_storage import store_raw_payload
 from app.services.timeseries_service import timeseries_service
+from app.utils.context import sync_run_var
 from app.utils.conversion import as_float, as_int, seconds_to_minutes
 from app.utils.dates import offset_to_iso
-from app.utils.exceptions import ProviderConnectionError, ProviderError
+from app.utils.exceptions import ProviderConnectionError, ProviderError, ProviderRateLimitError
 from app.utils.structured_logging import get_logger
 from app.utils.units import BloodGlucoseUnit, UnitConverter, parse_unit
 
@@ -55,6 +61,77 @@ SLEEP_GRAPH_STAGE_MAP: dict[str, SleepStageType] = {
 
 # The UTC offsets in use run from -12:00 to +14:00.
 _WESTMOST, _EASTMOST = timedelta(hours=-12), timedelta(hours=14)
+
+# A live sync retries a day whose fetch failed (5xx, no response) only while the day is this young: an older one is
+# given up and read as empty, so a day Ultrahuman never serves cannot hold the live cursor, and widen every later
+# pull's window, for good. Backfills keep reporting such a day as failed: they do not move the cursor.
+MAX_RETRIED_DAY_AGE = timedelta(days=7)
+
+# What reading a day's answer raises when its shape is not what our code expects (a JSON or pydantic error is a
+# ValueError): the same answer fails the same way every run, so the day is skipped rather than retried.
+_ANSWER_READING_ERRORS = (LookupError, TypeError, ValueError, AttributeError, ArithmeticError)
+
+
+class UltrahumanBodyError(ProviderError):
+    """Ultrahuman answered 200 with an error in its ``{data, error, status}`` envelope; ``upstream_status`` is the
+    body's status (None when it names none)."""
+
+
+class DayFailure(Enum):
+    """What a day's failed fetch means for the run (``Ultrahuman247Data._day_failure``)."""
+
+    FATAL = "fatal"  # the grant is unusable: raised, ending the run
+    EMPTY = "empty"  # a day without data
+    FAIL = "fail"  # an outage: the day fails, so a live sync fetches it again
+    THROTTLED = "throttled"  # failed like an outage, and the walk ends
+    SKIP = "skip"  # would fail the same way every run: skipped as empty, reported
+
+
+# The account id is looked up at most this often per connection while a connect could not read it.
+PROFILE_ATTEMPT_INTERVAL = timedelta(days=1)
+
+
+def _profile_attempt_allowed(connection_id: UUID) -> bool:
+    """Whether this connection may try /user_info now; claims the attempt. False when Redis can't be reached."""
+    try:
+        return bool(
+            get_redis_client().set(
+                f"ultrahuman:user_info_attempt:{connection_id}",
+                1,
+                nx=True,
+                ex=int(PROFILE_ATTEMPT_INTERVAL.total_seconds()),
+            )
+        )
+    except Exception as e:
+        logger.warning(
+            "Ultrahuman user profile attempt not claimed", provider="ultrahuman", error_code=error_code_of(e)
+        )
+        return False
+
+
+def _utc_today() -> date:
+    return datetime.now(timezone.utc).date()
+
+
+def _is_historical_run() -> bool:
+    run = sync_run_var.get()
+    return run is not None and run.scope == SyncScope.HISTORICAL
+
+
+def _body_status(value: Any) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value)
+    return None
+
+
+def _envelope_error(body: Any) -> tuple[bool, int | None]:
+    """Whether an Ultrahuman ``{data, error, status}`` body reports an error, and the status it names."""
+    if not isinstance(body, dict):
+        return False, None
+    status = _body_status(body.get("status"))
+    return bool(body.get("error")) or (status is not None and status != 200), status
 
 
 def _at(items_by_type: dict[str, Any], path: tuple[str, ...]) -> Any:
@@ -83,16 +160,26 @@ def _is_number(value: Any) -> TypeIs[int | float]:
     return isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
 
 
+def _utc(timestamp: Any) -> datetime | None:
+    """A unix timestamp as a UTC datetime; None for anything that is not a number of a representable instant."""
+    if not _is_number(timestamp):
+        return None
+    try:
+        return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
 def _zone_offset(day: date, metrics: list[dict[str, Any]]) -> str | None:
     """The user's UTC offset on ``day``: Ultrahuman starts each metric's day at the user's local midnight. None when
     no metric carries a day start that is a real offset from ``day``."""
     midnight = datetime.combine(day, time(), timezone.utc)
     for item in metrics:
         metric = item.get("object")
-        day_start = metric.get("day_start_timestamp") if isinstance(metric, dict) else None
-        if not _is_number(day_start):
+        day_start = _utc(metric.get("day_start_timestamp")) if isinstance(metric, dict) else None
+        if day_start is None:
             continue
-        offset = midnight - datetime.fromtimestamp(day_start, tz=timezone.utc)
+        offset = midnight - day_start
         if _WESTMOST <= offset <= _EASTMOST:
             return offset_to_iso(int(offset.total_seconds()))
     return None
@@ -137,6 +224,7 @@ class Ultrahuman247Data(Base247DataTemplate):
         endpoint: str,
         params: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
+        check_body_errors: bool = True,
     ) -> Any:
         """Make authenticated request to Ultrahuman API."""
         return make_authenticated_request(
@@ -150,6 +238,7 @@ class Ultrahuman247Data(Base247DataTemplate):
             method="GET",
             params=params,
             headers=headers,
+            check_body_errors=check_body_errors,
         )
 
     def _fetch_daily_metrics(
@@ -161,81 +250,50 @@ class Ultrahuman247Data(Base247DataTemplate):
         """Fetch all metrics for a specific day from Ultrahuman API.
 
         Returns:
-            list[dict[str, Any]]: List of metrics for the day, or empty list on recoverable errors.
+            list[dict[str, Any]]: The day's metric items; empty when Ultrahuman answered with no data for the day.
+                Items that are not objects are dropped, and a metric type nothing here reads (``workout``, or one a
+                new scope adds) is kept but ignored downstream.
+
+            A 200 whose ``{data, error, status}`` envelope reports a 404 is a day without data too.
 
         Raises:
             ProviderConnectionError: The connection can't be used (token rejected or missing).
-            ProviderError: Ultrahuman answered 403, which every remaining day would get too.
+            ProviderError: The request failed: a 401/403, a throttle that outlasted the client's backoff, a 5xx, no
+                response, a request Ultrahuman refused or an answer that is not JSON.
+            UltrahumanBodyError: A 200 whose envelope reports any other error.
         """
         date_str = date.strftime("%Y-%m-%d")
-        try:
-            response = self._make_api_request(
-                db,
-                user_id,
-                "/user_data/metrics",
-                params={"date": date_str},
-            )
-            store_raw_payload(
-                source="api_response",
-                provider="ultrahuman",
-                payload=response,
-                user_id=str(user_id),
-                trace_id=date_str,
-            )
-            if response and "data" in response and "metric_data" in response["data"]:
-                # Add date to each metric item for reference
-                metrics = response["data"]["metric_data"]
-                zone_offset = _zone_offset(date.date(), metrics)
-                for item in metrics:
-                    item["date"] = date_str
-                    # Inject the day and its offset into the inner object for use in normalization
-                    if "object" in item and isinstance(item["object"], dict):
-                        item["object"]["ultrahuman_date"] = date_str
-                        item["object"]["ultrahuman_zone_offset"] = zone_offset
-                return metrics
-        except ProviderConnectionError as e:
-            # Fatal errors - should be raised to trigger token refresh or invalidate connection
-            logger.error(
-                "Authorization failed while fetching daily metrics",
-                provider="ultrahuman",
-                task="fetch_daily_metrics",
-                date=date_str,
-                error=e.detail,
-            )
-            raise
-        except ProviderError as e:
-            if e.upstream_status in (401, 403):
-                logger.error(
-                    "Authorization failed while fetching daily metrics",
-                    provider="ultrahuman",
-                    task="fetch_daily_metrics",
-                    date=date_str,
-                    upstream_status=e.upstream_status,
-                    error=e.detail,
-                )
-                raise
-            # Recoverable errors - log and continue with next day
-            logger.warning(
-                "API error while fetching daily metrics",
-                provider="ultrahuman",
-                task="fetch_daily_metrics",
-                date=date_str,
-                upstream_status=e.upstream_status,
-                error=e.detail,
-            )
-            return []
-        except Exception as e:
-            # Network errors and other unexpected errors - log and continue
-            logger.warning(
-                "Failed to fetch daily metrics",
-                provider="ultrahuman",
-                task="fetch_daily_metrics",
-                date=date_str,
-                error=str(e),
-            )
-            return []
-
-        return []
+        response = self._make_api_request(
+            db,
+            user_id,
+            "/user_data/metrics",
+            params={"date": date_str},
+            # Ultrahuman's envelope carries its own status, read here rather than as a generic 400.
+            check_body_errors=False,
+        )
+        has_error, status = _envelope_error(response)
+        if has_error:
+            if status == 404:
+                self._log_empty_day(user_id, date, "body_404")
+                return []
+            raise UltrahumanBodyError(self.provider_name, upstream_status=status, request_rejected=False)
+        store_raw_payload(
+            source="api_response",
+            provider="ultrahuman",
+            payload=response,
+            user_id=str(user_id),
+            trace_id=date_str,
+        )
+        data = response.get("data") if isinstance(response, dict) else None
+        metrics = _dicts(data.get("metric_data")) if isinstance(data, dict) else []
+        zone_offset = _zone_offset(date.date(), metrics)
+        for item in metrics:
+            item["date"] = date_str
+            # Inject the day and its offset into the inner object for use in normalization
+            if isinstance(item.get("object"), dict):
+                item["object"]["ultrahuman_date"] = date_str
+                item["object"]["ultrahuman_zone_offset"] = zone_offset
+        return metrics
 
     # -------------------------------------------------------------------------
     # Sleep Data
@@ -254,15 +312,15 @@ class Ultrahuman247Data(Base247DataTemplate):
 
         stages: list[SleepStage] = []
         for interval in intervals:
-            start_ts = interval.get("start")
-            end_ts = interval.get("end")
-            if not _is_number(start_ts) or not _is_number(end_ts):
+            start_time = _utc(interval.get("start"))
+            end_time = _utc(interval.get("end"))
+            if start_time is None or end_time is None:
                 continue
             stages.append(
                 SleepStage(
                     stage=SLEEP_GRAPH_STAGE_MAP.get(interval.get("type"), SleepStageType.UNKNOWN),
-                    start_time=datetime.fromtimestamp(start_ts, tz=timezone.utc),
-                    end_time=datetime.fromtimestamp(end_ts, tz=timezone.utc),
+                    start_time=start_time,
+                    end_time=end_time,
                 )
             )
 
@@ -280,12 +338,8 @@ class Ultrahuman247Data(Base247DataTemplate):
         bedtime_end_ts = raw_sleep.get("bedtime_end")
         date_str = raw_sleep.get("ultrahuman_date")
 
-        start_dt = None
-        end_dt = None
-        if bedtime_start_ts:
-            start_dt = datetime.fromtimestamp(bedtime_start_ts, tz=timezone.utc)
-        if bedtime_end_ts:
-            end_dt = datetime.fromtimestamp(bedtime_end_ts, tz=timezone.utc)
+        start_dt = _utc(bedtime_start_ts) if bedtime_start_ts else None
+        end_dt = _utc(bedtime_end_ts) if bedtime_end_ts else None
 
         # Extract durations from quick_metrics
         # "quick_metrics": [{"type": "time_in_bed", "value": 27000}, ...]
@@ -489,7 +543,7 @@ class Ultrahuman247Data(Base247DataTemplate):
         for metric_type, category in DAILY_SCORES.items():
             metric = raw_recovery.get(metric_type) or {}
             value, day_start = metric.get("value"), metric.get("day_start_timestamp")
-            if value is None or not day_start:
+            if value is None or not day_start or (recorded_at := _utc(day_start)) is None:
                 continue
             scores.append(
                 HealthScoreCreate(
@@ -498,7 +552,7 @@ class Ultrahuman247Data(Base247DataTemplate):
                     provider=ProviderName.ULTRAHUMAN,
                     category=category,
                     value=value,
-                    recorded_at=datetime.fromtimestamp(day_start, tz=timezone.utc),
+                    recorded_at=recorded_at,
                     zone_offset=metric.get("ultrahuman_zone_offset"),
                     components=_components(category, raw_recovery) or None,
                 )
@@ -527,9 +581,11 @@ class Ultrahuman247Data(Base247DataTemplate):
                     value = _in_mg_dl(value, sample.get("unit"))
                 if not ts or (series_type is SeriesType.steps and not (value and value > 0)):
                     continue
+                if (recorded_at := _utc(ts)) is None:
+                    continue
                 readings.append(
                     {
-                        "recorded_at": datetime.fromtimestamp(ts, tz=timezone.utc),
+                        "recorded_at": recorded_at,
                         "zone_offset": sample.get("zone_offset"),
                         "value": value,
                     }
@@ -592,9 +648,13 @@ class Ultrahuman247Data(Base247DataTemplate):
         """Load and save all 247 data types by fetching daily metrics.
 
         Ultrahuman exposes one metrics endpoint per day, so the window is walked
-        a day at a time and each data type's counts accumulate across days. A
-        fatal auth error (401/403) aborts the whole run; anything else is
-        recorded against the data type it belongs to and the walk continues.
+        a day at a time and each data type's counts accumulate across days. How a
+        day's failed fetch counts is ``_fetch_items_by_type``'s: a lost grant ends
+        the run, an outage fails the day (so a live sync keeps its cursor and
+        fetches it again, while it is young enough), a throttle that outlasts the
+        client's backoff fails the day and ends the walk, and anything else is a
+        day without data. A failure while saving is recorded against the data
+        type it belongs to.
         """
 
         # TODO: Extract default backfill days (30) to an env var / settings constant.
@@ -603,15 +663,24 @@ class Ultrahuman247Data(Base247DataTemplate):
 
         start_time, end_time = self.resolve_window(start_time, end_time)
 
-        # A lost grant or a 403 from _fetch_daily_metrics invalidates every remaining
+        # A lost grant or a 401/403 from _fetch_daily_metrics invalidates every remaining
         # day, so it propagates instead of being recorded against one data type.
         run = self.sync_run(db, user_id, fatal=(ProviderConnectionError, ProviderError))
         run.expect("sleep", "recovery", "activity_samples")
+        self._fill_provider_user_id(db, user_id)
 
         current_date = datetime.combine(start_time.date(), datetime.min.time(), tzinfo=timezone.utc)
         end_date = datetime.combine(end_time.date(), datetime.min.time(), tzinfo=timezone.utc)
         while current_date <= end_date:
-            items_by_type = self._fetch_items_by_type(db, user_id, current_date, run)
+            try:
+                items_by_type = self._fetch_items_by_type(db, user_id, current_date, run)
+            except ProviderRateLimitError:
+                # Still throttled after the client's backoff: the remaining days would be too, and the
+                # failure recorded for daily_metrics keeps the cursor where it was, so they are fetched next run.
+                break
+            if items_by_type is None:
+                current_date += timedelta(days=1)
+                continue
 
             if "Sleep" in items_by_type:
                 with run.step("sleep", accumulate=True, commit=True) as step:
@@ -632,31 +701,179 @@ class Ultrahuman247Data(Base247DataTemplate):
         run.log_summary()
         return run.result
 
+    def _fill_provider_user_id(self, db: DbSession, user_id: UUID) -> None:
+        """Fill in the Ultrahuman account id a connect could not read, so the next sync takes the per-account pull
+        lock. Best effort, at most once a day per connection and only with the ``profile`` scope /user_info needs.
+
+        The profile is fetched outside the authenticated request path: a 401 there (the scope withdrawn, say) must not
+        refresh the token, count towards the dead-grant clock or revoke a connection the metrics work with. Every
+        failure, a connection error included, is logged and the sync goes on.
+        """
+        connection = self.connection_repo.get_by_user_and_provider(db, user_id, self.provider_name)
+        if connection is None or connection.provider_user_id:
+            return
+        if connection.scope and "profile" not in re.split(r"[\s,]+", connection.scope.strip()):
+            return
+        if not _profile_attempt_allowed(connection.id):
+            return
+        try:
+            access_token = get_valid_token(
+                db, user_id, self.provider_name, self.connection_repo, self.oauth, revoke_on_failure=False
+            )
+            info = fetch_provider_user_info(self.api_base_url, access_token, str(user_id))
+        except Exception as e:
+            logger.warning(
+                "Ultrahuman user profile not fetched; tried again tomorrow",
+                provider="ultrahuman",
+                task="fill_provider_user_id",
+                user_id=str(user_id),
+                error_code=error_code_of(e),
+            )
+            return
+        if not info["user_id"]:
+            return
+        connection.provider_user_id = info["user_id"]
+        if info["username"] and not connection.provider_username:
+            connection.provider_username = info["username"]
+        db.commit()
+        logger.info(
+            "Ultrahuman account id filled in on sync",
+            provider="ultrahuman",
+            task="fill_provider_user_id",
+            user_id=str(user_id),
+        )
+
+    @staticmethod
+    def _day_failure(error: Exception) -> DayFailure:
+        """What a day's failed fetch means for the run."""
+        if isinstance(error, ProviderConnectionError):
+            return DayFailure.FATAL
+        if not isinstance(error, ProviderError):
+            # Our own reading of the answer failed: it would fail the same way every run. Anything else (Redis, the
+            # token refresh lock, the database) is transient, so the day fails and is fetched again. Redis errors are
+            # excluded by name: its LockError is a ValueError too.
+            if isinstance(error, _ANSWER_READING_ERRORS) and not isinstance(error, RedisError):
+                return DayFailure.SKIP
+            return DayFailure.FAIL
+        status = error.upstream_status
+        if isinstance(error, UltrahumanBodyError):
+            if status == 429:
+                return DayFailure.THROTTLED
+            if status is None or status == 408 or status >= 500:
+                return DayFailure.FAIL
+            return DayFailure.SKIP  # a 4xx the body names (its 404 is an empty day, read in _fetch_daily_metrics)
+        if status in (401, 403):
+            return DayFailure.FATAL
+        if status == 404:
+            return DayFailure.EMPTY
+        if isinstance(error, ProviderRateLimitError):
+            return DayFailure.THROTTLED
+        if status is None or status >= 500:
+            return DayFailure.FAIL
+        return DayFailure.SKIP  # 400/422, a 200 that is not JSON: the same request fails the same way every run
+
     def _fetch_items_by_type(
         self,
         db: DbSession,
         user_id: UUID,
         day: datetime,
         run: Sync247Run,
-    ) -> dict[str, Any]:
-        """Fetch one day of metrics, keyed by Ultrahuman's type name.
+    ) -> dict[str, Any] | None:
+        """Fetch one day of metrics, keyed by Ultrahuman's type name; None when the fetch failed.
 
-        The fetch feeds every data type, so a failure is recorded against the
-        endpoint rather than any one of them, and the day is skipped.
+        The fetch feeds every data type, so its outcome is recorded against the endpoint (``daily_metrics``)
+        rather than any one of them:
+
+        - a lost grant (connection error, 401/403) is raised: every remaining day would get it too;
+        - a 404, in the status or in the body's envelope, is a day without data;
+        - an outage (5xx, no response, a 408 or an error without a status in the body) or a transient failure of
+          our own (Redis, the token refresh lock, the database) fails the day, so a live sync keeps its cursor and
+          fetches it again; once the day is older than ``MAX_RETRIED_DAY_AGE`` a live sync gives it up and reads it
+          as empty;
+        - a throttle that outlasted the client's backoff, or a 429 in the body, fails the day and is raised as
+          ``ProviderRateLimitError``, to end the walk;
+        - a request Ultrahuman refused (400/422, another 4xx in the body), an answer that is not JSON or one our
+          code could not read would fail the same way every run: the day is skipped as empty, logged and reported.
         """
+        date_str = day.strftime("%Y-%m-%d")
         try:
-            metrics_list = self._fetch_daily_metrics(db, user_id, day)
-        except (ProviderConnectionError, ProviderError):
-            raise
+            return self._items_by_type(self._fetch_daily_metrics(db, user_id, day))
         except Exception as e:
-            run.fail("daily_metrics", e)
-            return {}
+            failure = self._day_failure(e)
+            if failure is DayFailure.FATAL:
+                raise
+            if failure is DayFailure.EMPTY:
+                self._log_empty_day(user_id, day, error_code_of(e))
+                return {}
+            if failure is DayFailure.SKIP:
+                logger.warning(
+                    "Ultrahuman day skipped: its answer can't be used",
+                    provider="ultrahuman",
+                    task="fetch_daily_metrics",
+                    user_id=str(user_id),
+                    date=date_str,
+                    error_code=error_code_of(e),
+                    exc_info=e,
+                    alert=True,
+                )
+                run.result.add("daily_metrics", 0, skipped=1)
+                return {}
+            if (
+                failure is DayFailure.FAIL
+                and not _is_historical_run()
+                and day.date() < _utc_today() - MAX_RETRIED_DAY_AGE
+            ):
+                logger.warning(
+                    "Ultrahuman day still failing after the retry window; given up as empty",
+                    provider="ultrahuman",
+                    task="fetch_daily_metrics",
+                    user_id=str(user_id),
+                    date=date_str,
+                    error_code=error_code_of(e),
+                )
+                run.result.add("daily_metrics", 0, skipped=1)
+                return {}
+            # An outage is reported; a throttle or a lost response is not, so a day that keeps failing on every
+            # pull does not raise an alert each time.
+            outage = isinstance(e, ProviderError) and e.upstream_status is not None and e.upstream_status >= 500
+            logger.warning(
+                "Ultrahuman day not fetched; retried on the next sync",
+                provider="ultrahuman",
+                task="fetch_daily_metrics",
+                user_id=str(user_id),
+                date=date_str,
+                error_code=error_code_of(e),
+                exc_info=e if outage else None,
+                alert=outage,
+            )
+            run.result.fail("daily_metrics", e)
+            if failure is DayFailure.THROTTLED:
+                if isinstance(e, ProviderRateLimitError):
+                    raise
+                # A throttle named in the body: raised as the client's own, so the walk ends the same way.
+                raise ProviderRateLimitError(self.provider_name, upstream_status=429) from e
+            return None
 
-        return self._items_by_type(metrics_list)
+    @staticmethod
+    def _log_empty_day(user_id: UUID, day: datetime, reason: str) -> None:
+        logger.info(
+            "Ultrahuman has no data for the day",
+            provider="ultrahuman",
+            task="fetch_daily_metrics",
+            user_id=str(user_id),
+            date=day.strftime("%Y-%m-%d"),
+            reason=reason,
+        )
 
     @staticmethod
     def _items_by_type(metrics_list: list[dict[str, Any]]) -> dict[str, Any]:
-        return {item["type"]: item["object"] for item in metrics_list if item.get("type") and item.get("object")}
+        """The day's metric objects by type. A type nothing here reads (``workout``, whose payload Ultrahuman does
+        not document) is carried along and ignored, never a reason to fail the day."""
+        return {
+            item["type"]: item["object"]
+            for item in metrics_list
+            if isinstance(item.get("type"), str) and item["type"] and item.get("object")
+        }
 
     def _save_daily_activity(
         self,
@@ -685,9 +902,12 @@ class Ultrahuman247Data(Base247DataTemplate):
         for key, series_type in DAILY_SCALAR_SERIES.items():
             scalar = items_by_type.get(key) or {}
             value, day_start = scalar.get("value"), scalar.get("day_start_timestamp")
-            if value is None or not day_start:
+            if value is None or not day_start or (recorded_at := _utc(day_start)) is None:
                 continue
-            recorded_at = datetime.fromtimestamp(day_start, tz=timezone.utc)
+            try:
+                decimal_value = Decimal(str(value))
+            except InvalidOperation:
+                continue
             zone_offset = scalar.get("ultrahuman_zone_offset")
             samples.append(
                 TimeSeriesSampleCreate(
@@ -696,7 +916,7 @@ class Ultrahuman247Data(Base247DataTemplate):
                     provider=self.provider_name,
                     recorded_at=recorded_at,
                     zone_offset=zone_offset,
-                    value=Decimal(str(value)),
+                    value=decimal_value,
                     series_type=series_type,
                     is_daily_total=daily_total_flag(series_type, True),
                     period=CalendarPeriod.local_day(recorded_at, zone_offset=zone_offset),

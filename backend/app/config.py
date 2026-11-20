@@ -258,7 +258,10 @@ class Settings(BaseSettings):
     ultrahuman_client_id: str | None = None
     ultrahuman_client_secret: SecretStr | None = None
     ultrahuman_redirect_uri: str | None = None  # Deprecated: use API_BASE_URL
-    ultrahuman_default_scope: str = "ring_data cgm_data profile"
+    # ring_extended_data carries temperature_deviation (among others); workout delivers workouts inside
+    # /user_data/metrics (stored nowhere yet); profile lets /user_data/user_info read the account id.
+    # cgm_data is opt-in: Ultrahuman grants it only to approved partners, so add it via the env var once approved.
+    ultrahuman_default_scope: str = "ring_data ring_extended_data workout profile"
 
     # GOOGLE OAUTH SETTINGS
     google_client_id: str | None = None

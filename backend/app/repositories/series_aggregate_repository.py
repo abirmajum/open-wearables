@@ -556,6 +556,16 @@ _ACTIVITY_SUMS = {
     SeriesType.moderate_intensity_time: "moderate_intensity_minutes",
     SeriesType.vigorous_intensity_time: "vigorous_intensity_minutes",
 }
+# The providers whose own daily exercise and sedentary time stand for the summary's active and sedentary minutes,
+# as they report no active time: Ultrahuman stores its active minutes as exercise_time and its inactive time as
+# sedentary_time. Read only from their own day values, never summed from samples. Other providers' exercise time
+# (Withings, Google Health) stays out, so their summaries keep the step count.
+# A tuple, matched by equality: a str-valued enum member and the plain value a data source holds hash differently.
+_PROVIDER_DAY_ACTIVITY_MINUTES: tuple[ProviderName, ...] = (ProviderName.ULTRAHUMAN,)
+_OWN_DAY_MINUTES = {
+    SeriesType.exercise_time: "exercise_time_minutes",
+    SeriesType.sedentary_time: "sedentary_time_minutes",
+}
 _HEART_RATE_KEYS = ("hr_avg", "hr_max", "hr_min")
 _ENERGY_KEYS = ("active_energy_sum", "basal_energy_sum", "total_energy_sum")
 _INTENSITY_KEYS = ("moderate_intensity_minutes", "vigorous_intensity_minutes")
@@ -568,7 +578,9 @@ ACTIVITY_METRIC_GROUPS: tuple[tuple[str, ...], ...] = (
     _INTENSITY_KEYS,
     _HEART_RATE_KEYS,
 )
-ACTIVITY_METRIC_KEYS = tuple(key for group in ACTIVITY_METRIC_GROUPS for key in group)
+# Every key an activity day carries. The own-day minutes are in no group, so they are never filled in from another
+# source: a day shows them only when its winning row is the provider's own.
+ACTIVITY_METRIC_KEYS = (*(key for group in ACTIVITY_METRIC_GROUPS for key in group), *_OWN_DAY_MINUTES.values())
 
 
 def daily_activity(
@@ -579,7 +591,7 @@ def daily_activity(
 
     Data sources that share provider, source, device model and type add up, as their samples did.
     """
-    types = [*_ACTIVITY_SUMS, SeriesType.heart_rate]
+    types = [*_ACTIVITY_SUMS, *_OWN_DAY_MINUTES, SeriesType.heart_rate]
     # The bounds cut by their UTC date, as the workout and sleep queries of the same summary do in SQL:
     # a day is in when its date lies in [start's date, end's date).
     first_day, last_day = utc_date(start), utc_date(end) - timedelta(days=1)
@@ -589,9 +601,16 @@ def daily_activity(
     sources = {
         s.id: s for s in db_session.query(DataSource).filter(DataSource.id.in_({r.data_source_id for r, _ in rows}))
     }
+    own_day_keys = {get_series_type_id(series_type): key for series_type, key in _OWN_DAY_MINUTES.items()}
     days: dict[tuple, list[SeriesAggregate | SampleDay]] = {}
     for row, day in rows:
         source = sources[row.data_source_id]
+        # The own-day minutes count only as the provider's own day values: any other such row is dropped before it
+        # can make a day of its own, which could win the day over the source that has its activity.
+        if row.series_type_definition_id in own_day_keys and (
+            source.provider not in _PROVIDER_DAY_ACTIVITY_MINUTES or row.computed_by != ComputedBy.PROVIDER
+        ):
+            continue
         days.setdefault((day, source.provider, source.source, source.device_model, source.device_type), []).append(row)
 
     heart_rate_id = get_series_type_id(SeriesType.heart_rate)
@@ -610,6 +629,10 @@ def daily_activity(
             sums = [float(r.sum) for r in day_rows if r.series_type_definition_id == type_id and r.sum is not None]
             if sums:
                 result[key] = round(sum(sums)) if key in _INT_SUMS else sum(sums)
+        for type_id, key in own_day_keys.items():
+            minutes = [float(r.sum) for r in day_rows if r.series_type_definition_id == type_id and r.sum is not None]
+            if minutes:
+                result[key] = round(sum(minutes))
         heart_rate = [r for r in day_rows if r.series_type_definition_id == heart_rate_id]
         # Each source's day counts once: a provider's row (count 1) and ours (one per sample) weigh the same.
         if averages := [float(r.avg) for r in heart_rate if r.avg is not None]:

@@ -4,14 +4,21 @@ Tests for sync_vendor_data Celery task.
 Tests synchronization of workout data from external providers (Garmin, Polar, Suunto).
 """
 
+from datetime import datetime, timedelta, timezone
+from typing import Any
 from unittest.mock import MagicMock, patch
+from uuid import UUID
 
+import pytest
+from redis.exceptions import LockError
 from sqlalchemy.orm import Session
 
 from app.integrations.celery.tasks.sync_vendor_data_task import sync_vendor_data
 from app.schemas.auth import ConnectionStatus
 from app.schemas.sync_status import SyncStatus
+from app.services.providers.ultrahuman.data_247 import MAX_RETRIED_DAY_AGE, Ultrahuman247Data
 from app.services.sync_coordination import try_become_primary
+from app.utils.exceptions import ProviderError
 from app.utils.sync_params import build_sync_params
 from tests.factories import UserConnectionFactory, UserFactory
 
@@ -494,3 +501,62 @@ class TestSyncVendorDataLinkedSkip:
 
         db.refresh(connection)
         assert connection.last_synced_at == before
+
+
+class TestUltrahumanLiveCursor:
+    """A day Ultrahuman fails to serve holds the live cursor, but only until it is too old to retry."""
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            ProviderError("ultrahuman", upstream_status=500),
+            LockError("Unable to acquire lock"),  # the token refresh lock timed out: transient, not a skipped day
+        ],
+    )
+    @patch("app.integrations.celery.tasks.sync_vendor_data_task.SessionLocal")
+    def test_a_failing_day_holds_the_cursor_until_it_ages_out(
+        self,
+        mock_session_local: MagicMock,
+        db: Session,
+        mock_celery_app: MagicMock,
+        failure: Exception,
+    ) -> None:
+        user = UserFactory()
+        last_synced_at = datetime.now(timezone.utc) - timedelta(days=3)
+        connection = UserConnectionFactory(
+            user=user, provider="ultrahuman", status=ConnectionStatus.ACTIVE, last_synced_at=last_synced_at
+        )
+        failing_day = (last_synced_at + timedelta(days=1)).date()
+        mock_session_local.return_value.__enter__.return_value = db
+        mock_session_local.return_value.__exit__.return_value = None
+        fetched: list[str] = []
+
+        def metrics(_db: Session, _user_id: UUID, endpoint: str, params: dict[str, str], **_: Any) -> dict:
+            assert endpoint == "/user_data/metrics"
+            fetched.append(params["date"])
+            if params["date"] == failing_day.isoformat():
+                raise failure
+            day_start = datetime.fromisoformat(params["date"]).replace(tzinfo=timezone.utc).timestamp()
+            hr = {"type": "hr", "object": {"values": [{"timestamp": day_start + 3600, "value": 60}]}}
+            return {"data": {"metric_data": [hr]}, "error": None, "status": 200}
+
+        with patch.object(Ultrahuman247Data, "_make_api_request", side_effect=metrics):
+            result = sync_vendor_data(str(user.id), providers=["ultrahuman"])
+
+            assert result["providers_synced"]["ultrahuman"]["success"] is False
+            assert result["providers_synced"]["ultrahuman"]["params"]["data_247"]["status"] == SyncStatus.PARTIAL
+            db.refresh(connection)
+            assert connection.last_synced_at == last_synced_at
+
+            # A week on, the day is given up: the run succeeds and the cursor moves.
+            fetched.clear()
+            with patch(
+                "app.services.providers.ultrahuman.data_247._utc_today",
+                return_value=failing_day + MAX_RETRIED_DAY_AGE + timedelta(days=1),
+            ):
+                result = sync_vendor_data(str(user.id), providers=["ultrahuman"])
+
+        assert failing_day.isoformat() in fetched
+        assert result["providers_synced"]["ultrahuman"]["success"] is True
+        db.refresh(connection)
+        assert connection.last_synced_at > last_synced_at
