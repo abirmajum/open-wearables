@@ -557,8 +557,11 @@ _ACTIVITY_SUMS = {
     SeriesType.vigorous_intensity_time: "vigorous_intensity_minutes",
     SeriesType.sedentary_time: "sedentary_time_minutes",
 }
-# The provider's own daily exercise time, read only from its day values (not summed from samples): the summary's
-# active minutes where the provider reports no active time (Ultrahuman reports active minutes only as this).
+# The providers whose own daily exercise time stands for the summary's active minutes, as they report no active
+# time: Ultrahuman's active minutes are stored as exercise_time. Read only from their day values, never summed from
+# samples. Other providers' exercise time (Withings, Google Health) stays out, so their summaries keep the step count.
+# A tuple, matched by equality: a str-valued enum member and the plain value a data source holds hash differently.
+_EXERCISE_TIME_AS_ACTIVE_TIME: tuple[ProviderName, ...] = (ProviderName.ULTRAHUMAN,)
 _PROVIDER_EXERCISE_KEY = "exercise_time_minutes"
 _HEART_RATE_KEYS = ("hr_avg", "hr_max", "hr_min")
 _ENERGY_KEYS = ("active_energy_sum", "basal_energy_sum", "total_energy_sum")
@@ -619,7 +622,10 @@ def daily_activity(
         exercise = [
             float(r.sum)
             for r in day_rows
-            if r.series_type_definition_id == exercise_id and r.computed_by == ComputedBy.PROVIDER and r.sum is not None
+            if provider in _EXERCISE_TIME_AS_ACTIVE_TIME
+            and r.series_type_definition_id == exercise_id
+            and r.computed_by == ComputedBy.PROVIDER
+            and r.sum is not None
         ]
         if exercise:
             result[_PROVIDER_EXERCISE_KEY] = round(sum(exercise))

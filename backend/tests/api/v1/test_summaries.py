@@ -877,6 +877,41 @@ class TestActivitySummaryEndpoint:
         activity = response.json()["data"][0]
         assert activity["active_minutes"] == 2
 
+    @pytest.mark.parametrize(
+        ("provider", "active_minutes"),
+        [
+            (ProviderName.WITHINGS, 2),  # its exercise time is intensity minutes: the step-threshold count stays
+            (ProviderName.GOOGLE_HEALTH, 2),
+            (ProviderName.ULTRAHUMAN, 45),  # its active minutes are stored as exercise time
+        ],
+    )
+    def test_provider_exercise_time_is_active_minutes_only_where_it_means_that(
+        self, client: TestClient, db: Session, provider: ProviderName, active_minutes: int
+    ) -> None:
+        user = UserFactory()
+        mapping = DataSourceFactory(user=user, provider=provider, source=provider.value)
+        steps_type = SeriesTypeDefinitionFactory.get_or_create_steps()
+
+        base_time = datetime(2025, 12, 26, 8, 0, 0, tzinfo=timezone.utc)
+        # Two distinct minute buckets, each >= 30 steps -> 2 active minutes via the step threshold.
+        DataPointSeriesFactory(mapping=mapping, series_type=steps_type, value=Decimal("100"), recorded_at=base_time)
+        DataPointSeriesFactory(
+            mapping=mapping, series_type=steps_type, value=Decimal("200"), recorded_at=base_time + timedelta(minutes=5)
+        )
+        roll_up_everything(db)
+        provider_day(db, mapping, SeriesType.exercise_time, base_time.date(), sum=Decimal("45"))
+
+        response = client.get(
+            f"/api/v1/users/{user.id}/summaries/activity",
+            headers=api_key_headers(ApiKeyFactory().plain_key),
+            params={"start_date": "2025-12-25T00:00:00Z", "end_date": "2025-12-27T00:00:00Z"},
+        )
+
+        assert response.status_code == 200
+        activity = response.json()["data"][0]
+        assert activity["source"]["provider"] == provider.value
+        assert activity["active_minutes"] == active_minutes
+
     def test_get_activity_summary_multiple_days(self, client: TestClient, db: Session) -> None:
         """Test activity summary returns data grouped by day."""
         user = UserFactory()

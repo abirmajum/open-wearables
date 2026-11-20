@@ -626,10 +626,10 @@ class SummariesService:
                 total_cal = active_cal + basal_cal
 
             # Active minutes: prefer the provider-reported daily active time (Garmin
-            # activeTimeInSeconds, Oura high+medium+low activity time, Polar active_duration), then
-            # the provider's own daily exercise time where that is all it reports (Ultrahuman active
-            # minutes). Fall back to the step-threshold heuristic, which assumes per-minute step
-            # samples, only when the provider reports neither.
+            # activeTimeInSeconds, Oura high+medium+low activity time, Polar active_duration), then,
+            # for a provider whose exercise time is its active time (Ultrahuman active minutes), that
+            # daily exercise time. Fall back to the step-threshold heuristic, which assumes per-minute
+            # step samples, only when the provider reports neither.
             active_mins = result.get("active_time_minutes")
             if active_mins is None:
                 active_mins = result.get("exercise_time_minutes")

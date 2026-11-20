@@ -552,7 +552,8 @@ class Ultrahuman247Data(Base247DataTemplate):
 
         Ultrahuman exposes one metrics endpoint per day, so the window is walked
         a day at a time and each data type's counts accumulate across days. A
-        fatal auth error (401/403) aborts the whole run. A day whose fetch failed
+        fatal auth error (401/403) aborts the whole run, and a 404 for a day is
+        read as a day without data. A day whose fetch failed
         (5xx, no response, unreadable answer) is recorded as a ``daily_metrics``
         failure and skipped, and a throttle that outlasts the client's backoff
         ends the walk: either way the run is not a success, so a live sync keeps
@@ -654,6 +655,8 @@ class Ultrahuman247Data(Base247DataTemplate):
         never read as an empty one: the run then is not a success, so the live
         cursor stays put and the day is fetched again.
 
+        A 404 for the day, which Ultrahuman does not document, is read as a day without data.
+
         Raises:
             ProviderConnectionError, ProviderError (401/403): the access is unusable for every remaining day.
             ProviderRateLimitError: recorded, then raised so the caller stops the walk.
@@ -665,6 +668,16 @@ class Ultrahuman247Data(Base247DataTemplate):
         except ProviderError as e:
             if e.upstream_status in (401, 403):
                 raise
+            if e.upstream_status == 404:
+                # Undocumented for a day: read as a day without data, so one 404 can't hold the live cursor forever.
+                logger.info(
+                    "Ultrahuman answered 404 for a day; read as a day without data",
+                    provider="ultrahuman",
+                    task="fetch_daily_metrics",
+                    user_id=str(user_id),
+                    date=day.strftime("%Y-%m-%d"),
+                )
+                return {}
             self._fail_day(run, user_id, day, e)
             if isinstance(e, ProviderRateLimitError):
                 raise

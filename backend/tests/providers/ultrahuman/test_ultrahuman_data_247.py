@@ -450,6 +450,23 @@ class TestUltrahumanFetchFailures:
         assert not result.failures
         assert "daily_metrics" not in result.outcomes
 
+    def test_a_404_for_a_day_is_an_empty_day(self, data_247: Ultrahuman247Data) -> None:
+        """Undocumented for a day: a 404 must not hold the live cursor forever."""
+        with (
+            patch("app.services.providers.ultrahuman.data_247.logger") as mock_logger,
+            patch.object(
+                data_247,
+                "_make_api_request",
+                side_effect=[ProviderError("ultrahuman", upstream_status=404), {"data": {"metric_data": []}}],
+            ) as mock_request,
+        ):
+            result = data_247.load_and_save_all(MagicMock(), uuid4(), **self.WINDOW)
+
+        assert mock_request.call_count == 2
+        assert not result.failures
+        assert result.summary().status is not SyncStatus.FAILED
+        assert mock_logger.info.call_args_list[0].kwargs["date"] == "2026-01-01"
+
     def test_unknown_metric_types_and_malformed_items_are_ignored(self, data_247: Ultrahuman247Data) -> None:
         """The workout scope adds workouts to the day's metrics, in a shape Ultrahuman does not document."""
         day = {

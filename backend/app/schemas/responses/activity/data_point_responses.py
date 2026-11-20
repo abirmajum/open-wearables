@@ -55,7 +55,7 @@ class ActivityAggregateResult(TypedDict):
     distance_sum: float | None
     flights_climbed_sum: int | None
     active_time_minutes: int | None  # Provider-reported daily active time; None when not reported
-    exercise_time_minutes: int | None  # Provider-reported daily exercise time (its day value only); None otherwise
+    exercise_time_minutes: int | None  # Daily exercise time of a provider that reports it as active time (Ultrahuman)
     sedentary_time_minutes: int | None  # Provider-reported daily sedentary time; None when not reported
     moderate_intensity_minutes: int | None  # Provider-reported intensity minutes; None when not reported
     vigorous_intensity_minutes: int | None
