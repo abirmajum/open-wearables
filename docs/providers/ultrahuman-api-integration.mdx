@@ -28,9 +28,9 @@ Ultrahuman provides access to sleep, recovery, and continuous activity data thro
 | Heart rate (24/7) | Yes |
 | HRV - RMSSD (24/7) | Yes |
 | Skin temperature (24/7) | Yes |
-| Skin temperature deviation | Yes - `temperature_deviation`, the night's deviation from baseline |
+| Skin temperature deviation | Yes - `temperature_deviation`, the night's deviation from baseline; needs the `ring_extended_data` scope |
 | Steps (24/7) | Yes |
-| Glucose (CGM) | Yes - `glucose` readings as `blood_glucose` (mg/dL); see the unit note below |
+| Glucose (CGM) | Yes - `glucose` readings as `blood_glucose` (mg/dL); needs the `cgm_data` scope, which Ultrahuman grants only to approved partners; see the unit note below |
 | VO2 max | Yes |
 | Resting heart rate | Yes - `sleep_rhr`, the ring's overnight average, one value per day |
 | Active minutes | Yes - `active_minutes` as `exercise_time`, one value per day |
@@ -40,7 +40,7 @@ Ultrahuman provides access to sleep, recovery, and continuous activity data thro
 | Metabolic score | Yes - `metabolic` health score; components: average glucose, glucose variability, HbA1c, time in target |
 | Weekly active minutes | No - a rolling 7-day sum of active minutes, which are stored per day |
 | Night resting heart rate timeline | No - its average is the stored resting heart rate |
-| Workouts / Activities | No (not available via Partnership API) |
+| Workouts / Activities | Not mapped yet - Ultrahuman delivers workouts inside the day's metrics with the `workout` scope, but documents no payload for them, so they are received and ignored |
 
 Daily scores sit at the start of the day Ultrahuman reports them for, like the daily values above, and a later sync of the same day replaces them. Every value carries the user's UTC offset that day, taken from the day's `day_start_timestamp` (the user's local midnight), so it falls on the user's own date east or west of UTC; a later sync of a stored day refreshes the offset too. Naps are inferred from the sleep session, since Ultrahuman returns one sleep per day without a nap flag.
 
@@ -104,7 +104,8 @@ API_BASE_URL=http://localhost:8000
 #--- Ultrahuman ---#
 ULTRAHUMAN_CLIENT_ID=your-ultrahuman-client-id
 ULTRAHUMAN_CLIENT_SECRET=your-ultrahuman-client-secret
-ULTRAHUMAN_DEFAULT_SCOPE=ring_data cgm_data profile
+# Add cgm_data once Ultrahuman has approved your app for CGM access.
+ULTRAHUMAN_DEFAULT_SCOPE=ring_data ring_extended_data workout profile
 ```
 
     **Configuration details:**
@@ -114,7 +115,7 @@ ULTRAHUMAN_DEFAULT_SCOPE=ring_data cgm_data profile
     | `API_BASE_URL` | Public base URL of your API. The OAuth redirect URI is derived from it as `{API_BASE_URL}/api/v1/oauth/ultrahuman/callback`, which must match the redirect URI registered in the Developer Dashboard |
     | `ULTRAHUMAN_CLIENT_ID` | Client ID from the Developer Dashboard |
     | `ULTRAHUMAN_CLIENT_SECRET` | Client Secret from the Developer Dashboard |
-    | `ULTRAHUMAN_DEFAULT_SCOPE` | OAuth scopes requested during authorization |
+    | `ULTRAHUMAN_DEFAULT_SCOPE` | OAuth scopes requested during authorization. Defaults to `ring_data ring_extended_data workout profile`; add `cgm_data` once Ultrahuman has approved your app for it |
 
   </Step>
 
@@ -131,7 +132,7 @@ ULTRAHUMAN_DEFAULT_SCOPE=ring_data cgm_data profile
     **Response:**
     ```json
     {
-      "authorization_url": "https://auth.ultrahuman.com/authorise?client_id=...&redirect_uri=...&response_type=code&scope=ring_data+cgm_data+profile&state=...",
+      "authorization_url": "https://auth.ultrahuman.com/authorise?client_id=...&redirect_uri=...&response_type=code&scope=ring_data+ring_extended_data+workout+profile&state=...",
       "state": "abc123..."
     }
     ```
@@ -203,8 +204,10 @@ ULTRAHUMAN_DEFAULT_SCOPE=ring_data cgm_data profile
 | Scope | Description |
 |-------|-------------|
 | `ring_data` | Access to Ring Air data (sleep, HR, HRV, temperature, steps, VO2 max) |
-| `cgm_data` | Access to CGM (continuous glucose monitor) data |
-| `profile` | Access to user profile information |
+| `ring_extended_data` | Additional ring metrics, such as `temperature_deviation` |
+| `workout` | Workouts, delivered inside the day's metrics (not mapped yet) |
+| `cgm_data` | Access to CGM (continuous glucose monitor) data. Granted only to partners Ultrahuman approves, so it is not requested by default |
+| `profile` | Access to user profile information; used to read the Ultrahuman account id |
 
 ## Next Steps
 

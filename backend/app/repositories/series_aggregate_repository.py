@@ -555,15 +555,20 @@ _ACTIVITY_SUMS = {
     SeriesType.active_time: "active_time_minutes",
     SeriesType.moderate_intensity_time: "moderate_intensity_minutes",
     SeriesType.vigorous_intensity_time: "vigorous_intensity_minutes",
+    SeriesType.sedentary_time: "sedentary_time_minutes",
 }
+# The provider's own daily exercise time, read only from its day values (not summed from samples): the summary's
+# active minutes where the provider reports no active time (Ultrahuman reports active minutes only as this).
+_PROVIDER_EXERCISE_KEY = "exercise_time_minutes"
 _HEART_RATE_KEYS = ("hr_avg", "hr_max", "hr_min")
 _ENERGY_KEYS = ("active_energy_sum", "basal_energy_sum", "total_energy_sum")
 _INTENSITY_KEYS = ("moderate_intensity_minutes", "vigorous_intensity_minutes")
-_INT_SUMS = {"steps_sum", "flights_climbed_sum", "active_time_minutes", *_INTENSITY_KEYS}
+_INT_SUMS = {"steps_sum", "flights_climbed_sum", "active_time_minutes", "sedentary_time_minutes", *_INTENSITY_KEYS}
 # An activity day's metrics, in the groups that come whole from one source: a total is not made of one source's
 # active and another's basal energy.
 ACTIVITY_METRIC_GROUPS: tuple[tuple[str, ...], ...] = (
     *((key,) for key in _ACTIVITY_SUMS.values() if key not in (*_ENERGY_KEYS, *_INTENSITY_KEYS)),
+    (_PROVIDER_EXERCISE_KEY,),
     _ENERGY_KEYS,
     _INTENSITY_KEYS,
     _HEART_RATE_KEYS,
@@ -579,7 +584,7 @@ def daily_activity(
 
     Data sources that share provider, source, device model and type add up, as their samples did.
     """
-    types = [*_ACTIVITY_SUMS, SeriesType.heart_rate]
+    types = [*_ACTIVITY_SUMS, SeriesType.exercise_time, SeriesType.heart_rate]
     # The bounds cut by their UTC date, as the workout and sleep queries of the same summary do in SQL:
     # a day is in when its date lies in [start's date, end's date).
     first_day, last_day = utc_date(start), utc_date(end) - timedelta(days=1)
@@ -595,6 +600,7 @@ def daily_activity(
         days.setdefault((day, source.provider, source.source, source.device_model, source.device_type), []).append(row)
 
     heart_rate_id = get_series_type_id(SeriesType.heart_rate)
+    exercise_id = get_series_type_id(SeriesType.exercise_time)
     sum_keys = {get_series_type_id(series_type): key for series_type, key in _ACTIVITY_SUMS.items()}
     results: list[ActivityAggregateResult] = []
     for (day, provider, source, device_model, device_type), day_rows in days.items():
@@ -610,6 +616,13 @@ def daily_activity(
             sums = [float(r.sum) for r in day_rows if r.series_type_definition_id == type_id and r.sum is not None]
             if sums:
                 result[key] = round(sum(sums)) if key in _INT_SUMS else sum(sums)
+        exercise = [
+            float(r.sum)
+            for r in day_rows
+            if r.series_type_definition_id == exercise_id and r.computed_by == ComputedBy.PROVIDER and r.sum is not None
+        ]
+        if exercise:
+            result[_PROVIDER_EXERCISE_KEY] = round(sum(exercise))
         heart_rate = [r for r in day_rows if r.series_type_definition_id == heart_rate_id]
         # Each source's day counts once: a provider's row (count 1) and ours (one per sample) weigh the same.
         if averages := [float(r.avg) for r in heart_rate if r.avg is not None]:

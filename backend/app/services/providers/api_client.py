@@ -1,8 +1,10 @@
 """Simple API client for making authenticated requests to provider APIs."""
 
+import math
 import time
 from collections.abc import Collection
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.parse import urljoin, urlsplit
 from uuid import UUID
@@ -30,6 +32,8 @@ logger = get_logger(__name__)
 # Rate limiting configuration (Garmin: 100 req / 60s window)
 MAX_RETRIES = 3
 RETRY_BASE_DELAY = 15.0  # Base delay for exponential backoff (seconds): 15s, 30s, 60s
+# A 429's Retry-After is honoured up to this long; the wait blocks the worker, so a longer one is cut to it.
+MAX_RETRY_AFTER = 120.0
 
 # Redirects followed by download_binary_content; every hop is checked against its allowed hosts.
 MAX_DOWNLOAD_REDIRECTS = 5
@@ -50,6 +54,28 @@ DEAD_GRANT_AFTER = timedelta(days=1)
 
 # Session.info key of the grants this session has already seen succeed.
 _AUTH_OK_KEY = "provider_auth_ok"
+
+
+def _retry_delay(response: httpx.Response, attempt: int) -> float:
+    """How long to wait before retrying a 429: the provider's ``Retry-After`` (seconds or an HTTP date) when it
+    sends a usable one, capped at ``MAX_RETRY_AFTER``, else the exponential backoff."""
+    header = response.headers.get("Retry-After", "").strip()
+    delay: float | None = None
+    if header:
+        try:
+            delay = float(header)
+        except ValueError:
+            try:
+                retry_at = parsedate_to_datetime(header)
+            except (TypeError, ValueError):
+                retry_at = None
+            if retry_at is not None:
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                delay = (retry_at - datetime.now(timezone.utc)).total_seconds()
+    if delay is None or math.isnan(delay) or delay < 0:
+        return RETRY_BASE_DELAY * (2**attempt)
+    return min(delay, MAX_RETRY_AFTER)
 
 
 def _token_cache(db: DbSession) -> dict[tuple[UUID, str], tuple[str, datetime | None, float]]:
@@ -319,7 +345,7 @@ def make_authenticated_request(
             # Handle 429 rate limiting with retry
             if response.status_code == 429:
                 if attempt < MAX_RETRIES:
-                    backoff_delay = RETRY_BASE_DELAY * (2**attempt)  # 1s, 2s, 4s
+                    backoff_delay = _retry_delay(response, attempt)
                     logger.warning(
                         "Rate limited (429), retrying",
                         provider_name=provider_name,
@@ -380,7 +406,7 @@ def make_authenticated_request(
         except httpx.HTTPStatusError as e:
             # Handle 429 from raise_for_status (shouldn't happen due to early check, but just in case)
             if e.response.status_code == 429 and attempt < MAX_RETRIES:
-                backoff_delay = RETRY_BASE_DELAY * (2**attempt)
+                backoff_delay = _retry_delay(e.response, attempt)
                 logger.warning(
                     "Rate limited (429), retrying",
                     provider_name=provider_name,
@@ -463,7 +489,7 @@ def download_binary_content(
     The URL may contain additional auth params (e.g. token=...) alongside the Bearer header.
     The URL, and every redirect, must be https on one of ``allowed_hosts``: it comes from a
     webhook payload and is sent the user's token.
-    Retries up to MAX_RETRIES times on 429 with exponential backoff.
+    Retries up to MAX_RETRIES times on 429, after the provider's Retry-After or with exponential backoff.
     """
     _require_allowed_download_url(url, allowed_hosts, provider_name)
     access_token = get_valid_token(db, user_id, provider_name, connection_repo, oauth)
@@ -496,7 +522,7 @@ def download_binary_content(
                 headers["Authorization"] = f"Bearer {access_token}"
                 continue
         if response.status_code == 429 and attempt < MAX_RETRIES:
-            backoff_delay = RETRY_BASE_DELAY * (2**attempt)
+            backoff_delay = _retry_delay(response, attempt)
             logger.warning(
                 "Rate limited (429) on binary download, retrying",
                 provider_name=provider_name,

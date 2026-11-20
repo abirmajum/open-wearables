@@ -1201,6 +1201,22 @@ class TestUltrahumanScoresIntegration:
             day["avg_spo2_percent"],
         ) == (78, 51, 48, 97)
 
+    def test_activity_summary_reads_the_rings_active_and_inactive_minutes(
+        self, client: TestClient, db: Session, sample_ultrahuman_api_response: dict
+    ) -> None:
+        """Not the step heuristic, which reads each 5-minute step bucket as one minute."""
+        user_id = self._sync(db, sample_ultrahuman_api_response)
+
+        response = client.get(
+            f"/api/v1/users/{user_id}/summaries/activity",
+            params={"start_date": "2024-01-15T00:00:00Z", "end_date": "2024-01-16T00:00:00Z"},
+            headers=api_key_headers(ApiKeyFactory().plain_key),
+        )
+
+        assert response.status_code == 200, response.text
+        [day] = response.json()["data"]
+        assert (day["active_minutes"], day["sedentary_minutes"]) == (35, 210)
+
     def test_glucose_and_inactive_time_reach_the_timeseries_endpoint(
         self, client: TestClient, db: Session, sample_ultrahuman_api_response: dict
     ) -> None:

@@ -1,5 +1,7 @@
 """Ultrahuman Ring Air OAuth 2.0 implementation."""
 
+from typing import Any
+
 import httpx
 
 from app.config import settings
@@ -16,6 +18,30 @@ from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.utils.structured_logging import get_logger
 
 logger = get_logger(__name__)
+
+
+def provider_user_info(profile_data: Any, user_id: str) -> dict[str, str | None]:
+    """The Ultrahuman account id and username in a /user_data/user_info answer.
+
+    Ultrahuman documents no example answer: the fields are read at the top level, else inside the ``data`` envelope
+    its other endpoints use. A profile without an id is logged with its field names, never their values.
+    """
+    profile = profile_data if isinstance(profile_data, dict) else {}
+    if "user_id" not in profile and isinstance(profile.get("data"), dict):
+        profile = profile["data"]
+    provider_user_id = profile.get("user_id")
+    provider_username = profile.get("username") or profile.get("email")
+    if not provider_user_id:
+        logger.warning(
+            "Ultrahuman user profile has no user_id; the per-account pull lock stays off",
+            provider="ultrahuman",
+            user_id=user_id,
+            profile_fields=sorted(str(key) for key in profile),
+        )
+    return {
+        "user_id": str(provider_user_id) if provider_user_id else None,
+        "username": provider_username if isinstance(provider_username, str) else None,
+    }
 
 
 class UltrahumanOAuth(BaseOAuthTemplate):
@@ -63,6 +89,9 @@ class UltrahumanOAuth(BaseOAuthTemplate):
 
         Returns user ID and username from Ultrahuman profile data.
         Endpoint: /user_data/user_info
+
+        Never fails the connect: without an id the connection works, but the per-account pull lock is off until a
+        later sync fills it in (``Ultrahuman247Data._fill_provider_user_id``).
         """
         try:
             profile_response = httpx.get(
@@ -71,16 +100,13 @@ class UltrahumanOAuth(BaseOAuthTemplate):
                 timeout=30.0,
             )
             profile_response.raise_for_status()
-            profile_data = profile_response.json()
-            provider_user_id = profile_data.get("user_id")
-            provider_username = profile_data.get("username") or profile_data.get("email")
-            return {
-                "user_id": str(provider_user_id) if provider_user_id else None,
-                "username": provider_username,
-            }
+            return provider_user_info(profile_response.json(), user_id)
         except httpx.HTTPError as e:
-            logger.error(
-                "HTTP error fetching Ultrahuman user profile", exc_info=e, provider="ultrahuman", user_id=user_id
+            logger.warning(
+                "Ultrahuman user profile not fetched at connect; retried on a later sync",
+                exc_info=e,
+                provider="ultrahuman",
+                user_id=user_id,
             )
             return {"user_id": None, "username": None}
         except Exception as e:
