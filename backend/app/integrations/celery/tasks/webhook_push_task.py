@@ -14,6 +14,7 @@ from app.services import sync_status_service
 from app.services.providers.factory import ProviderFactory
 from app.services.providers.sync_247_result import error_code_of
 from app.services.providers.templates.base_webhook_handler import BaseWebhookHandler
+from app.services.providers.whoop.webhook_handler import WhoopFanoutError, WhoopWebhookHandler
 from app.utils.exceptions import (
     INTEGRITY_ERRORS,
     REAUTH_REQUIRED,
@@ -86,18 +87,34 @@ def _extract_breakdown(result: dict[str, Any], count: Any) -> dict[str, int] | N
 
 
 def _emit_final_failure(
-    provider_name: str, handler: BaseWebhookHandler | None, provider_user_id: str | None, exc: Exception
+    provider_name: str,
+    handler: BaseWebhookHandler | None,
+    provider_user_id: str | None,
+    exc: Exception,
+    retry_user_ids: list[str] | None = None,
 ) -> None:
     """Record a delivery that ran out of retries as FAILED"""
     if handler is None or not provider_user_id:
         return
     try:
-        with SessionLocal() as db:
-            connection = handler.find_connection(db, str(provider_user_id))
-        if connection:
+        if isinstance(handler, WhoopWebhookHandler) and retry_user_ids is not None:
+            user_ids = retry_user_ids
+        else:
+            with SessionLocal() as db:
+                if isinstance(handler, WhoopWebhookHandler):
+                    connections = handler.connection_repo.get_all_by_provider_user_id(
+                        db, "whoop", str(provider_user_id)
+                    )
+                else:
+                    connection = handler.find_connection(db, str(provider_user_id))
+                    connections = [connection] if connection else []
+                user_ids = [str(c.user_id) for c in connections]
+        for user_id in user_ids:
+            if retry_user_ids is not None and user_id not in retry_user_ids:
+                continue
             _emit_webhook_sync_status(
                 provider_name,
-                {"status": "error", "error": error_code_of(exc), "user_id": str(connection.user_id)},
+                {"status": "error", "error": error_code_of(exc), "user_id": user_id},
             )
     except Exception as emit_exc:  # pragma: no cover - sync log must never break processing
         logger.debug("Failed to emit final webhook failure", provider=provider_name, error=str(emit_exc))
@@ -181,6 +198,14 @@ def _error_attributes(exc: Exception) -> dict[str, str]:
     return {"error_type": type(exc).__name__, "error": str(exc)}
 
 
+def _retryable_profile_error(exc: Exception) -> bool:
+    if isinstance(exc, ValueError | ConfigurationError) or _is_client_error(exc):
+        return False
+    if isinstance(exc, ProviderError):
+        return exc.upstream_status not in _NONRETRIABLE_UPSTREAM_STATUSES
+    return not isinstance(exc, INTEGRITY_ERRORS) or is_unique_violation(exc)
+
+
 @shared_task(
     name=CeleryTask.PROCESS_WEBHOOK_PUSH,
     bind=True,
@@ -189,7 +214,11 @@ def _error_attributes(exc: Exception) -> dict[str, str]:
     max_retries=8,
 )
 def process_webhook_push(
-    self: Task, provider_name: str, payload: dict[str, Any], request_trace_id: str
+    self: Task,
+    provider_name: str,
+    payload: dict[str, Any],
+    request_trace_id: str,
+    retry_user_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """Process an accepted webhook using the provider's handler and a fresh DB session.
 
@@ -204,12 +233,60 @@ def process_webhook_push(
             raise ValueError(f"Provider '{provider_name}' has no webhook handler")
         provider_user_id = handler.extract_user_id(payload)
         with SessionLocal() as db:
-            result = handler.process_payload(db, payload, request_trace_id)
+            if isinstance(handler, WhoopWebhookHandler):
+                if retry_user_ids is None and provider_user_id:
+                    retry_user_ids = [
+                        str(c.user_id)
+                        for c in handler.connection_repo.get_all_by_provider_user_id(db, "whoop", provider_user_id)
+                    ]
+                result = handler.process_payload(db, payload, request_trace_id, retry_user_ids=retry_user_ids)
+            else:
+                result = handler.process_payload(db, payload, request_trace_id)
             # Bulk sample/score writes defer their commit to the caller, so closing the
             # session without this would silently discard them.
             db.commit()
-        _emit_webhook_sync_status(provider_name, result)
+        profiles = result.get("profiles")
+        for profile_result in profiles if isinstance(profiles, list) else [result]:
+            _emit_webhook_sync_status(provider_name, profile_result)
         return result
+    except WhoopFanoutError as exc:
+        retry_ids = [uid for uid, error in exc.errors.items() if _retryable_profile_error(error)]
+        fatal: Exception | None = None
+        for user_id, error in exc.errors.items():
+            if user_id in retry_ids or _is_client_error(error):
+                continue
+            if not isinstance(error, ProviderError):
+                fatal = fatal or error
+            logger.warning(
+                "WHOOP webhook profile failed without retry",
+                provider=provider_name,
+                user_id=user_id,
+                trace_id=request_trace_id,
+                error=error_code_of(error),
+                alert=not isinstance(error, ProviderError) or error.request_rejected,
+            )
+        exhausted = self.request.retries >= self.max_retries
+        for profile in exc.profiles:
+            if profile["user_id"] not in retry_ids or exhausted:
+                _emit_webhook_sync_status(provider_name, profile)
+        if retry_ids:
+            cause = exc.errors[retry_ids[0]]
+            if exhausted:
+                raise cause from exc
+            raise self.retry(
+                exc=cause,
+                args=(),
+                kwargs={
+                    "provider_name": provider_name,
+                    "payload": payload,
+                    "request_trace_id": request_trace_id,
+                    "retry_user_ids": retry_ids,
+                },
+                countdown=_retry_countdown(self.request.retries),
+            ) from exc
+        if fatal is not None:
+            raise fatal from exc
+        return {**exc.profiles[0], "profiles": exc.profiles}
     except (ValueError, ConfigurationError) as exc:
         # Unknown provider, missing handler or invalid settings won't recover on retry.
         logger.error(
@@ -231,7 +308,10 @@ def process_webhook_push(
             error=exc.reason,
         )
         result = {"status": "error", "error": REAUTH_REQUIRED, "user_id": str(exc.user_id)}
-        _emit_webhook_sync_status(provider_name, result)
+        if isinstance(handler, WhoopWebhookHandler):
+            _emit_final_failure(provider_name, handler, provider_user_id, exc, retry_user_ids=retry_user_ids)
+        else:
+            _emit_webhook_sync_status(provider_name, result)
         return result
     except ProviderError as exc:
         # Non-retriable upstream 4xx (deleted/unqueryable object): ack so the task
@@ -249,11 +329,17 @@ def process_webhook_push(
                 upstream_status=exc.upstream_status,
                 error=exc.detail,
             )
-            return {
+            result = {
                 "status": "skipped",
                 "reason": "upstream_non_retriable",
                 "upstream_status": exc.upstream_status,
             }
+            if isinstance(handler, WhoopWebhookHandler):
+                profiles = [{**result, "user_id": uid} for uid in retry_user_ids or []]
+                for profile in profiles:
+                    _emit_webhook_sync_status(provider_name, profile)
+                return {**result, "profiles": profiles}
+            return result
         if self.request.retries >= self.max_retries:
             # The payload is lost now. CeleryIntegration reports the error re-raised below, but
             # drops a provider's answer about the user's state (a throttle), so alert on that here.
@@ -267,7 +353,7 @@ def process_webhook_push(
                 upstream_status=exc.upstream_status,
                 attempt=self.request.retries,
             )
-            _emit_final_failure(provider_name, handler, provider_user_id, exc)
+            _emit_final_failure(provider_name, handler, provider_user_id, exc, retry_user_ids=retry_user_ids)
             raise
         countdown = _retry_countdown(self.request.retries)
         logger.warning(
@@ -291,7 +377,7 @@ def process_webhook_push(
                 provider_user_id=provider_user_id,
                 **_error_attributes(exc),
             )
-            _emit_final_failure(provider_name, handler, provider_user_id, exc)
+            _emit_final_failure(provider_name, handler, provider_user_id, exc, retry_user_ids=retry_user_ids)
             return {"status": "skipped", "reason": "non_retriable", "error_type": type(exc).__name__}
         if isinstance(exc, INTEGRITY_ERRORS) and not is_unique_violation(exc):
             # Our bug, and the same payload violates the constraint again on every retry:
@@ -303,7 +389,7 @@ def process_webhook_push(
                 provider_user_id=provider_user_id,
                 **_error_attributes(exc),
             )
-            _emit_final_failure(provider_name, handler, provider_user_id, exc)
+            _emit_final_failure(provider_name, handler, provider_user_id, exc, retry_user_ids=retry_user_ids)
             raise
         if self.request.retries >= self.max_retries:
             logger.error(
@@ -314,7 +400,7 @@ def process_webhook_push(
                 **_error_attributes(exc),
                 attempt=self.request.retries,
             )
-            _emit_final_failure(provider_name, handler, provider_user_id, exc)
+            _emit_final_failure(provider_name, handler, provider_user_id, exc, retry_user_ids=retry_user_ids)
             raise
         countdown = _retry_countdown(self.request.retries)
         logger.error(

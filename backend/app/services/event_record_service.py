@@ -5,7 +5,6 @@ from typing import cast
 from uuid import UUID, uuid4
 
 from sqlalchemy import Column, Table, and_, delete, exists, func, select, tuple_
-from sqlalchemy import event as sa_event
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Query
 
@@ -85,6 +84,7 @@ from app.services.scores.sleep_service import sleep_score_service
 from app.services.services import AppService
 from app.services.sleep_finality import final_record_ids
 from app.services.sleep_naps import reclassify_naps
+from app.utils.after_commit import run_after_commit
 from app.utils.context import current_sync_payload
 from app.utils.conversion import as_dict_list, as_float, as_int, as_model, minutes_to_seconds, sum_optional
 from app.utils.dates import local_date
@@ -1206,10 +1206,11 @@ class EventRecordService(
 
         sync = current_sync_payload()
 
-        @sa_event.listens_for(db_session, "after_commit", once=True)
-        def _dispatch_bulk_webhooks(session: DbSession) -> None:  # noqa: ARG001
+        def _dispatch_bulk_webhooks() -> None:
             for record, data_source, detail in dispatches:
                 self._emit_event_record_webhook(record, data_source, detail, sync)
+
+        run_after_commit(db_session, _dispatch_bulk_webhooks)
 
     def _get_records_with_filters(
         self,
