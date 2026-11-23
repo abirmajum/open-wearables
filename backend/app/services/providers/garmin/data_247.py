@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from operator import itemgetter
 from typing import Any
+from urllib.parse import urlparse
 from uuid import UUID, uuid4
 
 from celery import current_app as celery_app
@@ -71,6 +72,13 @@ def schedule_fit_retry(user_id: str, activity_id: str, callback_url: str, attemp
         countdown=countdown,
     )
     return True
+
+
+def _is_garmin_url(url: str) -> bool:
+    """Only Garmin gets the user's bearer token."""
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    return parsed.scheme == "https" and (host == "garmin.com" or host.endswith(".garmin.com"))
 
 
 # Series types to skip when parsing FIT files — already present from activityDetails.
@@ -1990,6 +1998,16 @@ class Garmin247Data(Base247DataTemplate):
                         if not callback_url:
                             continue
                         activity_id = str(item.get("activityId", ""))
+                        if not _is_garmin_url(callback_url):
+                            logger.warning(
+                                "Skipped FIT download from a non-Garmin host",
+                                provider="garmin",
+                                task="process_items_batch",
+                                user_id=str(user_id),
+                                activity_id=activity_id,
+                                host=urlparse(callback_url).hostname,
+                            )
+                            continue
                         try:
                             fit_bytes = download_binary_content(
                                 db=db,

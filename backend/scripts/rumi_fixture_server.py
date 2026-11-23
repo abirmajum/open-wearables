@@ -703,7 +703,7 @@ def main() -> None:
     parser.add_argument("--no-serve", action="store_true", help="Exit after seeding (and the dump)")
     args = parser.parse_args()
 
-    from freezegun import freeze_time
+    import time_machine
 
     port = args.port or _free_port()
     signal.signal(signal.SIGTERM, _stop)
@@ -724,11 +724,10 @@ def main() -> None:
 
         from app.main import api
 
-        # Frozen only once the app is imported and its routes built: freezegun swaps each module's datetime, which
-        # pydantic can neither subclass at import nor validate in a lazily read route signature.
+        # Frozen only once the app is imported and its routes built, so startup work runs on the real clock.
         with warnings.catch_warnings(action="ignore"):
             api.openapi()
-        clock = stack.enter_context(freeze_time(now - SEEDED_BEFORE, real_asyncio=True))
+        clock = stack.enter_context(time_machine.travel(now - SEEDED_BEFORE, tick=False))
         skipped = seed(args.today, args.api_key)
         if unexpected := sorted(set(skipped) - EXPECTED_SKIPPED_TASKS.keys()):
             raise SystemExit(

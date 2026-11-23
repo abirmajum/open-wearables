@@ -1,11 +1,13 @@
 """Real subprocess checks; no broker, database, or Celery workers are started."""
 
+import importlib.util
 import os
 import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
@@ -99,3 +101,50 @@ def test_stubborn_worker_is_killed_after_grace_period(tmp_path: Path) -> None:
         if process.poll() is None:
             process.terminate()
             process.wait(timeout=5)
+
+
+def _load_supervisor() -> ModuleType:
+    spec = importlib.util.spec_from_file_location("worker_supervisor", SUPERVISOR)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _names(commands: list[list[str]]) -> list[str]:
+    return [command[command.index("-n") + 1].split("@")[0] for command in commands]
+
+
+def test_default_roles_run_the_core_workers_without_extension_queues() -> None:
+    assert _names(_load_supervisor().worker_commands("io,cpu,ext", "", "4")) == ["io", "cpu"]
+
+
+def test_extension_worker_runs_the_extension_queues() -> None:
+    commands = _load_supervisor().worker_commands("io,cpu,ext", "my_queue,other", "6")
+
+    assert _names(commands) == ["io", "cpu", "ext"]
+    ext = commands[2]
+    assert ext[ext.index("-Q") + 1] == "my_queue,other"
+    assert {"--pool=threads", "--concurrency=6", "--prefetch-multiplier=1", "--disable-prefetch"} <= set(ext)
+
+
+def test_worker_roles_start_only_the_named_workers() -> None:
+    supervisor = _load_supervisor()
+
+    assert _names(supervisor.worker_commands("ext", "my_queue", "4")) == ["ext"]
+    assert _names(supervisor.worker_commands("io,cpu", "my_queue", "4")) == ["io", "cpu"]
+    assert supervisor.worker_commands("ext", "", "4") == []
+
+
+def test_the_container_exits_when_its_roles_leave_no_worker() -> None:
+    process = subprocess.run(
+        [sys.executable, str(SUPERVISOR)],
+        env={**os.environ, "WORKER_ROLES": "ext", "EXTENSION_QUEUES": ""},
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert process.returncode == 1
+    assert "no worker to run for WORKER_ROLES=ext" in process.stderr

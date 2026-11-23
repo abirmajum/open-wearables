@@ -1,4 +1,4 @@
-"""Keep both Celery workers alive, or exit so the container can restart."""
+"""Keep every Celery worker of this container alive, or exit so the container can restart."""
 
 import os
 import signal
@@ -28,7 +28,7 @@ def stop_workers(workers: Sequence[subprocess.Popen[bytes]]) -> None:
 
 
 def supervise(commands: Sequence[Sequence[str]]) -> int:
-    """Forward shutdown and fail the container if either worker exits early."""
+    """Forward shutdown and fail the container if any worker exits early."""
     workers: list[subprocess.Popen[bytes]] = []
     shutdown_signal = 0
 
@@ -57,11 +57,18 @@ def supervise(commands: Sequence[Sequence[str]]) -> int:
             signal.signal(sig, handler)
 
 
-def main() -> int:
+def worker_commands(roles: str, extension_queues: str, extension_concurrency: str) -> list[list[str]]:
+    """The Celery workers for WORKER_ROLES; the extension worker only when an active extension has queues."""
+    role_set = {role.strip() for role in roles.split(",")}
     common = [sys.executable, "-m", "celery", "-A", "app.main:celery_app", "worker", "--loglevel=info"]
-    return supervise(
-        [
-            [*common, "--pool=threads", "-Q", "default,sdk_sync,garmin_sync,webhook_sync", "-n", "io@%h"],
+    commands: list[list[str]] = []
+    if "io" in role_set:
+        commands.append([*common, "--pool=threads", "-Q", "default,sdk_sync,garmin_sync,webhook_sync", "-n", "io@%h"])
+    if "cpu" in role_set:
+        # XML imports are long and a direct upload carries the whole file in its message. With early
+        # acks a prefetch multiplier of 1 still reserves one extra message per busy process, so
+        # prefetch is disabled: the worker fetches a task only when a process is free.
+        commands.append(
             [
                 *common,
                 "--pool=prefork",
@@ -72,9 +79,35 @@ def main() -> int:
                 "xml_sync",
                 "-n",
                 "cpu@%h",
-            ],
-        ]
+            ]
+        )
+    if "ext" in role_set and extension_queues:
+        # Extension tasks can run for minutes, so they get their own pool with prefetch off.
+        commands.append(
+            [
+                *common,
+                "--pool=threads",
+                f"--concurrency={extension_concurrency}",
+                "--prefetch-multiplier=1",
+                "--disable-prefetch",
+                "-Q",
+                extension_queues,
+                "-n",
+                "ext@%h",
+            ]
+        )
+    return commands
+
+
+def main() -> int:
+    roles = os.environ.get("WORKER_ROLES", "io,cpu,ext")
+    commands = worker_commands(
+        roles, os.environ.get("EXTENSION_QUEUES", ""), os.environ.get("EXTENSION_WORKER_CONCURRENCY", "4")
     )
+    if not commands:
+        print(f"no worker to run for WORKER_ROLES={roles}; exiting", file=sys.stderr, flush=True)
+        return 1
+    return supervise(commands)
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ from unittest.mock import MagicMock
 from uuid import UUID, uuid4
 
 import pytest
+from dirty_equals import IsInstance, IsPartialDict, IsStr
 from fastapi.testclient import TestClient
 from jose import jwt
 from sqlalchemy.orm import Session
@@ -50,11 +51,7 @@ class TestOAuthAuthorizeEndpoint:
         # Assert
         assert response.status_code == 200
         data = response.json()
-        assert "authorization_url" in data
-        assert "state" in data
-        assert isinstance(data["authorization_url"], str)
-        assert isinstance(data["state"], str)
-        assert len(data["state"]) > 0
+        assert data == {"authorization_url": IsStr, "state": IsStr(min_length=1)}
 
     def test_authorize_provider_with_redirect_uri(self, client: TestClient, auth_headers: dict[str, str]) -> None:
         """Test OAuth flow with optional redirect URI."""
@@ -74,9 +71,7 @@ class TestOAuthAuthorizeEndpoint:
 
         # Assert
         assert response.status_code == 200
-        data = response.json()
-        assert "authorization_url" in data
-        assert "state" in data
+        assert response.json() == {"authorization_url": IsStr, "state": IsStr}
 
     def test_authorize_different_providers(self, client: TestClient, auth_headers: dict[str, str]) -> None:
         """Test initiating OAuth for different providers."""
@@ -94,9 +89,7 @@ class TestOAuthAuthorizeEndpoint:
 
             # Assert
             assert response.status_code == 200
-            data = response.json()
-            assert "authorization_url" in data
-            assert "state" in data
+            assert response.json() == {"authorization_url": IsStr, "state": IsStr}
 
     def test_authorize_rejects_provider_callback_even_when_allowlisted(
         self, client: TestClient, auth_headers: dict[str, str], monkeypatch: pytest.MonkeyPatch
@@ -296,13 +289,13 @@ class TestOAuthProvidersEndpoint:
         assert len(data) > 0
 
         # Verify structure of first provider
-        if data:
-            provider = data[0]
-            assert "provider" in provider
-            assert "name" in provider
-            assert "icon_url" in provider
-            assert "has_cloud_api" in provider
-            assert "is_enabled" in provider
+        assert data[0] == IsPartialDict(
+            provider=IsStr,
+            name=IsStr,
+            icon_url=IsStr,
+            has_cloud_api=IsInstance(bool),
+            is_enabled=IsInstance(bool),
+        )
 
     def test_get_providers_enabled_only(self, client: TestClient, db: Session) -> None:
         """Test retrieving only enabled providers."""
@@ -379,16 +372,13 @@ class TestOAuthProvidersEndpoint:
         assert len(data) > 0
 
         # Check first provider has all required fields
-        provider = data[0]
-        required_fields = [
-            "provider",
-            "name",
-            "icon_url",
-            "has_cloud_api",
-            "is_enabled",
-        ]
-        for field in required_fields:
-            assert field in provider, f"Missing field: {field}"
+        assert data[0] == IsPartialDict(
+            provider=IsStr,
+            name=IsStr,
+            icon_url=IsStr,
+            has_cloud_api=IsInstance(bool),
+            is_enabled=IsInstance(bool),
+        )
 
 
 class TestOAuthUpdateProviderEndpoint:
@@ -542,12 +532,13 @@ class TestOAuthUpdateProviderEndpoint:
 
         # Assert
         assert response.status_code == 200
-        data = response.json()
-        assert "provider" in data
-        assert "name" in data
-        assert "icon_url" in data
-        assert "has_cloud_api" in data
-        assert "is_enabled" in data
+        assert response.json() == IsPartialDict(
+            provider="garmin",
+            name="Garmin",
+            icon_url="/static/provider-icons/garmin.svg",
+            has_cloud_api=True,
+            is_enabled=True,
+        )
 
     def test_update_multiple_providers_sequentially(
         self,
