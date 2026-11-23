@@ -8,7 +8,8 @@ import time
 from collections.abc import Sequence
 from contextlib import suppress
 
-SHUTDOWN_TIMEOUT_SECONDS = 30.0
+# Match the platform's stop grace period, so in-flight tasks (extension jobs can run for minutes) finish.
+SHUTDOWN_TIMEOUT_SECONDS = float(os.environ.get("WORKER_SHUTDOWN_TIMEOUT_SECONDS", "30"))
 POLL_INTERVAL_SECONDS = 0.2
 
 

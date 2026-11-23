@@ -31,6 +31,8 @@ The worker container exits with a non-zero status when any of its workers stops 
 
 To scale the extension queues apart from the core's, run a second worker service from the same image with `WORKER_ROLES=ext`, and set `WORKER_ROLES=io,cpu` on the first. Without `WORKER_ROLES` a worker container runs all three.
 
+On a stop, the worker container gives its tasks in progress `WORKER_SHUTDOWN_TIMEOUT_SECONDS` (default 30) to finish before it kills them. Set it just under your platform's stop grace period when extension tasks run longer.
+
 ## Image tags
 
 Both images share the same tag scheme. Choose a tag based on how much stability you need:
