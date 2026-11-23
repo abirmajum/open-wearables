@@ -7,13 +7,19 @@ as a bad API key), and a failed call keeps the provider's status and body out of
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, create_autospec
 from uuid import uuid4
 
 import httpx
 import pytest
+import respx
+from pytest_mock import MockerFixture
+from sqlalchemy.orm import Session
 
+from app.models import UserConnection
+from app.repositories import UserConnectionRepository
 from app.services.providers import api_client
+from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.utils.exceptions import (
     InvalidInputError,
     ProviderAuthRejectedError,
@@ -28,31 +34,32 @@ URL = "https://api.provider.test/v1/data"
 
 
 def _token_args(connection: Any) -> dict[str, Any]:
-    connection_repo = MagicMock()
+    connection_repo = create_autospec(UserConnectionRepository, instance=True)
     connection_repo.get_by_user_and_provider.return_value = connection
     return {
-        "db": MagicMock(info={}),
+        "db": MagicMock(spec=Session, info={}),
         "user_id": uuid4(),
         "provider_name": "garmin",
         "connection_repo": connection_repo,
-        "oauth": MagicMock(),
+        "oauth": create_autospec(BaseOAuthTemplate, instance=True),
     }
 
 
 def _request_args() -> dict[str, Any]:
     return {
-        "db": MagicMock(info={}),
+        "db": MagicMock(spec=Session, info={}),
         "user_id": uuid4(),
-        "connection_repo": MagicMock(),
-        "oauth": MagicMock(),
+        "connection_repo": create_autospec(UserConnectionRepository, instance=True),
+        "oauth": create_autospec(BaseOAuthTemplate, instance=True),
         "api_base_url": "https://api.provider.test",
         "provider_name": "garmin",
         "endpoint": "/v1/data",
     }
 
 
-def _response(status_code: int, **kwargs: Any) -> httpx.Response:
-    return httpx.Response(status_code, request=httpx.Request("GET", URL), **kwargs)
+@pytest.fixture
+def valid_token(mocker: MockerFixture) -> None:
+    mocker.patch("app.services.providers.api_client.get_valid_token", autospec=True, return_value="token")
 
 
 class TestGetValidToken:
@@ -65,12 +72,12 @@ class TestGetValidToken:
 
     def test_connection_without_a_token(self) -> None:
         with pytest.raises(ProviderTokenUnavailableError) as exc_info:
-            api_client.get_valid_token(**_token_args(MagicMock(access_token=None)))
+            api_client.get_valid_token(**_token_args(UserConnection(access_token=None)))
 
         assert exc_info.value.status_code == 400
 
     def test_expired_token_without_a_refresh_token(self) -> None:
-        connection = MagicMock(
+        connection = UserConnection(
             access_token="at",
             refresh_token=None,
             token_expires_at=datetime.now(timezone.utc) - timedelta(hours=1),
@@ -82,31 +89,22 @@ class TestGetValidToken:
         assert exc_info.value.status_code == 409
 
 
-@patch("app.services.providers.api_client.get_valid_token", return_value="token")
-@patch("app.services.providers.api_client.httpx.Client")
+@pytest.mark.usefixtures("valid_token")
 class TestMakeAuthenticatedRequest:
-    @staticmethod
-    def _answer(mock_client: MagicMock, *responses: httpx.Response | Exception) -> MagicMock:
-        request = mock_client.return_value.__enter__.return_value.request
-        request.side_effect = list(responses)
-        return request
-
-    @patch("app.services.providers.api_client._reload_token_after_401", return_value=None)
     def test_a_rejected_token_is_an_upstream_error_not_a_reconnect(
-        self, mock_reload: MagicMock, mock_client: MagicMock, mock_token: MagicMock
+        self, mocker: MockerFixture, respx_mock: respx.MockRouter
     ) -> None:
         """Not proof the grant is dead: only a day of rejections revokes it (ReauthRequiredError, 409)."""
-        self._answer(mock_client, _response(401, text="invalid_token"))
+        mocker.patch("app.services.providers.api_client._reload_token_after_401", autospec=True, return_value=None)
+        respx_mock.get(URL).respond(401, text="invalid_token")
 
         with pytest.raises(ProviderAuthRejectedError) as exc_info:
             api_client.make_authenticated_request(**_request_args())
 
         assert exc_info.value.status_code == 502
 
-    def test_error_response_keeps_the_body_out_of_the_detail(
-        self, mock_client: MagicMock, mock_token: MagicMock
-    ) -> None:
-        self._answer(mock_client, _response(404, text='{"message": "user 42 not found"}'))
+    def test_error_response_keeps_the_body_out_of_the_detail(self, respx_mock: respx.MockRouter) -> None:
+        respx_mock.get(URL).respond(404, text='{"message": "user 42 not found"}')
 
         with pytest.raises(ProviderError) as exc_info:
             api_client.make_authenticated_request(**_request_args())
@@ -116,17 +114,15 @@ class TestMakeAuthenticatedRequest:
         assert error.detail == "Garmin API error (status 404)"
         assert error.upstream_body == '{"message": "user 42 not found"}'
 
-    @patch("app.services.providers.api_client.time.sleep")
-    def test_throttle_that_persists_is_a_503(
-        self, mock_sleep: MagicMock, mock_client: MagicMock, mock_token: MagicMock
-    ) -> None:
-        request = self._answer(mock_client, *[_response(429, text="slow down") for _ in range(4)])
+    def test_throttle_that_persists_is_a_503(self, mocker: MockerFixture, respx_mock: respx.MockRouter) -> None:
+        mocker.patch("app.services.providers.api_client.time.sleep", autospec=True)
+        route = respx_mock.get(URL).respond(429, text="slow down")
 
         with pytest.raises(ProviderRateLimitError) as exc_info:
             api_client.make_authenticated_request(**_request_args())
 
         assert (exc_info.value.status_code, exc_info.value.upstream_status) == (503, 429)
-        assert request.call_count == 4
+        assert route.call_count == 4
 
     @pytest.mark.parametrize(
         ("retry_after", "delays"),
@@ -140,48 +136,45 @@ class TestMakeAuthenticatedRequest:
             (None, [15.0, 30.0, 60.0]),
         ],
     )
-    @patch("app.services.providers.api_client.time.sleep")
     def test_throttle_waits_for_retry_after(
-        self,
-        mock_sleep: MagicMock,
-        mock_client: MagicMock,
-        mock_token: MagicMock,
-        retry_after: str | None,
-        delays: list[float],
+        self, mocker: MockerFixture, respx_mock: respx.MockRouter, retry_after: str | None, delays: list[float]
     ) -> None:
+        sleep = mocker.patch("app.services.providers.api_client.time.sleep", autospec=True)
         headers = {"Retry-After": retry_after} if retry_after is not None else {}
-        self._answer(mock_client, *[_response(429, headers=headers) for _ in range(4)])
+        respx_mock.get(URL).respond(429, headers=headers)
 
         with pytest.raises(ProviderRateLimitError):
             api_client.make_authenticated_request(**_request_args())
 
-        assert [c.args[0] for c in mock_sleep.call_args_list] == delays
+        assert [c.args[0] for c in sleep.call_args_list] == delays
 
-    @patch("app.services.providers.api_client.time.sleep")
     def test_a_retry_after_date_in_the_past_waits_the_floor(
-        self, mock_sleep: MagicMock, mock_client: MagicMock, mock_token: MagicMock
+        self, mocker: MockerFixture, respx_mock: respx.MockRouter
     ) -> None:
+        sleep = mocker.patch("app.services.providers.api_client.time.sleep", autospec=True)
         retry_at = format_datetime(datetime.now(timezone.utc) - timedelta(minutes=5), usegmt=True)
-        self._answer(mock_client, _response(429, headers={"Retry-After": retry_at}), _response(200, json={}))
+        respx_mock.get(URL).mock(
+            side_effect=[httpx.Response(429, headers={"Retry-After": retry_at}), httpx.Response(200, json={})]
+        )
 
         assert api_client.make_authenticated_request(**_request_args()) == {}
 
-        assert [c.args[0] for c in mock_sleep.call_args_list] == [3.75]
+        assert [c.args[0] for c in sleep.call_args_list] == [3.75]
 
-    @patch("app.services.providers.api_client.time.sleep")
-    def test_throttle_waits_until_a_retry_after_date(
-        self, mock_sleep: MagicMock, mock_client: MagicMock, mock_token: MagicMock
-    ) -> None:
+    def test_throttle_waits_until_a_retry_after_date(self, mocker: MockerFixture, respx_mock: respx.MockRouter) -> None:
+        sleep = mocker.patch("app.services.providers.api_client.time.sleep", autospec=True)
         retry_at = format_datetime(datetime.now(timezone.utc) + timedelta(seconds=30), usegmt=True)
-        self._answer(mock_client, _response(429, headers={"Retry-After": retry_at}), _response(200, json={}))
+        respx_mock.get(URL).mock(
+            side_effect=[httpx.Response(429, headers={"Retry-After": retry_at}), httpx.Response(200, json={})]
+        )
 
         assert api_client.make_authenticated_request(**_request_args()) == {}
 
-        [wait] = [c.args[0] for c in mock_sleep.call_args_list]
+        [wait] = [c.args[0] for c in sleep.call_args_list]
         assert 25 <= wait <= 30
 
-    def test_no_response(self, mock_client: MagicMock, mock_token: MagicMock) -> None:
-        self._answer(mock_client, httpx.ConnectTimeout("timed out"))
+    def test_no_response(self, respx_mock: respx.MockRouter) -> None:
+        respx_mock.get(URL).mock(side_effect=httpx.ConnectTimeout("timed out"))
 
         with pytest.raises(ProviderError) as exc_info:
             api_client.make_authenticated_request(**_request_args())
@@ -189,16 +182,16 @@ class TestMakeAuthenticatedRequest:
         assert exc_info.value.upstream_status is None
         assert exc_info.value.detail == "Garmin API request failed"
 
-    def test_empty_body_where_json_is_expected(self, mock_client: MagicMock, mock_token: MagicMock) -> None:
-        self._answer(mock_client, _response(204))
+    def test_empty_body_where_json_is_expected(self, respx_mock: respx.MockRouter) -> None:
+        respx_mock.get(URL).respond(204)
 
         with pytest.raises(ProviderError) as exc_info:
             api_client.make_authenticated_request(**_request_args())
 
         assert exc_info.value.upstream_status == 204
 
-    def test_error_in_a_200_body(self, mock_client: MagicMock, mock_token: MagicMock) -> None:
-        self._answer(mock_client, _response(200, text='{"error": "not found", "code": 404, "request_id": "r1"}'))
+    def test_error_in_a_200_body(self, respx_mock: respx.MockRouter) -> None:
+        respx_mock.get(URL).respond(200, text='{"error": "not found", "code": 404, "request_id": "r1"}')
 
         with pytest.raises(ProviderError) as exc_info:
             api_client.make_authenticated_request(**_request_args())
@@ -206,9 +199,9 @@ class TestMakeAuthenticatedRequest:
         assert exc_info.value.upstream_status == 404
         assert exc_info.value.upstream_body == '{"error": "not found", "code": 404, "request_id": "r1"}'
 
-    def test_error_in_a_200_body_without_a_code(self, mock_client: MagicMock, mock_token: MagicMock) -> None:
+    def test_error_in_a_200_body_without_a_code(self, respx_mock: respx.MockRouter) -> None:
         """The provider still rejected the request: dropped by a task like an upstream 400, not retried."""
-        self._answer(mock_client, _response(200, json={"error": "Workout not found"}))
+        respx_mock.get(URL).respond(200, json={"error": "Workout not found"})
 
         with pytest.raises(ProviderError) as exc_info:
             api_client.make_authenticated_request(**_request_args())
@@ -216,9 +209,9 @@ class TestMakeAuthenticatedRequest:
         assert exc_info.value.upstream_status == 400
         assert exc_info.value.detail == "Garmin API error (status 400)"
 
-    def test_error_in_a_200_body_with_a_string_code(self, mock_client: MagicMock, mock_token: MagicMock) -> None:
+    def test_error_in_a_200_body_with_a_string_code(self, respx_mock: respx.MockRouter) -> None:
         """A provider outage reported as "503" is still retried by a task, not dropped as a 400."""
-        self._answer(mock_client, _response(200, json={"error": "maintenance", "code": "503"}))
+        respx_mock.get(URL).respond(200, json={"error": "maintenance", "code": "503"})
 
         with pytest.raises(ProviderError) as exc_info:
             api_client.make_authenticated_request(**_request_args())
@@ -226,8 +219,7 @@ class TestMakeAuthenticatedRequest:
         assert exc_info.value.upstream_status == 503
 
 
-@patch("app.services.providers.api_client.get_valid_token", return_value="token")
-@patch("app.services.providers.api_client.httpx.get")
+@pytest.mark.usefixtures("valid_token")
 class TestDownloadBinaryContent:
     def _download(self, url: str = URL) -> bytes:
         args = _request_args()
@@ -241,13 +233,10 @@ class TestDownloadBinaryContent:
             allowed_hosts={"api.provider.test"},
         )
 
-    def test_downloads_from_an_allowed_host_without_following_redirects(
-        self, mock_get: MagicMock, mock_token: MagicMock
-    ) -> None:
-        mock_get.return_value = _response(200, content=b"fit")
+    def test_downloads_from_an_allowed_host_without_following_redirects(self, respx_mock: respx.MockRouter) -> None:
+        respx_mock.get(URL).respond(200, content=b"fit")
 
         assert self._download() == b"fit"
-        assert mock_get.call_args.kwargs["follow_redirects"] is False
 
     @pytest.mark.parametrize(
         "url",
@@ -261,47 +250,45 @@ class TestDownloadBinaryContent:
             "file:///etc/passwd",
         ],
     )
-    def test_a_url_off_the_allowed_hosts_is_never_fetched(
-        self, mock_get: MagicMock, mock_token: MagicMock, url: str
-    ) -> None:
+    def test_a_url_off_the_allowed_hosts_is_never_fetched(self, url: str) -> None:
         with pytest.raises(InvalidInputError):
             self._download(url)
 
-        mock_get.assert_not_called()
-        mock_token.assert_not_called()
+        api_client.get_valid_token.assert_not_called()
 
-    def test_a_redirect_off_the_allowed_hosts_is_not_followed(self, mock_get: MagicMock, mock_token: MagicMock) -> None:
-        mock_get.return_value = _response(302, headers={"Location": "https://evil.example/steal"})
+    def test_a_redirect_off_the_allowed_hosts_is_not_followed(self, respx_mock: respx.MockRouter) -> None:
+        respx_mock.get(URL).respond(302, headers={"Location": "https://evil.example/steal"})
 
         with pytest.raises(InvalidInputError):
             self._download()
 
-        assert [c.args[0] for c in mock_get.call_args_list] == [URL]
+        assert [str(call.request.url) for call in respx_mock.calls] == [URL]
 
-    def test_a_redirect_on_an_allowed_host_is_followed(self, mock_get: MagicMock, mock_token: MagicMock) -> None:
-        mock_get.side_effect = [_response(302, headers={"Location": "/v1/file"}), _response(200, content=b"fit")]
+    def test_a_redirect_on_an_allowed_host_is_followed(self, respx_mock: respx.MockRouter) -> None:
+        respx_mock.get(URL).respond(302, headers={"Location": "/v1/file"})
+        respx_mock.get("https://api.provider.test/v1/file").respond(200, content=b"fit")
 
         assert self._download() == b"fit"
-        assert [c.args[0] for c in mock_get.call_args_list] == [URL, "https://api.provider.test/v1/file"]
+        assert [str(call.request.url) for call in respx_mock.calls] == [URL, "https://api.provider.test/v1/file"]
 
-    def test_a_redirect_loop_stops(self, mock_get: MagicMock, mock_token: MagicMock) -> None:
-        mock_get.return_value = _response(302, headers={"Location": URL})
+    def test_a_redirect_loop_stops(self, respx_mock: respx.MockRouter) -> None:
+        route = respx_mock.get(URL).respond(302, headers={"Location": URL})
 
         with pytest.raises(ProviderError):
             self._download()
 
-        assert mock_get.call_count == api_client.MAX_DOWNLOAD_REDIRECTS + 1
+        assert route.call_count == api_client.MAX_DOWNLOAD_REDIRECTS + 1
 
-    def test_error_response(self, mock_get: MagicMock, mock_token: MagicMock) -> None:
-        mock_get.return_value = _response(403, text="forbidden")
+    def test_error_response(self, respx_mock: respx.MockRouter) -> None:
+        respx_mock.get(URL).respond(403, text="forbidden")
 
         with pytest.raises(ProviderError) as exc_info:
             self._download()
 
         assert exc_info.value.upstream_status == 403
 
-    def test_no_response(self, mock_get: MagicMock, mock_token: MagicMock) -> None:
-        mock_get.side_effect = httpx.ReadTimeout("timed out")
+    def test_no_response(self, respx_mock: respx.MockRouter) -> None:
+        respx_mock.get(URL).mock(side_effect=httpx.ReadTimeout("timed out"))
 
         with pytest.raises(ProviderError) as exc_info:
             self._download()

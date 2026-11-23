@@ -8,9 +8,10 @@ tests/tasks/test_garmin_webhook_task.py.
 """
 
 from collections.abc import Generator
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, create_autospec, patch
 
 import pytest
+from celery.result import AsyncResult
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
@@ -40,7 +41,10 @@ def _configure_garmin_client_id() -> Generator[None, None, None]:
 
 @pytest.fixture
 def celery() -> Generator[MagicMock, None, None]:
-    with patch(f"{WEBHOOK_HANDLER}.celery_app") as mock, patch(f"{WEBHOOK_HANDLER}.store_raw_payload"):
+    with (
+        patch(f"{WEBHOOK_HANDLER}.celery_app", autospec=True) as mock,
+        patch(f"{WEBHOOK_HANDLER}.store_raw_payload", autospec=True),
+    ):
         mock.send_task.return_value.id = "task-1"
         yield mock
 
@@ -102,7 +106,7 @@ class TestGarminWebhookClientIdHeader:
         assert response.status_code == 401
 
     def test_rejection_log_hides_the_token(self, client: TestClient, db: Session) -> None:
-        with patch("app.services.providers.templates.base_webhook_handler.logger") as logger:
+        with patch("app.services.providers.templates.base_webhook_handler.logger", autospec=True) as logger:
             response = client.post(PUSH_ENDPOINT, headers={"garmin-client-id": "attacker-invented"}, json={})
 
         assert response.status_code == 401
@@ -155,8 +159,8 @@ class TestGarminWebhookTaskEnqueue:
             ],
         }
 
-        with patch(f"{WEBHOOK_HANDLER}.celery_app") as mock_celery:
-            mock_celery.send_task.return_value = MagicMock(id="test-task-id")
+        with patch(f"{WEBHOOK_HANDLER}.celery_app", autospec=True) as mock_celery:
+            mock_celery.send_task.return_value = create_autospec(AsyncResult, instance=True, id="test-task-id")
             response = client.post(PUSH_ENDPOINT, headers=HEADERS, json=payload)
 
         assert response.status_code == 200
@@ -173,8 +177,8 @@ class TestGarminWebhookTaskEnqueue:
         """The payload passed to send_task matches the incoming webhook body."""
         payload = {"hrv": [{"userId": "u1", "summaryId": "s1"}]}
 
-        with patch(f"{WEBHOOK_HANDLER}.celery_app") as mock_celery:
-            mock_celery.send_task.return_value = MagicMock(id="task-xyz")
+        with patch(f"{WEBHOOK_HANDLER}.celery_app", autospec=True) as mock_celery:
+            mock_celery.send_task.return_value = create_autospec(AsyncResult, instance=True, id="task-xyz")
             client.post(PUSH_ENDPOINT, headers=HEADERS, json=payload)
 
         # send_task(CeleryTask.PROCESS_WEBHOOK_PUSH, args=["garmin", payload, trace_id])
@@ -210,7 +214,7 @@ class TestGarminDeprecatedRoutes:
 
     @pytest.mark.parametrize("path", [LEGACY_PUSH_ENDPOINT, LEGACY_PING_ENDPOINT])
     def test_legacy_route_is_rejected(self, client: TestClient, celery: MagicMock, path: str) -> None:
-        with patch(f"{WEBHOOK_HANDLER}.logger") as logger:
+        with patch(f"{WEBHOOK_HANDLER}.logger", autospec=True) as logger:
             response = client.post(path, headers=HEADERS, json={"dailies": [{"userId": "u1"}]})
 
         assert response.status_code == 401
@@ -227,8 +231,8 @@ class TestGarminDeprecatedRoutes:
     ) -> None:
         """A scanner hitting the old path is no reason to log an error."""
         with (
-            patch(f"{WEBHOOK_HANDLER}.logger") as handler_logger,
-            patch("app.api.routes.v1.deprecated_webhooks.logger") as route_logger,
+            patch(f"{WEBHOOK_HANDLER}.logger", autospec=True) as handler_logger,
+            patch("app.api.routes.v1.deprecated_webhooks.logger", autospec=True) as route_logger,
         ):
             response = client.post(LEGACY_PUSH_ENDPOINT, json={})
 
@@ -248,7 +252,7 @@ class TestGarminRejectedUrlReport:
     def test_our_garmin_app_without_the_token_is_an_error(
         self, client: TestClient, celery: MagicMock, path: str, logged_path: str
     ) -> None:
-        with patch(f"{WEBHOOK_HANDLER}.logger") as logger:
+        with patch(f"{WEBHOOK_HANDLER}.logger", autospec=True) as logger:
             response = client.post(path, headers=HEADERS, json={"dailies": []})
 
         assert response.status_code == 401
@@ -258,7 +262,7 @@ class TestGarminRejectedUrlReport:
         assert TOKEN[:-1] not in str(logger.error.call_args)
 
     def test_our_garmin_app_on_the_token_url_is_not_an_error(self, client: TestClient, celery: MagicMock) -> None:
-        with patch(f"{WEBHOOK_HANDLER}.logger") as logger:
+        with patch(f"{WEBHOOK_HANDLER}.logger", autospec=True) as logger:
             response = client.post(PUSH_ENDPOINT, headers=HEADERS, json={"dailies": []})
 
         assert response.status_code == 200
@@ -268,14 +272,17 @@ class TestGarminRejectedUrlReport:
     def test_other_callers_are_not_an_error(
         self, client: TestClient, celery: MagicMock, headers: dict[str, str]
     ) -> None:
-        with patch(f"{WEBHOOK_HANDLER}.logger") as logger:
+        with patch(f"{WEBHOOK_HANDLER}.logger", autospec=True) as logger:
             response = client.post(BASE, headers=headers, json={})
 
         assert response.status_code == 401
         logger.error.assert_not_called()
 
     def test_nothing_is_an_error_while_the_client_id_is_unset(self, client: TestClient, celery: MagicMock) -> None:
-        with patch.object(settings, "garmin_client_id", None), patch(f"{WEBHOOK_HANDLER}.logger") as logger:
+        with (
+            patch.object(settings, "garmin_client_id", None),
+            patch(f"{WEBHOOK_HANDLER}.logger", autospec=True) as logger,
+        ):
             response = client.post(BASE, headers=HEADERS, json={})
 
         assert response.status_code == 401
@@ -285,7 +292,7 @@ class TestGarminRejectedUrlReport:
     def test_get_and_head_from_our_garmin_app_without_the_token_are_an_error(
         self, client: TestClient, method: str
     ) -> None:
-        with patch(f"{WEBHOOK_HANDLER}.logger") as logger:
+        with patch(f"{WEBHOOK_HANDLER}.logger", autospec=True) as logger:
             response = getattr(client, method)(BASE, headers=HEADERS)
 
         assert response.status_code == 401

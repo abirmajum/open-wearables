@@ -6,12 +6,10 @@ plumbing. Saves become SUCCESS runs, errors FAILED, no-ops SKIPPED, and
 deliveries with no resolvable user (or from self-reporting Garmin) are dropped.
 """
 
-from __future__ import annotations
-
 import contextlib
 from decimal import Decimal
 from typing import Any
-from unittest.mock import ANY, MagicMock, patch
+from unittest.mock import ANY, create_autospec, patch
 from uuid import UUID, uuid4
 
 import pytest
@@ -23,11 +21,12 @@ from sqlalchemy.orm import Session
 
 import app.integrations.celery.tasks.webhook_push_task as task
 from app.constants.celery_tasks import CeleryQueue, CeleryTask
-from app.models import DataSource, SeriesAggregate
+from app.models import DataSource, SeriesAggregate, UserConnection
 from app.repositories.data_point_series_repository import WriteCounts
 from app.schemas.sync_status import SyncStatus
 from app.services.providers.oura.data_247 import Oura247Data
 from app.services.providers.oura.strategy import OuraStrategy
+from app.services.providers.templates.base_webhook_handler import BaseWebhookHandler
 from app.utils.exceptions import (
     AppError,
     ConfigurationError,
@@ -58,7 +57,7 @@ def _capture() -> tuple[list[dict], Any]:
 def test_writecounts_split_surfaces_without_explicit_keys(user_id: str) -> None:
     """A WriteCounts count yields the new/updated split centrally (no records_inserted keys)."""
     calls, fake = _capture()
-    with patch.object(task.sync_status_service, "emit_webhook_delivered", side_effect=fake):
+    with patch.object(task.sync_status_service, "emit_webhook_delivered", autospec=True, side_effect=fake):
         task._emit_webhook_sync_status(
             "oura",
             {
@@ -79,7 +78,7 @@ def test_writecounts_split_surfaces_without_explicit_keys(user_id: str) -> None:
 def test_plain_int_count_has_no_breakdown(user_id: str) -> None:
     """Workout-style providers returning a plain int still log a success run, no split."""
     calls, fake = _capture()
-    with patch.object(task.sync_status_service, "emit_webhook_delivered", side_effect=fake):
+    with patch.object(task.sync_status_service, "emit_webhook_delivered", autospec=True, side_effect=fake):
         task._emit_webhook_sync_status("strava", {"status": "processed", "records_saved": 2, "user_id": user_id})
     assert calls[0]["status"] == SyncStatus.SUCCESS
     assert calls[0]["items_processed"] == 2
@@ -96,7 +95,7 @@ def test_plain_int_count_has_no_breakdown(user_id: str) -> None:
 )
 def test_status_mapping(result: dict, expected: SyncStatus, user_id: str) -> None:
     calls, fake = _capture()
-    with patch.object(task.sync_status_service, "emit_webhook_delivered", side_effect=fake):
+    with patch.object(task.sync_status_service, "emit_webhook_delivered", autospec=True, side_effect=fake):
         task._emit_webhook_sync_status("oura", {**result, "user_id": user_id})
     assert calls[0]["status"] == expected
 
@@ -104,7 +103,7 @@ def test_status_mapping(result: dict, expected: SyncStatus, user_id: str) -> Non
 def test_no_user_resolved_is_dropped() -> None:
     """user_not_found / invalid payloads carry no user_id → nothing to attribute."""
     calls, fake = _capture()
-    with patch.object(task.sync_status_service, "emit_webhook_delivered", side_effect=fake):
+    with patch.object(task.sync_status_service, "emit_webhook_delivered", autospec=True, side_effect=fake):
         task._emit_webhook_sync_status("oura", {"status": "user_not_found", "oura_user_id": "x"})
     assert calls == []
 
@@ -112,7 +111,7 @@ def test_no_user_resolved_is_dropped() -> None:
 def test_self_reporting_provider_excluded(user_id: str) -> None:
     """Garmin reports its own sync status; the shared task must not duplicate it."""
     calls, fake = _capture()
-    with patch.object(task.sync_status_service, "emit_webhook_delivered", side_effect=fake):
+    with patch.object(task.sync_status_service, "emit_webhook_delivered", autospec=True, side_effect=fake):
         task._emit_webhook_sync_status("garmin", {"status": "processed", "saved_count": 9, "user_id": user_id})
     assert calls == []
 
@@ -120,20 +119,20 @@ def test_self_reporting_provider_excluded(user_id: str) -> None:
 def test_emission_never_raises() -> None:
     """Sync-log emission must never break webhook processing."""
     calls, fake = _capture()
-    with patch.object(task.sync_status_service, "emit_webhook_delivered", side_effect=fake):
+    with patch.object(task.sync_status_service, "emit_webhook_delivered", autospec=True, side_effect=fake):
         task._emit_webhook_sync_status("oura", None)
         task._emit_webhook_sync_status("oura", {"status": "processed", "records_saved": 1, "user_id": "not-a-uuid"})
     assert calls == []
 
 
 def _run_with_failing_handler(exc: Exception) -> dict[str, Any]:
-    handler = MagicMock()
+    handler = create_autospec(BaseWebhookHandler, instance=True)
     handler.extract_user_id.return_value = "provider-user"
     handler.process_payload.side_effect = exc
     with (
-        patch.object(task, "ProviderFactory") as factory,
-        patch.object(task, "SessionLocal", MagicMock()),
-        patch.object(task.process_webhook_push, "retry", side_effect=Retry()),
+        patch.object(task, "ProviderFactory", autospec=True) as factory,
+        patch.object(task, "SessionLocal", autospec=True),
+        patch.object(task.process_webhook_push, "retry", autospec=True, side_effect=Retry()),
     ):
         factory.return_value.get_provider.return_value.webhooks = handler
         return task.process_webhook_push.run("oura", {}, "trace-1")
@@ -275,7 +274,7 @@ def test_webhook_persists_after_a_six_minute_outage(db: Session, outage: str) ->
 @pytest.mark.parametrize(("upstream_status", "alerted"), [(400, True), (422, True), (404, False), (410, False)])
 def test_only_a_request_the_provider_refused_alerts_when_skipped(upstream_status: int, alerted: bool) -> None:
     """A 400 or 422 is most likely our bug; a deleted object at the provider is not."""
-    with patch.object(task, "logger") as logger:
+    with patch.object(task, "logger", autospec=True) as logger:
         _run_with_failing_handler(ProviderError("oura", upstream_status=upstream_status))
 
     assert logger.warning.call_args.kwargs["alert"] is alerted
@@ -290,7 +289,7 @@ def test_last_failed_attempt_reports_that_the_payload_is_lost(exc: ProviderError
     which before_send drops: the line alerts only on that, so nothing is reported twice."""
     task.process_webhook_push.push_request(retries=task.process_webhook_push.max_retries)
     try:
-        with patch.object(task, "logger") as logger, pytest.raises(type(exc)):
+        with patch.object(task, "logger", autospec=True) as logger, pytest.raises(type(exc)):
             _run_with_failing_handler(exc)
     finally:
         task.process_webhook_push.pop_request()
@@ -300,7 +299,7 @@ def test_last_failed_attempt_reports_that_the_payload_is_lost(exc: ProviderError
 
 
 def test_earlier_failed_attempts_do_not_alert() -> None:
-    with patch.object(task, "logger") as logger, pytest.raises(Retry):
+    with patch.object(task, "logger", autospec=True) as logger, pytest.raises(Retry):
         _run_with_failing_handler(ProviderError("oura", upstream_status=503))
 
     assert logger.warning.call_args.args[0] == "Webhook push task failed, scheduling retry"
@@ -334,7 +333,7 @@ def test_configuration_error_fails_without_retry() -> None:
 )
 def test_own_constraint_bug_fails_without_retry(exc: Exception, violation: str) -> None:
     """Retrying the same payload violates the constraint again; raising gets it to Sentry."""
-    with patch.object(task, "logger") as logger, pytest.raises(type(exc)):
+    with patch.object(task, "logger", autospec=True) as logger, pytest.raises(type(exc)):
         _run_with_failing_handler(exc)
 
     kwargs = logger.error.call_args.kwargs
@@ -351,7 +350,7 @@ def test_own_constraint_bug_fails_without_retry(exc: Exception, violation: str) 
 )
 def test_a_delivery_given_up_on_is_recorded_as_failed(exc: Exception) -> None:
     """Dropped or failed without retry, the delivery still shows in the sync history."""
-    with patch.object(task, "_emit_final_failure") as final_failure, contextlib.suppress(type(exc)):
+    with patch.object(task, "_emit_final_failure", autospec=True) as final_failure, contextlib.suppress(type(exc)):
         _run_with_failing_handler(exc)
 
     final_failure.assert_called_once()
@@ -362,7 +361,7 @@ def test_skipped_integrity_error_is_logged_without_the_payloads_values() -> None
     """The message of an IntegrityError carries the statement's parameters, i.e. health data."""
     exc = IntegrityError("INSERT ...", {"heart_rate": 187}, ForeignKeyViolation("fk"))
 
-    with patch.object(task, "logger") as logger:
+    with patch.object(task, "logger", autospec=True) as logger:
         _run_with_failing_handler(exc)
 
     kwargs = logger.warning.call_args.kwargs
@@ -374,14 +373,14 @@ def test_skipped_integrity_error_is_logged_without_the_payloads_values() -> None
 def test_reauth_required_fails_delivery_without_retry(user_id: str) -> None:
     """A dead grant raised out of the handler is logged FAILED and not retried."""
     calls, fake = _capture()
-    handler = MagicMock()
+    handler = create_autospec(BaseWebhookHandler, instance=True)
     handler.extract_user_id.return_value = "athlete-1"
     handler.process_payload.side_effect = ReauthRequiredError("strava", UUID(user_id), "reconnection required")
     with (
-        patch.object(task, "SessionLocal"),
-        patch.object(task, "ProviderFactory") as factory,
-        patch.object(task.process_webhook_push, "retry") as retry,
-        patch.object(task.sync_status_service, "emit_webhook_delivered", side_effect=fake),
+        patch.object(task, "SessionLocal", autospec=True),
+        patch.object(task, "ProviderFactory", autospec=True) as factory,
+        patch.object(task.process_webhook_push, "retry", autospec=True) as retry,
+        patch.object(task.sync_status_service, "emit_webhook_delivered", autospec=True, side_effect=fake),
     ):
         factory.return_value.get_provider.return_value.webhooks = handler
         result = task.process_webhook_push.run("strava", {}, "trace")
@@ -395,15 +394,15 @@ def test_reauth_required_fails_delivery_without_retry(user_id: str) -> None:
 def test_failed_run_logged_only_when_retries_run_out(retries: int, expect_failed: bool, user_id: str) -> None:
     """A retriable error logs nothing until the last attempt, which is logged FAILED."""
     calls, fake = _capture()
-    handler = MagicMock()
+    handler = create_autospec(BaseWebhookHandler, instance=True)
     handler.extract_user_id.return_value = "athlete-1"
     handler.process_payload.side_effect = RuntimeError("upstream timeout")
-    handler.find_connection.return_value = MagicMock(user_id=UUID(user_id))
+    handler.find_connection.return_value = UserConnection(user_id=UUID(user_id))
     with (
-        patch.object(task, "SessionLocal"),
-        patch.object(task, "ProviderFactory") as factory,
-        patch.object(task.process_webhook_push, "retry", side_effect=Retry()) as retry,
-        patch.object(task.sync_status_service, "emit_webhook_delivered", side_effect=fake),
+        patch.object(task, "SessionLocal", autospec=True),
+        patch.object(task, "ProviderFactory", autospec=True) as factory,
+        patch.object(task.process_webhook_push, "retry", autospec=True, side_effect=Retry()) as retry,
+        patch.object(task.sync_status_service, "emit_webhook_delivered", autospec=True, side_effect=fake),
     ):
         factory.return_value.get_provider.return_value.webhooks = handler
         task.process_webhook_push.push_request(retries=retries)

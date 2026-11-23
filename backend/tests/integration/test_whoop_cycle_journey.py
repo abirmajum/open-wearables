@@ -20,6 +20,7 @@ from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
 import pytest
+import respx
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine, delete, select
 from sqlalchemy.orm import Session
@@ -42,7 +43,9 @@ from tests.factories import ApiKeyFactory, DataSourceFactory, EventRecordFactory
 from tests.utils import api_key_headers
 
 
-def test_whoop_cycle_http_journey(client: TestClient, db: Session, tmp_path: Path, engine: Engine) -> None:
+def test_whoop_cycle_http_journey(
+    client: TestClient, db: Session, tmp_path: Path, engine: Engine, respx_mock: respx.MockRouter
+) -> None:
     date = (datetime.now(timezone(timedelta(hours=3))) - timedelta(days=1)).date().isoformat()
     previous = (datetime.fromisoformat(date) - timedelta(days=1)).date().isoformat()
     raw: dict[str, Any] = {
@@ -77,6 +80,7 @@ def test_whoop_cycle_http_journey(client: TestClient, db: Session, tmp_path: Pat
         def log_message(self, format: str, *args: Any) -> None:
             pass
 
+    respx_mock.route(host="127.0.0.1").pass_through()
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()

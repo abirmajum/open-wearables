@@ -6,6 +6,7 @@ from .auth import (
     create_test_token,
     developer_auth_headers,
 )
+from .http_mock import RecordingRouter
 
 __all__ = [
     # Auth helpers
@@ -14,4 +15,6 @@ __all__ = [
     "api_key_secret",
     "api_key_secret_for_id",
     "create_test_token",
+    # HTTP mocking
+    "RecordingRouter",
 ]
