@@ -8,8 +8,27 @@ import time
 from collections.abc import Sequence
 from contextlib import suppress
 
-# Match the platform's stop grace period, so in-flight tasks (extension jobs can run for minutes) finish.
-SHUTDOWN_TIMEOUT_SECONDS = float(os.environ.get("WORKER_SHUTDOWN_TIMEOUT_SECONDS", "30"))
+DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 30.0
+
+
+def shutdown_timeout_seconds(value: str | None) -> float:
+    """Seconds in-flight tasks get on a stop; set it to the platform's stop grace period for long extension jobs."""
+    if not value or not value.strip():
+        return DEFAULT_SHUTDOWN_TIMEOUT_SECONDS
+    try:
+        seconds = float(value)
+    except ValueError:
+        print(
+            f"WORKER_SHUTDOWN_TIMEOUT_SECONDS={value!r} is not a number of seconds; "
+            f"using {DEFAULT_SHUTDOWN_TIMEOUT_SECONDS:g}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return DEFAULT_SHUTDOWN_TIMEOUT_SECONDS
+    return seconds if seconds > 0 else DEFAULT_SHUTDOWN_TIMEOUT_SECONDS
+
+
+SHUTDOWN_TIMEOUT_SECONDS = shutdown_timeout_seconds(os.environ.get("WORKER_SHUTDOWN_TIMEOUT_SECONDS"))
 POLL_INTERVAL_SECONDS = 0.2
 
 

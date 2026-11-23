@@ -148,3 +148,11 @@ def test_the_container_exits_when_its_roles_leave_no_worker() -> None:
 
     assert process.returncode == 1
     assert "no worker to run for WORKER_ROLES=ext" in process.stderr
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, 30.0), ("", 30.0), ("  ", 30.0), ("5m", 30.0), ("0", 30.0), ("-5", 30.0), ("120", 120.0), ("2.5", 2.5)],
+)
+def test_shutdown_timeout_falls_back_to_default_for_invalid_values(value: str | None, expected: float) -> None:
+    assert _load_supervisor().shutdown_timeout_seconds(value) == expected
